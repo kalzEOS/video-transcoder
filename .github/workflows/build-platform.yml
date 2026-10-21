@@ -275,6 +275,8 @@ jobs:
           cp -L "$GPAC_LIB" "squashfs-root/usr/lib/$(basename "$GPAC_LIB")"
           # Test the bundled binary with its bundled GPAC library, not the system installation.
           LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib:${LD_LIBRARY_PATH:-}" squashfs-root/usr/bin/MP4Box -version
+          mkdir -p squashfs-root/usr/share/licenses/gpac
+          cp /usr/share/doc/gpac/copyright squashfs-root/usr/share/licenses/gpac/ || cp /usr/share/doc/libgpac11/copyright squashfs-root/usr/share/licenses/gpac/
           cp THIRD-PARTY-LICENCES squashfs-root/
 
           # Remove bundled Wayland/EGL/GBM libraries so the host's native
