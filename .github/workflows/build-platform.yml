@@ -102,7 +102,7 @@ jobs:
       - name: Run tests
         if: inputs.run_tests
         working-directory: src-tauri
-        run: cargo test --features dovi,cli --target ${{ inputs.target }}
+        run: cargo test --features cli --target ${{ inputs.target }}
 
       - name: Build GUI
         shell: bash

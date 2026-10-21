@@ -47,8 +47,8 @@ Available as a desktop app and a headless CLI for servers (see [CLI-README.md](C
 - **Precision mode** - one checkbox for the best possible quality. Uses software encoding with smart analysis that adapts to your system's RAM. Tests a few short clips first to make sure it won't make the file bigger. Slower, but produces the smallest file that still looks great.
 - **VBR peak ceiling** - controls how much the bitrate can spike on action-heavy scenes (1.5x to 3x). Higher values look better on complex content.
 - **Audio handling** - each audio track is handled separately. Tracks already below 640kbps are copied as-is. Tracks above the cap are re-encoded to the same codec at the cap. Codecs with no ffmpeg encoder (DTS, TrueHD) fall back to EAC3. Compatibility Mode forces AAC.
-- **HDR support** - HDR videos are detected automatically and encoded in 10-bit. Dolby Vision and HDR10+ dynamic metadata are preserved automatically when tools are available (the app downloads MP4Box if needed for DV packaging). When preservation isn't possible, the app falls back gracefully to HDR10 and tells you why. Untick the HDR checkbox to convert HDR to SDR with industry-standard tonemapping so colours look right on a normal screen.
-- **Pre-flight checks** - before encoding starts, the app scans your queue and warns you if any files won't get their best-possible encode (e.g. DV files without MP4Box). Offers to download missing tools, encode anyway, or cancel.
+- **HDR10 and bit depth** - Source 8-bit stays 8-bit and 10-bit stays 10-bit. HDR10 color signaling and static metadata are checked after encoding. Valid Dolby Vision Profile 8.1 HDR10 base layers encode as HDR10. No automatic tone mapping or dynamic metadata processing.
+- **Pre-flight checks** - Unsupported Dolby Vision base layers trigger an explicit warning and cannot be re-encoded into incorrect HDR10 colors. No MP4Box download or forced container change.
 - **Subtitles** - all subtitle tracks are kept.
 - **Output options** - save to a folder, next to the source file, or replace the source. Container is preserved per-file (MKV stays MKV, MP4 stays MP4, MOV stays MOV; other formats default to MKV).
 - **Queue columns** - source file size, estimated compressed size, resolution, HDR type badge (DV8, HDR10+, HDR10, HLG, SDR), source and target bitrates, and resizable column headers.
@@ -157,7 +157,6 @@ cargo build --manifest-path src-tauri/Cargo.toml --release --bin histv-cli --no-
 |---------|---------|---------------|
 | `custom-protocol` | GUI | Tauri custom-protocol handler (required for release GUI builds) |
 | `downloader` | GUI | In-app ffmpeg downloader (pulls in `reqwest` + `futures-util`); GUI-only — the CLI expects ffmpeg on your PATH |
-| `dovi` | GUI, CLI | Dolby Vision RPU preservation and HDR10+ pipelines |
 | `cli` | CLI | Builds the headless `histv-cli` binary without any Tauri/GTK/WebKit dependencies |
 
 </details>
@@ -180,18 +179,35 @@ Files within 15% above the threshold that are already in the target codec are al
 
 If an encode makes the file meaningfully bigger than it was (accounting for container overhead), the app throws away the encode and copies the original into the new container instead. Small size increases from container format differences are tolerated.
 
-### Dolby Vision and HDR10+
+### HDR10 baseline
 
-When "Preserve HDR" is ticked, the app automatically detects Dolby Vision and HDR10+ content and preserves the dynamic metadata through re-encoding. No extra settings needed — the app picks the best path for each file:
+The normal re-encoding path preserves source bit depth, color primaries, transfer,
+matrix, range, and supported HDR10 static mastering/content-light metadata. A
+bounded output decode probe rejects errors and lost required HDR10 properties.
+MKV stays MKV in Auto container mode. Audio Copy bypasses bitrate caps; Auto
+retains the existing capped conversion policy. Supported subtitle streams are
+mapped to the selected container.
 
-| Source | Tools needed | Result |
-|--------|-------------|--------|
-| Dolby Vision (any profile) | MP4Box | Full DV preservation. Output forced to MP4. |
-| HDR10+ | None | Full dynamic metadata preservation. |
-| DV without tools | None | Falls back to HDR10 base layer. |
-| HDR10 / HLG | None | Preserved as-is (existing behaviour). |
+| Source | Re-encoding behavior |
+|--------|----------------------|
+| SDR 8-bit / 10-bit | Keep the original bit depth and SDR signaling |
+| HDR10 / HLG | Keep source bit depth, HDR color signaling and static metadata |
+| Dolby Vision Profile 8.1 with verified 10-bit BT.2020/PQ base | Encode the HDR10 base; Dolby Vision is discarded |
+| Other/unknown Dolby Vision base-layer compatibility | Block re-encoding with an explicit warning; retain original |
+| HDR10+ | Preserve standard HDR10; dynamic metadata is not promised |
 
-All bitstream processing uses streaming I/O so memory usage stays bounded regardless of file size. If a DV/HDR10+ pipeline step fails, the app falls back to the next best option and logs why.
+There is no full-movie dynamic metadata extraction, reinsertion, packaging, or
+verification pipeline. MP4Box is not required. No HDR10+ preservation mode is
+enabled: reliable preservation would require additional bitstream work, which
+conflicts with this baseline's speed and simplicity priorities.
+
+On Linux, enable **Hardware Decoding (GPU)** to try supported 8/10-bit VAAPI
+decoding on the same verified render device as encoding. Failed or incompatible
+GPU decoding retries with CPU decoding while retaining the GPU encoder. The
+checkbox keeps its saved preference. Intel QSV device selection is independent.
+
+See [the HDR10 baseline validation notes](docs/HDR10-baseline.md) for the scope
+of physical testing, metadata limitations, and recovery snapshot details.
 
 ### Precision mode
 
@@ -240,10 +256,9 @@ People with a pile of video files at different sizes and formats who want to shr
 │       ├── ffmpeg.rs           # Binary resolution, download, spawning
 │       ├── probe.rs            # Media probing via ffprobe (DV/HDR10+ detection)
 │       ├── queue.rs            # Queue data structures, file collection
-│       ├── dovi_pipeline.rs    # Dolby Vision RPU extract/inject pipeline
-│       ├── dovi_tools.rs       # MP4Box discovery, download, capabilities
-│       ├── hdr10plus_pipeline.rs  # HDR10+ metadata extract/inject pipeline
-│       ├── hevc_utils.rs       # Streaming HEVC NAL reader/writer
+│       ├── encoder_devices.rs  # Dedicated GPU ranking, independent Intel QSV
+│       ├── video_format.rs     # Bit depth, HDR10 policy and color validation
+│       ├── pipeline_progress.rs # UI stage and cancellation forwarding
 │       ├── mkv_tags.rs         # MKV stream statistics tag repair (EBML)
 │       ├── webp_decode.rs      # Animated WebP RIFF parser + decode pipeline
 │       ├── events.rs           # EventSink + BatchControl traits
@@ -274,6 +289,6 @@ People with a pile of video files at different sizes and formats who want to shr
 
 The **-full** builds bundle [FFmpeg](https://ffmpeg.org) and [MP4Box](https://gpac.io) (GPAC). FFmpeg is licensed under the [GNU General Public Licence v2+](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html). The bundled FFmpeg binaries are unmodified static GPL builds from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) (Windows/Linux) and [evermeet.cx](https://evermeet.cx/ffmpeg/) (macOS). MP4Box is licensed under the [GNU Lesser General Public Licence v2.1+](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html). The corresponding source code is available from those repositories. We will provide the source on request for three years from the date of each release - file an issue on this repo.
 
-Dolby Vision processing uses the [dolby_vision](https://crates.io/crates/dolby_vision) crate by quietvoid (MIT). HDR10+ processing uses the [hdr10plus](https://crates.io/crates/hdr10plus) crate by quietvoid (MIT).
+This HDR10 baseline no longer includes the Dolby Vision/HDR10+ processing crates or requires MP4Box. The CachyOS AppImage uses the installed `/usr/bin/ffmpeg` and `/usr/bin/ffprobe` with host graphics libraries. The description of earlier full builds above is retained for historical releases.
 
 This software is based in part on the work of the Independent JPEG Group. See [THIRD-PARTY-LICENCES](THIRD-PARTY-LICENCES) for full details.

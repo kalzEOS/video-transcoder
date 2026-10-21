@@ -13,6 +13,11 @@ use crate::queue::QueueItem;
 /// a method on this trait instead. Prompts (overwrite, fallback) are excluded
 /// — they are bidirectional and belong on the `BatchControl` trait (Phase 3).
 pub trait EventSink: Send + Sync {
+    /// Stage-local progress. None means that completion cannot be measured.
+    fn processing_stage(&self, _stage: &str, _message: &str, _percent: Option<f64>) {}
+    fn cancellation_requested(&self) -> bool {
+        false
+    }
     fn log(&self, message: &str);
     fn file_progress(&self, percent: f64, time_secs: f64, total_secs: f64, pass: Option<(u8, u8)>);
     fn batch_progress(&self, current: u32, total: usize);
@@ -40,6 +45,12 @@ pub trait EventSink: Send + Sync {
 /// Blanket impl: `Arc<T>` delegates to the inner `T`, allowing shared
 /// ownership of sinks across async tasks without trait-object indirection.
 impl<T: EventSink> EventSink for std::sync::Arc<T> {
+    fn processing_stage(&self, stage: &str, message: &str, percent: Option<f64>) {
+        (**self).processing_stage(stage, message, percent)
+    }
+    fn cancellation_requested(&self) -> bool {
+        (**self).cancellation_requested()
+    }
     fn log(&self, message: &str) {
         (**self).log(message)
     }

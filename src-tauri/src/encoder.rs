@@ -1,15 +1,15 @@
-#[cfg(feature = "dovi")]
-use crate::dovi_pipeline;
 use crate::events::{BatchControl, EventSink};
 use crate::ffmpeg as ffbin;
-#[cfg(feature = "dovi")]
-use crate::hdr10plus_pipeline;
 use crate::queue::{QueueItem, QueueItemStatus};
 use crate::staging::{StagingContext, WaveItem};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::process::Command;
+
+#[cfg(target_os = "linux")]
+#[path = "encoder_devices.rs"]
+mod devices;
 
 // ── Rate-control parameters (options struct) ───────────────────
 
@@ -29,6 +29,9 @@ pub struct EncoderInfo {
     pub name: String,
     pub codec_family: String, // "hevc", "h264", or "av1"
     pub is_hardware: bool,
+    /// DRM device that passed this encoder's probe; absent for other backends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_device: Option<String>,
 }
 
 /// Encoder priority tables per platform (§8.2).
@@ -65,6 +68,7 @@ const AUDIO_ENCODERS: &[&str] = &["ac3", "eac3", "aac"];
 
 /// Fixed tonemap filter chain for HDR→SDR conversion (#1).
 /// Defined as a static str to avoid per-file heap allocation.
+#[cfg(test)]
 const TONEMAP_HABLE: &str =
     "zscale=t=linear,tonemap=hable:desat=0,zscale=t=bt709:p=bt709:m=bt709:r=tv,format=yuv420p";
 
@@ -347,8 +351,13 @@ pub async fn detect_encoders(sink: &dyn EventSink) -> (Vec<EncoderInfo>, Vec<Str
         .flat_map(|line| line.split_whitespace())
         .collect();
 
+    #[cfg(target_os = "linux")]
+    let render_nodes = find_dri_render_nodes_in(std::path::Path::new("/dev/dri"));
+    #[cfg(not(target_os = "linux"))]
+    let render_nodes: Vec<String> = Vec::new();
+
     // Classify each video encoder: software encoders are added immediately,
-    // hardware candidates are collected for concurrent verification.
+    // hardware candidates are collected for sequential verification.
     struct HwCandidate {
         name: &'static str,
         family: &'static str,
@@ -381,6 +390,7 @@ pub async fn detect_encoders(sink: &dyn EventSink) -> (Vec<EncoderInfo>, Vec<Str
                 name: enc_name.to_string(),
                 codec_family: family.to_string(),
                 is_hardware: false,
+                render_device: None,
             });
             continue;
         }
@@ -397,17 +407,49 @@ pub async fn detect_encoders(sink: &dyn EventSink) -> (Vec<EncoderInfo>, Vec<Str
     // encoding sessions (e.g. AMD AMF), causing all candidates to be
     // rejected even though they work individually.
     for candidate in &hw_candidates {
-        let ok = test_encode(candidate.name).await;
-        if ok {
-            sink.log(&format!("[detect] {} (HW) - works", candidate.name));
+        #[cfg(target_os = "linux")]
+        let render_nodes = devices::preferred_render_nodes(
+            candidate.name,
+            &render_nodes,
+            std::path::Path::new("/sys/class/drm"),
+        );
+        #[cfg(target_os = "linux")]
+        if is_vaapi_encoder(candidate.name) || is_qsv_encoder(candidate.name) {
+            sink.log(&format!(
+                "[detect] {} device preference: {}",
+                candidate.name,
+                render_nodes.join(", ")
+            ));
+        }
+        let devices = hardware_probe_devices(candidate.name, &render_nodes);
+        let verified = first_working_device(devices, |device| async move {
+            let result = test_encode(candidate.name, device.as_deref()).await;
+            let label = device.as_deref().unwrap_or("default device");
+            match result {
+                Ok(()) => {
+                    sink.log(&format!("[detect] {} on {label} - works", candidate.name));
+                    true
+                }
+                Err(error) => {
+                    sink.log(&format!(
+                        "[detect] {} on {label} - failed: {error}",
+                        candidate.name
+                    ));
+                    false
+                }
+            }
+        })
+        .await;
+        if let Some(render_device) = verified {
             video_encoders.push(EncoderInfo {
                 name: candidate.name.to_string(),
                 codec_family: candidate.family.to_string(),
                 is_hardware: true,
+                render_device,
             });
         } else {
             sink.log(&format!(
-                "[detect] {} (HW) - not available (test encode failed)",
+                "[detect] {} (HW) - no working device",
                 candidate.name
             ));
         }
@@ -439,121 +481,157 @@ pub async fn detect_encoders(sink: &dyn EventSink) -> (Vec<EncoderInfo>, Vec<Str
     (video_encoders, audio_encoders)
 }
 
-/// Test a hardware encoder by encoding a single black frame to a temp file.
-/// Returns true if the encoder produced output successfully.
-async fn test_encode(encoder_name: &str) -> bool {
-    // Use a temp file - some hardware encoders fail with -f null.
-    // NamedTempFile auto-deletes on drop.
-    let tmp_file = match tempfile::Builder::new()
-        .prefix(&format!("histv_test_{}_", encoder_name))
-        .suffix(".mp4")
-        .tempfile()
-    {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let tmp_str = tmp_file.path().to_string_lossy().to_string();
+/// Use HD rather than tiny frames: modern AMD hardware can require widths
+/// of at least 384 pixels. This is a capability probe, not a guarantee that
+/// every input resolution, profile, or pixel format is supported.
+const DETECTION_SOURCE: &str = "color=black:s=1920x1080:d=0.04:r=25";
 
-    let mut args: Vec<String> = Vec::new();
+fn hardware_probe_devices(encoder: &str, render_nodes: &[String]) -> Vec<Option<String>> {
+    if cfg!(target_os = "linux") && (is_vaapi_encoder(encoder) || is_qsv_encoder(encoder)) {
+        render_nodes.iter().cloned().map(Some).collect()
+    } else {
+        vec![None]
+    }
+}
 
-    // Hardware device initialisation - required before -i for VAAPI/QSV.
-    // NVENC auto-detects the GPU but benefits from explicit init on some
-    // multi-GPU systems.
-    #[cfg(target_os = "linux")]
-    if is_vaapi_encoder(encoder_name) {
-        if let Some(render_node) = find_dri_render_node() {
-            args.extend(["-vaapi_device".into(), render_node]);
-        } else {
-            return false;
+/// Stop at the first successful device, preserving its identity. Failures on
+/// one device (including permissions or unsupported codecs) do not hide others.
+async fn first_working_device<F, Fut>(
+    devices: Vec<Option<String>>,
+    mut probe: F,
+) -> Option<Option<String>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for device in devices {
+        if probe(device.clone()).await {
+            return Some(device);
         }
     }
+    None
+}
+
+/// Derive QSV from an explicitly selected VAAPI device. Initializing QSV
+/// before selecting its child can create a session on a different GPU.
+#[cfg(target_os = "linux")]
+fn qsv_device_args(render_device: &str) -> Vec<String> {
+    vec![
+        "-init_hw_device".into(),
+        format!("vaapi=va:{render_device}"),
+        "-init_hw_device".into(),
+        "qsv=qs@va".into(),
+        "-filter_hw_device".into(),
+        "qs".into(),
+    ]
+}
+
+fn test_encode_args(encoder: &str, render_device: Option<&str>, output: &str) -> Vec<String> {
+    let mut args = vec!["-y".into(), "-loglevel".into(), "error".into()];
     #[cfg(target_os = "linux")]
-    if is_qsv_encoder(encoder_name) {
-        if let Some(render_node) = find_dri_render_node() {
-            args.extend([
-                "-init_hw_device".into(),
-                "qsv=qs".into(),
-                "-filter_hw_device".into(),
-                "qs".into(),
-                "-qsv_device".into(),
-                render_node,
-            ]);
-        } else {
-            return false;
+    if let Some(device) = render_device {
+        if is_vaapi_encoder(encoder) {
+            args.extend(["-vaapi_device".into(), device.into()]);
+        } else if is_qsv_encoder(encoder) {
+            args.extend(qsv_device_args(device));
         }
     }
-
-    // 256x256 minimum - some HW encoders reject smaller resolutions
-    // nv12 pixel format - required by most hardware encoders
+    #[cfg(not(target_os = "linux"))]
+    let _ = render_device;
     args.extend([
-        "-y".into(),
         "-f".into(),
         "lavfi".into(),
         "-i".into(),
-        "color=black:s=256x256:d=0.04:r=25".into(),
+        DETECTION_SOURCE.into(),
         "-frames:v".into(),
         "1".into(),
     ]);
-
-    // VAAPI needs frames uploaded to the hardware device
     #[cfg(target_os = "linux")]
-    if is_vaapi_encoder(encoder_name) {
+    if is_vaapi_encoder(encoder) {
         args.extend(["-vf".into(), "format=nv12,hwupload".into()]);
-    }
-    #[cfg(target_os = "linux")]
-    if is_qsv_encoder(encoder_name) {
+    } else if is_qsv_encoder(encoder) {
         args.extend([
             "-vf".into(),
             "format=nv12,hwupload=extra_hw_frames=64".into(),
         ]);
     }
-    if !is_vaapi_encoder(encoder_name) && !is_qsv_encoder(encoder_name) {
+    if !is_vaapi_encoder(encoder) && !is_qsv_encoder(encoder) {
         args.extend(["-pix_fmt".into(), "nv12".into()]);
     }
+    args.extend(["-c:v".into(), encoder.into(), output.into()]);
+    args
+}
 
-    args.extend(["-c:v".into(), encoder_name.into(), tmp_str]);
-
-    let result = ffbin::ffmpeg_command()
+/// Test with a real output file: some hardware encoders reject the null muxer.
+async fn test_encode(encoder: &str, render_device: Option<&str>) -> Result<(), String> {
+    let tmp_file = tempfile::Builder::new()
+        .prefix("histv_test_")
+        .suffix(".mp4")
+        .tempfile()
+        .map_err(|e| e.to_string())?;
+    let args = test_encode_args(encoder, render_device, &tmp_file.path().to_string_lossy());
+    let child = ffbin::ffmpeg_command()
         .args(&args)
+        .kill_on_drop(true)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .spawn();
-
-    match result {
-        Ok(child) => child
-            .wait_with_output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false),
-        Err(_) => false,
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output())
+        .await
+        .map_err(|_| "probe timed out after 15 seconds".to_string())?
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(stderr.lines().take(8).collect::<Vec<_>>().join(" | "));
     }
+    if tmp_file
+        .as_file()
+        .metadata()
+        .map_err(|e| e.to_string())?
+        .len()
+        == 0
+    {
+        return Err("probe produced empty output".into());
+    }
+    Ok(())
 }
 
+/// Enumerate exact DRM render-node names in deterministic numeric order.
+/// Let FFmpeg open each candidate so permissions/driver failures are reported
+/// by the same operation that verifies codec support.
 #[cfg(target_os = "linux")]
-/// Find the first available DRI render node in `dir` (e.g.
-/// `renderD128`). Returns the full path as a string, or `None` if no
-/// render node is found or the directory cannot be read.
-///
-/// Split from the public wrapper so tests can pass a temporary
-/// directory instead of requiring `/dev/dri` to exist.
-fn find_dri_render_node_in(dir: &std::path::Path) -> Option<String> {
-    std::fs::read_dir(dir).ok()?.find_map(|entry| {
-        let entry = entry.ok()?;
+fn find_dri_render_nodes_in(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut nodes = Vec::new();
+    for entry in entries.flatten() {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("renderD") {
-            Some(format!("{}/{name}", dir.display()))
-        } else {
-            None
+        let Some(suffix) = name.to_str().and_then(|n| n.strip_prefix("renderD")) else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
         }
-    })
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(true) {
+            continue;
+        }
+        if let Ok(index) = suffix.parse::<u32>() {
+            if let Some(path) = entry.path().to_str() {
+                nodes.push((index, path.to_string()));
+            }
+        }
+    }
+    nodes.sort();
+    nodes.into_iter().map(|(_, path)| path).collect()
 }
 
-/// Find the first available DRI render node (e.g. /dev/dri/renderD128).
-/// Returns None if no render node is found.
-#[cfg(target_os = "linux")]
-fn find_dri_render_node() -> Option<String> {
-    find_dri_render_node_in(std::path::Path::new("/dev/dri"))
+fn encoder_render_device<'a>(encoders: &'a [EncoderInfo], name: &str) -> Option<&'a str> {
+    encoders
+        .iter()
+        .find(|e| e.name == name)
+        .and_then(|e| e.render_device.as_deref())
 }
 
 fn ensure_fallback(encoders: &mut Vec<EncoderInfo>, name: &str, family: &str) {
@@ -562,6 +640,7 @@ fn ensure_fallback(encoders: &mut Vec<EncoderInfo>, name: &str, family: &str) {
             name: name.to_string(),
             codec_family: family.to_string(),
             is_hardware: false,
+            render_device: None,
         });
     }
 }
@@ -573,16 +652,19 @@ fn fallback_encoders() -> (Vec<EncoderInfo>, Vec<String>) {
                 name: "libx265".into(),
                 codec_family: "hevc".into(),
                 is_hardware: false,
+                render_device: None,
             },
             EncoderInfo {
                 name: "libx264".into(),
                 codec_family: "h264".into(),
                 is_hardware: false,
+                render_device: None,
             },
             EncoderInfo {
                 name: "libsvtav1".into(),
                 codec_family: "av1".into(),
                 is_hardware: false,
+                render_device: None,
             },
         ],
         vec!["ac3".into()],
@@ -594,6 +676,8 @@ fn fallback_encoders() -> (Vec<EncoderInfo>, Vec<String>) {
 /// Audio handling strategy for a file.
 #[derive(Debug, Clone)]
 pub enum AudioStrategy {
+    /// Explicit passthrough: never apply the automatic bitrate cap.
+    CopyAll,
     /// Default: copy if below cap; re-encode to same codec at cap;
     /// codecs with no ffmpeg encoder fall back to EAC3.
     CopyCapped { cap_kbps: u32 },
@@ -613,22 +697,15 @@ pub struct ResolvedFileSettings {
 
 /// Resolve the output container extension for a single file.
 ///
-/// Three layers of logic:
-/// 1. **Auto resolution** - when `container_setting` is "auto", derive from source extension.
-/// 2. **DV override** - when `is_dovi_tier1` is true, force MP4 (DV requires MP4 container).
-/// 3. **Explicit** - when "mkv" or "mp4", use that directly.
+/// Auto derives from the source extension; explicit MKV/MP4 settings win.
+/// The legacy DV flag is ignored: metadata must never force a container change.
 ///
 /// Deterministic, no I/O - safe to call from display code.
 pub fn resolve_container(
     source_path: &str,
     container_setting: &str,
-    is_dovi_tier1: bool,
+    _is_dovi_tier1: bool,
 ) -> &'static str {
-    // DV Tier 1 always forces MP4
-    if is_dovi_tier1 {
-        return "mp4";
-    }
-
     match container_setting {
         "mp4" => "mp4",
         "mkv" => "mkv",
@@ -648,23 +725,18 @@ pub fn resolve_container(
 }
 
 /// Resolve the final output container extension for a file, applying the exact
-/// rules `encode_single_file` uses: Dolby Vision Tier 1 and compatibility mode
-/// both force MP4, otherwise the container is derived from the configured
+/// rules `encode_single_file` uses: compatibility mode forces MP4;
+/// otherwise the container is derived from the configured
 /// setting / source extension. Centralised so the encode path and every
 /// remote-staging back-copy path resolve the extension identically and cannot
 /// drift apart (the back-copy must look for the file the encode actually wrote).
 pub fn resolve_output_ext(
     source_path: &str,
-    dovi_profile: Option<u8>,
+    _dovi_profile: Option<u8>,
     settings: &BatchSettings,
-    preserve_hdr: bool,
+    _preserve_hdr: bool,
 ) -> &'static str {
-    let caps = crate::dovi_tools::capabilities();
-    let is_dovi_tier1 = dovi_profile.is_some()
-        && caps.can_process_dovi
-        && caps.can_package_dovi_mp4
-        && preserve_hdr;
-    if is_dovi_tier1 || settings.compatibility_mode {
+    if settings.compatibility_mode {
         return "mp4";
     }
     resolve_container(source_path, &settings.output_container, false)
@@ -706,7 +778,7 @@ pub fn resolve_file_settings(
                 detected_encoders
                     .iter()
                     .filter(|e| e.codec_family == codec_family)
-                    .max_by_key(|e| e.is_hardware as u8)
+                    .min_by_key(|e| !e.is_hardware)
                     .map(|e| e.name.clone())
                     .unwrap_or_else(|| software_fallback(codec_family).to_string())
             }
@@ -730,7 +802,7 @@ pub fn resolve_file_settings(
         AudioStrategy::CompatCapped { cap_kbps: cap }
     } else {
         match settings.audio_encoder.as_str() {
-            "copy" => AudioStrategy::CopyCapped { cap_kbps: cap },
+            "copy" => AudioStrategy::CopyAll,
             "aac" => AudioStrategy::CompatCapped { cap_kbps: cap },
             // ac3, eac3, or any other codec: use CopyCapped so the
             // fallback codec is resolved per-stream inside
@@ -764,48 +836,23 @@ pub struct PreflightWarning {
 
 /// Scan the queue and report files that will be degraded due to missing tools.
 pub fn preflight_scan(queue: &[QueueItem]) -> Vec<PreflightWarning> {
-    let caps = crate::dovi_tools::capabilities();
-    let mut warnings = Vec::new();
-
-    for item in queue {
-        if item.status != QueueItemStatus::Pending {
-            continue;
-        }
-
-        // Dolby Vision files without MP4Box
-        if let Some(profile) = item.probe.dovi_profile {
-            if !caps.can_package_dovi_mp4 {
-                let source_type = format!("Dolby Vision Profile {}", profile);
-                let actual = if profile == 5 {
-                    "HDR10 fallback (Profile 5 → 8.1 conversion requires MP4Box)".to_string()
-                } else {
-                    "HDR10 fallback (DV tools not found)".to_string()
-                };
-                let best = "Full DV preservation".to_string();
-                warnings.push(PreflightWarning {
-                    file_name: item.file_name.clone(),
-                    source_type,
-                    best_possible: best,
-                    actual_outcome: actual,
-                    missing_tool: Some("MP4Box".to_string()),
-                });
-            }
-            // Profile 5 with tools available: auto-converted to 8.1, no warning needed
-        }
-
-        // HDR10+ without the crate (only if feature not compiled)
-        if item.probe.has_hdr10plus && !caps.can_process_hdr10plus {
-            warnings.push(PreflightWarning {
+    queue
+        .iter()
+        .filter(|item| item.status == QueueItemStatus::Pending)
+        .filter_map(|item| {
+            let reason = item
+                .probe
+                .video_format
+                .hdr10_fallback_error(item.probe.dovi_profile, item.probe.dovi_bl_compat_id);
+            reason.map(|reason| PreflightWarning {
                 file_name: item.file_name.clone(),
-                source_type: "HDR10+".to_string(),
-                best_possible: "Full dynamic metadata preservation".to_string(),
-                actual_outcome: "Static HDR10 only (hdr10plus support not available)".to_string(),
+                source_type: format!("Dolby Vision Profile {}", item.probe.dovi_profile.unwrap()),
+                best_possible: "Keep original without re-encoding".into(),
+                actual_outcome: reason,
                 missing_tool: None,
-            });
-        }
-    }
-
-    warnings
+            })
+        })
+        .collect()
 }
 
 /// Typed deserialization target for the frontend's `startBatch` JSON payload.
@@ -844,6 +891,8 @@ pub struct BatchRequest {
     pub low_priority: bool,
     #[serde(default)]
     pub precision_mode: bool,
+    #[serde(default)]
+    pub hardware_decoding: bool,
     #[serde(default)]
     pub compatibility_mode: bool,
     #[serde(default)]
@@ -917,6 +966,7 @@ impl BatchRequest {
             threads: self.threads.min(64),
             low_priority: self.low_priority,
             precision_mode: self.precision_mode,
+            hardware_decoding: self.hardware_decoding,
             compatibility_mode: self.compatibility_mode,
             preserve_av1: self.preserve_av1,
             force_local: self.force_local,
@@ -942,6 +992,7 @@ pub struct BatchSettings {
     pub threads: u32,
     pub low_priority: bool,
     pub precision_mode: bool,
+    pub hardware_decoding: bool,
     pub compatibility_mode: bool,
     pub preserve_av1: bool,
     pub force_local: bool,
@@ -978,7 +1029,7 @@ struct WaveWork {
     total_waves: u32,
 }
 
-/// Post-encode processing: DV/HDR10+ metadata injection, size check, MKV tag
+/// Post-encode processing: size check, HDR10 validation, MKV tag
 /// patching, and source replacement/deletion.
 ///
 /// Returns `true` if the file was completed successfully, `false` on failure.
@@ -998,107 +1049,16 @@ async fn handle_post_encode(
     is_replace_mode: bool,
     item_duration_secs: f64,
     final_frame_count: Option<u64>,
-    #[cfg(feature = "dovi")] extracted_rpus: &Option<dovi_pipeline::ExtractedRpus>,
-    #[cfg(not(feature = "dovi"))] _extracted_rpus: &Option<()>,
-    #[cfg(feature = "dovi")] extracted_hdr10plus: &Option<hdr10plus_pipeline::ExtractedHdr10Plus>,
-    #[cfg(not(feature = "dovi"))] _extracted_hdr10plus: &Option<()>,
     settings: &BatchSettings,
     audio_strategy: &AudioStrategy,
     log_writer: &mut Option<std::io::BufWriter<std::fs::File>>,
     write_log: &(dyn Fn(&mut Option<std::io::BufWriter<std::fs::File>>, &str) + Send + Sync),
     sink: &dyn EventSink,
 ) -> bool {
-    // ── Post-encode: DV RPU injection + MP4Box packaging (Tier 1) ──
-    #[cfg(feature = "dovi")]
-    if let Some(ref rpus) = extracted_rpus {
-        if temp_output_file.exists() {
-            // Stage DV output to a separate temp file so the downstream
-            // logic (size check, replace rename) works unchanged.
-            let dv_staging = temp_output_file.with_extension("histv-dv.mp4");
-
-            match dovi_pipeline::inject_and_package(
-                temp_output_file,
-                temp_output_file, // audio source: use encoded audio, not original
-                &dv_staging,
-                rpus,
-                sink,
-            )
-            .await
-            {
-                Ok(result) if result.success => {
-                    sink.log(&format!("  {}", result.message));
-                    write_log(log_writer, &format!("  {}", result.message));
-                    // Swap: remove the non-DV encode, put the DV MP4 in its place
-                    let _ = std::fs::remove_file(temp_output_file);
-                    if let Err(e) = std::fs::rename(&dv_staging, temp_output_file) {
-                        sink.log(&format!("  WARNING: Could not rename DV output: {e}"));
-                        // Try copy as fallback (cross-filesystem)
-                        if let Err(copy_err) = std::fs::copy(&dv_staging, temp_output_file) {
-                            sink.log(&format!(
-                                "  WARNING: DV output copy also failed: {copy_err}"
-                            ));
-                        }
-                        let _ = std::fs::remove_file(&dv_staging);
-                    }
-                }
-                Ok(result) => {
-                    // MP4Box failed — fall through with original encode (HDR10 fallback)
-                    sink.log(&format!("  {}", result.message));
-                    write_log(log_writer, &format!("  {}", result.message));
-                    let _ = std::fs::remove_file(&dv_staging);
-                }
-                Err(e) => {
-                    sink.log(&format!(
-                        "  DV injection failed: {e} - output has HDR10 only"
-                    ));
-                    write_log(log_writer, &format!("  DV injection failed: {e}"));
-                    let _ = std::fs::remove_file(&dv_staging);
-                }
-            }
-        }
+    if sink.cancellation_requested() {
+        return false;
     }
-
-    // ── Post-encode: HDR10+ metadata injection (Tier 2) ──────
-    #[cfg(feature = "dovi")]
-    if let Some(ref meta) = extracted_hdr10plus {
-        if temp_output_file.exists() {
-            let injected_output = temp_output_file.with_extension(format!("hdr10p.{}", ext));
-
-            match hdr10plus_pipeline::inject_hdr10plus(
-                temp_output_file,
-                &injected_output,
-                meta,
-                sink,
-            )
-            .await
-            {
-                Ok(result) if result.success => {
-                    sink.log(&format!("  {}", result.message));
-                    write_log(log_writer, &format!("  {}", result.message));
-                    // Replace the encoded file with the injected version
-                    if injected_output.exists() {
-                        let _ = std::fs::remove_file(temp_output_file);
-                        if let Err(e) = std::fs::rename(&injected_output, temp_output_file) {
-                            sink.log(&format!("  WARNING: Could not rename injected file: {e}"));
-                        }
-                    }
-                }
-                Ok(result) => {
-                    sink.log(&format!("  {}", result.message));
-                    write_log(log_writer, &format!("  {}", result.message));
-                    let _ = std::fs::remove_file(&injected_output);
-                }
-                Err(e) => {
-                    sink.log(&format!(
-                        "  HDR10+ injection failed: {e} - output has static HDR10 only"
-                    ));
-                    write_log(log_writer, &format!("  HDR10+ injection failed: {e}"));
-                    let _ = std::fs::remove_file(&injected_output);
-                }
-            }
-        }
-    }
-
+    sink.processing_stage("finalizing", "Validating and finalizing output...", None);
     // Post-encode size check
     // In replace mode, ffmpeg wrote to temp_output_file; in other modes temp == final.
     // Skip for Copy decisions: the output is just a remux of the source, so
@@ -1172,6 +1132,9 @@ async fn handle_post_encode(
                 ]);
             }
             remux_args.extend(audio_codec);
+            if ext == "mp4" {
+                remux_args.extend(["-strict".into(), "unofficial".into()]);
+            }
             remux_args.push(output_str.into());
 
             let remux_refs: Vec<&str> = remux_args.iter().map(|s| s.as_str()).collect();
@@ -1269,6 +1232,30 @@ async fn handle_post_encode(
             }
         }
 
+        if !is_image_source {
+            let tone_mapped = false;
+            let validation =
+                validate_encoded_output(&queue[idx].probe, output_str, tone_mapped, sink).await;
+            if let Err(reason) = validation {
+                sink.log(&format!(
+                    "  ERROR: Output rejected: {reason}. Source retained."
+                ));
+                write_log(log_writer, &reason);
+                let _ = std::fs::remove_file(temp_output_file);
+                queue[idx].status = QueueItemStatus::Failed;
+                sink.queue_item_updated(idx, "Failed");
+                return false;
+            }
+        }
+
+        if sink.cancellation_requested() {
+            return false;
+        }
+        if sink.cancellation_requested() {
+            return false;
+        }
+        // Once the source replacement starts, finish the atomic commit before
+        // accepting cancellation. The completed output must never be removed.
         // Replace mode: safely swap source with encoded output.
         // Rename source to .bak first so we can recover if the final
         // rename fails (avoids TOCTOU data loss).
@@ -1334,7 +1321,7 @@ async fn handle_post_encode(
 }
 
 /// Encode a single file from the queue. Handles field extraction, MKV tag
-/// repair, encode decision, DV/HDR10+ metadata extraction, FFmpeg arg
+/// repair, encode decision, HDR10 fallback checks, FFmpeg arg
 /// assembly, precision mode CRF probe, two-pass or single-pass encode,
 /// hardware fallback on failure, and post-encode processing.
 #[allow(clippy::too_many_arguments)]
@@ -1357,6 +1344,12 @@ async fn encode_single_file(
     batch_control: &dyn BatchControl,
     batch_stderr_log: Option<SharedStderrLog>,
 ) -> EncodeFileResult {
+    let pipeline_sink = crate::pipeline_progress::PipelineSink {
+        inner: sink,
+        control: batch_control,
+    };
+    let sink: &dyn EventSink = &pipeline_sink;
+    sink.processing_stage("preparing", "Preparing video...", None);
     // Extract read-only data from the queue item. Cloning individual
     // fields avoids a full QueueItem clone (which includes audio_streams
     // Vec, all Strings, and fields unused in the loop body).
@@ -1373,24 +1366,7 @@ async fn encode_single_file(
     let is_animated_webp =
         item_video_codec == "webp" && item_full_path.to_lowercase().ends_with(".webp");
 
-    // ── DV/HDR10+ tier determination (Phase DV) ──────────────
     let item_dovi_profile = queue[idx].probe.dovi_profile;
-    let caps = crate::dovi_tools::capabilities();
-
-    // Tier 1: DV source + MP4Box available → full DV preservation
-    let is_dovi_tier1 = item_dovi_profile.is_some()
-        && caps.can_process_dovi
-        && caps.can_package_dovi_mp4
-        && preserve_hdr;
-
-    // Tier 2: HDR10+ source + crate available → full metadata preservation
-    #[cfg(feature = "dovi")]
-    let item_dovi_bl_compat_id = queue[idx].probe.dovi_bl_compat_id;
-    #[cfg(feature = "dovi")]
-    let is_hdr10plus_tier2 = queue[idx].probe.has_hdr10plus
-        && caps.can_process_hdr10plus
-        && preserve_hdr
-        && !is_dovi_tier1;
 
     // Per-file codec/encoder/container resolution (§2.4.0)
     let source_ext = std::path::Path::new(&item_full_path)
@@ -1399,80 +1375,42 @@ async fn encode_single_file(
         .unwrap_or_default();
     let mut resolved =
         resolve_file_settings(&item_video_codec, &source_ext, settings, detected_encoders);
-    // DV Tier 1 requires HEVC output — the RPU inject pipeline only works with
-    // HEVC bitstreams. If the source has an H.264 base layer (DV Profile 8
-    // with HDR10 compat), force the codec family to HEVC and re-resolve the
-    // encoder name.
-    if is_dovi_tier1 && resolved.codec_family != "hevc" {
-        resolved.codec_family = "hevc".to_string();
-        resolved.encoder_name = detected_encoders
-            .iter()
-            .filter(|e| e.codec_family == "hevc")
-            .max_by_key(|e| e.is_hardware as u8)
-            .map(|e| e.name.clone())
-            .unwrap_or_else(|| software_fallback("hevc").to_string());
-        sink.log("  Dolby Vision requires HEVC output - forcing HEVC encoder");
-    }
-    // AMD VAAPI 10-bit HEVC encoding previously produced visible artifacts
-    // (green bar, halos). The green bar is fixable via hevc_metadata BSF
-    // crop_bottom; the VUI/profile issues are resolved in ffmpeg >= 6.1.
-    // Fall back to libx265 unless HISTV_ALLOW_VAAPI_DV=1 is set, which
-    // permits VAAPI for DV tier 1 (for testing the full DV pipeline).
-    #[cfg(target_os = "linux")]
-    if is_dovi_tier1 && is_vaapi_encoder(&resolved.encoder_name) {
-        let allow_vaapi_dv = std::env::var("HISTV_ALLOW_VAAPI_DV")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        if allow_vaapi_dv {
-            sink.log(
-                "  Dolby Vision: HISTV_ALLOW_VAAPI_DV=1 - keeping VAAPI encoder for DV (test mode)",
-            );
-        } else {
-            let sw = software_fallback("hevc").to_string();
-            sink.log(&format!(
-                "  Dolby Vision: VAAPI 10-bit encoding unreliable - falling back to {} (set HISTV_ALLOW_VAAPI_DV=1 to test VAAPI DV)",
-                sw,
-            ));
-            resolved.encoder_name = sw;
-        }
+    let source_format = queue[idx].probe.video_format.clone();
+    let source_format = &source_format;
+    // 12-bit and non-4:2:0 material must not be sent to an 8/10-bit 4:2:0
+    // hardware surface. Keep the source precision on a compatible SW encoder.
+    if source_format.bit_depth > 10
+        || source_format.pixel_format.starts_with("yuv422")
+        || source_format.pixel_format.starts_with("yuv444")
+        || (source_format.bit_depth == 10 && resolved.codec_family == "h264")
+    {
+        resolved.encoder_name = software_fallback(&resolved.codec_family).into();
+        sink.log("  Source format requires software encoding to preserve precision/chroma");
     }
     let file_encoder = &resolved.encoder_name;
     let file_codec_family = &resolved.codec_family;
-    // Override container for DV Tier 1. DV requires MP4 container for
-    // proper signaling. For copies this is typically a no-op (DV sources
-    // are already MP4). For re-encodes, MP4Box will set the DV flags.
     let file_ext =
         resolve_output_ext(&item_full_path, item_dovi_profile, settings, preserve_hdr).to_string();
-    if is_dovi_tier1 && file_ext != resolved.container_ext {
-        sink.log("  Dolby Vision requires MP4 container - output set to MP4 for this file");
-    }
     let sw_fallback = software_fallback(file_codec_family).to_string();
     let is_sw = file_encoder.starts_with("lib");
     let target_codec = file_codec_family.as_str();
 
-    // Per-file pixel format and optional tonemap filter (#1, #2).
-    // Compatibility mode forces SDR output — H.264 "compat" targets devices
-    // that don't support 10-bit/HDR, so tonemap regardless of preserve_hdr.
-    // DV Tier 1 always requires 10-bit output — the RPU pipeline only works
-    // with Main 10 HEVC, so override regardless of probe's colour-transfer
-    // detection (some DV containers omit smpte2084 from container-level metadata).
-    let force_sdr = settings.compatibility_mode;
-    let (file_pix_fmt, tonemap_filter): (&str, Option<&'static str>) = if is_dovi_tier1 {
-        if !item_is_hdr {
-            sink.log("  Dolby Vision requires 10-bit output - forcing p010le (source container omitted HDR colour metadata)");
-        }
-        ("p010le", None)
-    } else if item_is_hdr && (!preserve_hdr || force_sdr) {
-        // HDR source → SDR: tonemap via zscale + Hable curve
-        ("yuv420p", Some(TONEMAP_HABLE))
-    } else if item_is_hdr {
-        // HDR source, preserve HDR
-        ("p010le", None)
-    } else {
-        // SDR source
-        ("yuv420p", None)
+    // Preserve source precision independently of the legacy HDR checkbox.
+    let tonemap_filter: Option<&'static str> = None;
+    let file_pix_fmt = match source_format.bit_depth {
+        10 => "p010le",
+        12 => "yuv420p12le",
+        _ => "yuv420p",
     };
 
+    let software_pixel_format = source_format
+        .software_format()
+        .unwrap_or_else(|_| "yuv420p".into());
+    let file_pix_fmt = if is_sw && tonemap_filter.is_none() {
+        software_pixel_format.as_str()
+    } else {
+        file_pix_fmt
+    };
     sink.batch_status(&format!("[{}/{}] {}", file_counter, total, item_file_name));
 
     queue[idx].status = QueueItemStatus::Encoding;
@@ -1640,64 +1578,40 @@ async fn encode_single_file(
         decision
     };
 
-    // ── Pre-encode: DV/HDR10+ metadata extraction ────────────
-    // Only extract when actually re-encoding (not copy). Extraction is
-    // expensive (demux + full bitstream parse) so we skip it for copies
-    // where the original bitstream (and its DV/HDR10+ data) is preserved.
-    #[cfg(feature = "dovi")]
-    let is_copy = matches!(decision, EncodeDecision::Copy);
-
-    #[cfg(feature = "dovi")]
-    let extracted_rpus = if is_dovi_tier1 && !is_copy {
-        let profile = item_dovi_profile.unwrap();
-        sink.log(&format!(
-            "  Dolby Vision Profile {} detected - extracting RPU data for preservation",
-            profile,
-        ));
-        match dovi_pipeline::extract_rpus(
-            std::path::Path::new(&item_full_path),
-            profile,
-            item_dovi_bl_compat_id,
-            sink,
-        )
-        .await
-        {
-            Ok(rpus) => Some(rpus),
-            Err(e) => {
-                sink.log(&format!(
-                    "  DV extraction failed: {e} - falling back to HDR10"
-                ));
-                write_log(log_writer, &format!("  DV extraction failed: {e}"));
-                None
-            }
+    if !matches!(decision, EncodeDecision::Copy) && !is_image_source {
+        let invalid = source_format.preservation_error(
+            target_codec,
+            settings.compatibility_mode,
+            item_is_hdr,
+            item_dovi_profile,
+            queue[idx].probe.dovi_bl_compat_id,
+        );
+        if let Some(reason) = invalid {
+            sink.log(&format!("  ERROR: {reason}"));
+            queue[idx].status = QueueItemStatus::Failed;
+            sink.queue_item_updated(idx, "Failed");
+            return EncodeFileResult::Failed;
         }
-    } else {
-        None
-    };
-    #[cfg(not(feature = "dovi"))]
-    let extracted_rpus: Option<()> = None;
+    }
 
-    #[cfg(feature = "dovi")]
-    let extracted_hdr10plus = if is_hdr10plus_tier2 && !is_copy {
-        sink.log("  HDR10+ detected - extracting dynamic metadata for preservation");
-        match hdr10plus_pipeline::extract_hdr10plus(std::path::Path::new(&item_full_path), sink)
-            .await
-        {
-            Ok(meta) => Some(meta),
-            Err(e) => {
-                sink.log(&format!(
-                    "  HDR10+ extraction failed: {e} - falling back to static HDR10"
-                ));
-                write_log(log_writer, &format!("  HDR10+ extraction failed: {e}"));
-                None
-            }
+    if !matches!(decision, EncodeDecision::Copy) {
+        if item_dovi_profile.is_some() {
+            sink.log("  Dolby Vision is not retained: encoding the verified HDR10-compatible base layer.");
         }
-    } else {
-        None
-    };
-    #[cfg(not(feature = "dovi"))]
-    let extracted_hdr10plus: Option<()> = None;
+        if queue[idx].probe.has_hdr10plus {
+            sink.log("  HDR10+ dynamic metadata is not guaranteed; standard HDR10 is preserved. No metadata extraction passes.");
+        }
+    }
 
+    if sink.cancellation_requested() {
+        queue[idx].status = QueueItemStatus::Cancelled;
+        sink.queue_item_updated(idx, "Cancelled");
+        return if batch_control.should_cancel_all() {
+            EncodeFileResult::CancelledAll
+        } else {
+            EncodeFileResult::CancelledCurrent
+        };
+    }
     // Build video args from the decision
     let mut video_args: Vec<String> = if matches!(decision, EncodeDecision::Copy) {
         vec!["-c:v".into(), "copy".into()]
@@ -1948,71 +1862,40 @@ async fn encode_single_file(
         // Assemble ffmpeg command
         let video_arg_refs: Vec<&str> = video_args.iter().map(|s| s.as_str()).collect();
 
-        // VAAPI hwaccel decode (-hwaccel vaapi) does not propagate colour
-        // metadata from the input to the output. For HDR/DV content encoded
-        // through that path, explicitly set BT.2020/PQ/limited-range so the
-        // output file is tagged correctly. Without this, players interpret
-        // 10-bit VAAPI output as BT.709 SDR and display red or green frames.
-        //
-        // For all other encode paths (software, hwupload, NVENC, AMF),
-        // ffmpeg propagates colour metadata from the input automatically.
-        // Adding explicit flags there is redundant and can cause haloing
-        // around high-contrast text: the flags force a VUI into the SPS that
-        // triggers player tone mapping, creating edge overshoot on PQ content
-        // that was previously displayed without mapping.
-        let uses_vaapi_hwaccel_decode =
-            is_vaapi_encoder(file_encoder) && file_pix_fmt == "p010le" && tonemap_filter.is_none();
-        let colour_metadata = if uses_vaapi_hwaccel_decode
-            && (is_dovi_tier1 || (item_is_hdr && preserve_hdr && !force_sdr))
-        {
-            let colour_primaries = if is_dovi_tier1 {
-                "bt2020" // DV always uses BT.2020
+        let hardware_decode = !matches!(decision, EncodeDecision::Copy)
+            && source_format.gpu_decode_eligible(
+                &item_video_codec,
+                file_encoder,
+                settings.hardware_decoding,
+                tonemap_filter.is_some(),
+                item_dovi_profile.is_some() || queue[idx].probe.has_hdr10plus,
+            );
+        if settings.hardware_decoding {
+            sink.log(if hardware_decode { "  Hardware decoding active: VA-API, same verified GPU as encoder" }
+                else { "  Hardware decoding bypassed: filters, codec, format or backend require software decoding" });
+        }
+        let colour_metadata =
+            if tonemap_filter.is_none() && !matches!(decision, EncodeDecision::Copy) {
+                Some(ColourMetadata {
+                    primaries: &source_format.primaries,
+                    trc: &source_format.transfer,
+                    matrix: &source_format.matrix,
+                    range: &source_format.range,
+                })
             } else {
-                match queue[idx].probe.color_transfer.as_str() {
-                    "smpte2084" => "bt2020",
-                    "arib-std-b67" => "bt2020", // HLG also uses BT.2020
-                    _ => "bt709",               // fallback
-                }
+                None
             };
-            let colour_trc = if is_dovi_tier1 {
-                "smpte2084" // DV Profile 5→8.1 always uses PQ
-            } else {
-                match queue[idx].probe.color_transfer.as_str() {
-                    "smpte2084" => "smpte2084",
-                    "arib-std-b67" => "arib-std-b67",
-                    _ => "bt709",
-                }
-            };
-            Some(ColourMetadata {
-                primaries: colour_primaries,
-                trc: colour_trc,
-                matrix: "bt2020nc",
-                range: "tv",
-            })
-        } else {
-            None
-        };
-
-        // VAAPI 10-bit HEVC: AMD VCN pads 1080-line content to 1088 lines
-        // without setting a conformance window crop in the SPS, producing a
-        // green bar at the bottom. The hevc_metadata BSF patches the SPS to
-        // declare crop_bottom=8 (8 pixels for 4:2:0 chroma = 4 luma rows,
-        // but ffmpeg's BSF parameter is in luma samples, so 8 is correct).
-        // Also required for DV: without the crop, the 1088-line HEVC
-        // bitstream has mismatched dimensions that corrupt RPU injection.
-        #[cfg(target_os = "linux")]
-        let vaapi_hevc_bsf = if uses_vaapi_hwaccel_decode && target_codec == "hevc" {
-            Some("hevc_metadata=crop_bottom=8")
-        } else {
-            None
-        };
-        #[cfg(not(target_os = "linux"))]
-        let vaapi_hevc_bsf: Option<&str> = None;
+        // Do not crop every HEVC frame by a fixed amount. Modern drivers set
+        // the conformance window themselves; validate output dimensions below.
+        let vaapi_hevc_bsf = None;
 
         let ffmpeg_args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: &item_full_path,
             output_path: &output_str,
             video_args: &video_arg_refs,
+            render_device: encoder_render_device(detected_encoders, file_encoder),
+            hardware_decode,
+            source_format: Some(source_format),
             pix_fmt: file_pix_fmt,
             audio_map_args: &audio_map_args,
             audio_codec_args: &audio_codec_args,
@@ -2024,6 +1907,27 @@ async fn encode_single_file(
             vaapi_hevc_bsf,
         });
 
+        let retry_args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
+            input_path: &item_full_path,
+            output_path: &output_str,
+            video_args: &video_arg_refs,
+            render_device: encoder_render_device(detected_encoders, file_encoder),
+            hardware_decode: false,
+            source_format: Some(source_format),
+            pix_fmt: if file_encoder.starts_with("lib") {
+                &software_pixel_format
+            } else {
+                file_pix_fmt
+            },
+            audio_map_args: &audio_map_args,
+            audio_codec_args: &audio_codec_args,
+            is_image_source,
+            threads: settings.threads,
+            tonemap_filter,
+            codec_family: target_codec,
+            colour_metadata,
+            vaapi_hevc_bsf: None,
+        });
         let cmd_line = format!("ffmpeg {}", ffmpeg_args.join(" "));
         sink.batch_command(&cmd_line);
         let cmd_log = format!("  CMD: {cmd_line}");
@@ -2169,8 +2073,16 @@ async fn encode_single_file(
             // passlog_dir dropped here — auto-cleans passlog files
         } else {
             // ── Single-pass encode ──
-            match run_ffmpeg_with_progress(&ffmpeg_args, item_duration_secs, None, &ffmpeg_ctx)
-                .await
+            match run_with_decode_retry(
+                &ffmpeg_args,
+                &retry_args,
+                hardware_decode,
+                source_format,
+                item_duration_secs,
+                tonemap_filter.is_some(),
+                &ffmpeg_ctx,
+            )
+            .await
             {
                 Ok(r) if r.was_cancelled_all => {
                     sink.log("  Cancelled (batch cancel)");
@@ -2256,15 +2168,22 @@ async fn encode_single_file(
                         input_path: &item_full_path,
                         output_path: &output_str,
                         video_args: &sw_ref,
-                        pix_fmt: file_pix_fmt,
+                        render_device: None,
+                        hardware_decode: false,
+                        source_format: Some(source_format),
+                        pix_fmt: if tonemap_filter.is_none() {
+                            &software_pixel_format
+                        } else {
+                            file_pix_fmt
+                        },
                         audio_map_args: &audio_map_args,
                         audio_codec_args: &audio_codec_args,
                         is_image_source,
                         threads: settings.threads,
                         tonemap_filter,
                         codec_family: target_codec,
-                        colour_metadata: None, // SW encode propagates from input
-                        vaapi_hevc_bsf: None,  // SW encode doesn't need VAAPI crop fix
+                        colour_metadata, // Preserve the source tags on software fallback
+                        vaapi_hevc_bsf: None, // SW encode doesn't need VAAPI crop fix
                     });
 
                     let sw_cmd = format!("ffmpeg {}", sw_args.join(" "));
@@ -2367,8 +2286,6 @@ async fn encode_single_file(
         is_replace_mode,
         item_duration_secs,
         final_frame_count,
-        &extracted_rpus,
-        &extracted_hdr10plus,
         settings,
         &resolved.audio_strategy,
         log_writer,
@@ -2377,6 +2294,16 @@ async fn encode_single_file(
     )
     .await;
 
+    if !success && sink.cancellation_requested() {
+        let _ = std::fs::remove_file(&temp_output_file);
+        queue[idx].status = QueueItemStatus::Cancelled;
+        sink.queue_item_updated(idx, "Cancelled");
+        return if batch_control.should_cancel_all() {
+            EncodeFileResult::CancelledAll
+        } else {
+            EncodeFileResult::CancelledCurrent
+        };
+    }
     if success {
         EncodeFileResult::Done
     } else {
@@ -2402,7 +2329,7 @@ pub async fn run_encode_loop(
     let crf_str = settings.crf_val.to_string();
 
     // ── Pre-loop invariant computation (#2, #3, #4) ──
-    let preserve_hdr = settings.pix_fmt == "p010le";
+    let preserve_hdr = true;
     let cached_ram_gb = get_system_ram_gb();
 
     // Collect pending indices
@@ -2466,9 +2393,13 @@ pub async fn run_encode_loop(
 
     // ── Per-batch ffmpeg stderr log ──
     // One shared log file for all ffmpeg invocations in this batch.
-    let batch_stderr_log: Option<SharedStderrLog> = open_stderr_log(output_dir);
+    let batch_stderr_log: Option<SharedStderrLog> = if save_log {
+        open_stderr_log(output_dir)
+    } else {
+        None
+    };
     // Remember the log filename so we can check if it's empty after the batch
-    let stderr_log_filename: Option<std::path::PathBuf> = {
+    let stderr_log_filename: Option<std::path::PathBuf> = if batch_stderr_log.is_some() {
         let log_dir = output_dir.join("ffmpeg_logs");
         // The file was just created by open_stderr_log — find the newest .log
         std::fs::read_dir(&log_dir).ok().and_then(|entries| {
@@ -2488,6 +2419,8 @@ pub async fn run_encode_loop(
                 })
                 .map(|e| e.path())
         })
+    } else {
+        None
     };
 
     sink.batch_started();
@@ -2903,7 +2836,9 @@ pub async fn run_encode_loop(
     // Drop the shared handle so the file is fully flushed/closed.
     drop(batch_stderr_log);
     // Delete if empty, and enforce the 10-file cap.
-    cleanup_stderr_logs(output_dir, stderr_log_filename.as_deref(), 10);
+    if save_log {
+        cleanup_stderr_logs(output_dir, stderr_log_filename.as_deref(), 10);
+    }
 
     (done_count, fail_count, skip_count, was_cancelled)
 }
@@ -2922,6 +2857,103 @@ struct FfmpegRunResult {
     was_cancelled_current: bool,
     was_cancelled_all: bool,
     frame_count: u64,
+}
+
+async fn validate_encoded_output(
+    source: &crate::probe::ProbeResult,
+    path: &str,
+    tone_mapped: bool,
+    sink: &dyn EventSink,
+) -> Result<(), String> {
+    let output = crate::probe::probe_file_for_validation(path, sink).await?;
+    if !tone_mapped && source.is_hdr != output.is_hdr {
+        return Err("HDR/SDR classification changed; conversion rejected".into());
+    }
+    let tolerance = (2.0 / source.video_fps.max(1.0)).max(0.1);
+    if !durations_match(
+        source.duration_secs,
+        output.duration_secs,
+        source.start_time_secs,
+        output.start_time_secs,
+        tolerance,
+    ) {
+        return Err("Output duration changed; frame timing preservation failed".into());
+    }
+    source
+        .video_format
+        .verify(&output.video_format, tone_mapped)?;
+    if (source.video_width, source.video_height) != (output.video_width, output.video_height) {
+        return Err(format!(
+            "Frame dimensions changed: {}x{} -> {}x{}",
+            source.video_width, source.video_height, output.video_width, output.video_height
+        ));
+    }
+    Ok(())
+}
+
+fn durations_match(
+    source: f64,
+    output: f64,
+    source_start: f64,
+    output_start: f64,
+    tolerance: f64,
+) -> bool {
+    let difference = source - output;
+    let rebase = source_start - output_start;
+    // Matroska may report the end timestamp as duration. FFmpeg rebases small
+    // initial codec delays when re-encoding. Permit that measured shift, while
+    // bounding it so large timestamp offsets cannot hide truncated output.
+    difference.abs() <= tolerance
+        || (rebase.abs() <= 1.0 && (difference - rebase).abs() <= tolerance)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_decode_retry(
+    primary: &[String],
+    software_decode: &[String],
+    hardware_decode: bool,
+    format: &crate::video_format::VideoFormat,
+    duration: f64,
+    tone_mapped: bool,
+    ctx: &FfmpegRunContext<'_>,
+) -> Result<FfmpegRunResult, String> {
+    ctx.sink
+        .processing_stage("encoding", "Starting video encoding...", None);
+    let result = crate::video_format::decode_retry(hardware_decode, |hardware| {
+        let args = if hardware { primary } else if hardware_decode { software_decode } else { primary };
+        async move {
+            let mut result = run_ffmpeg_with_progress(args,duration,None,ctx).await?;
+            if result.exit_code == 0 && !result.was_cancelled_all && !result.was_cancelled_current {
+                let output = crate::probe::probe_file_for_validation(args.last().unwrap(),ctx.sink).await?;
+                if let Err(reason) = format.verify(&output.video_format,tone_mapped) {
+                    ctx.sink.log(&format!("  Encoded output preservation check failed: {reason}"));
+                    result.exit_code = 1;
+                }
+            }
+            Ok(result)
+        }
+    }, |result: &Result<FfmpegRunResult,String>| {
+        if ctx.batch_control.should_cancel_all() || ctx.batch_control.should_cancel_current() { return false; }
+        match result {
+        Ok(r) => r.exit_code != 0 && !r.was_cancelled_all && !r.was_cancelled_current,
+        Err(error) => {
+            ctx.sink.log(&format!("  Hardware decode attempt failed: {error}"));
+            true
+        },
+    }}, || {
+        ctx.sink.processing_stage("encoding", "GPU decoding unavailable; retrying with CPU decoding and the same GPU encoder...", None);
+        ctx.sink.log("  Hardware decode/processing failed (see FFmpeg stderr); retrying with software decoding and preserved bit depth/color. The same verified hardware encoder and device are retained.");
+        if let Some(path) = primary.last() { let _ = std::fs::remove_file(path); }
+        let command = format!("ffmpeg {}",software_decode.join(" "));
+        ctx.sink.batch_command(&command);
+        ctx.sink.log(&format!("  CMD (decode fallback): {command}"));
+    }).await;
+    if result.is_err() {
+        if let Some(path) = primary.last() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
 }
 
 /// Build two-pass argument lists directly from components (#5).
@@ -2992,6 +3024,7 @@ async fn run_ffmpeg_with_progress(
     pass: Option<(u8, u8)>,
     ctx: &FfmpegRunContext<'_>,
 ) -> Result<FfmpegRunResult, String> {
+    let phase_start = std::time::Instant::now();
     let mut cmd = ffbin::ffmpeg_command();
     cmd.args(args)
         .stdin(std::process::Stdio::piped())
@@ -3092,6 +3125,10 @@ async fn run_ffmpeg_with_progress(
     let exit_code = exit_status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
     let final_frames = progress.frames();
 
+    ctx.sink.log(&format!(
+        "  PERF FFmpeg video encoding: {:.3}s",
+        phase_start.elapsed().as_secs_f64()
+    ));
     Ok(FfmpegRunResult {
         exit_code,
         was_cancelled_current: ctx.batch_control.should_cancel_current(),
@@ -3355,6 +3392,9 @@ struct FfmpegAssemblyParts<'a> {
     input_path: &'a str,
     output_path: &'a str,
     video_args: &'a [&'a str],
+    render_device: Option<&'a str>,
+    hardware_decode: bool,
+    source_format: Option<&'a crate::video_format::VideoFormat>,
     pix_fmt: &'a str,
     audio_map_args: &'a [String],
     audio_codec_args: &'a [String],
@@ -3366,7 +3406,7 @@ struct FfmpegAssemblyParts<'a> {
     /// propagate colour primaries/transfer/matrix from input. Only set
     /// for the VAAPI hwaccel decode path; other paths propagate
     /// automatically and explicit flags cause haloing on PQ content.
-    colour_metadata: Option<ColourMetadata>,
+    colour_metadata: Option<ColourMetadata<'a>>,
     /// HEVC bitstream filter for VAAPI 10-bit encode. AMD VCN pads 1080-line
     /// content to 1088 lines without setting a conformance window crop in the
     /// SPS, producing a visible green bar at the bottom. The hevc_metadata BSF
@@ -3380,11 +3420,11 @@ struct FfmpegAssemblyParts<'a> {
 /// from the input. For all other paths, ffmpeg propagates automatically
 /// and explicit flags cause haloing on PQ content.
 #[derive(Clone, Copy)]
-struct ColourMetadata {
-    primaries: &'static str,
-    trc: &'static str,
-    matrix: &'static str,
-    range: &'static str,
+struct ColourMetadata<'a> {
+    primaries: &'a str,
+    trc: &'a str,
+    matrix: &'a str,
+    range: &'a str,
 }
 
 /// Assemble the full ffmpeg argument list from its component parts.
@@ -3415,38 +3455,22 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
 
     let mut hw_device_init: Vec<String> = Vec::new();
     let mut hw_upload_filter: Option<String> = None;
-    // When true, decode the input on the VAAPI device and keep frames on
-    // the GPU, avoiding the broken software→hwupload path for 10-bit.
+    // When true, keep decoded frames on the verified VAAPI encoding device.
     let mut vaapi_hwaccel_decode = false;
 
     if let Some(enc) = encoder_name {
         #[cfg(target_os = "linux")]
         if is_vaapi_encoder(enc) {
-            if let Some(render_node) = find_dri_render_node() {
-                // 10-bit (HDR/DV preservation): the software-decode +
-                // format=p010le,hwupload path silently produces green or
-                // corrupt frames on AMD VAAPI because hwupload cannot
-                // correctly create a P010 VAAPI surface from a software
-                // p010le frame. Instead, decode on the VAAPI device with
-                // -hwaccel vaapi and keep frames on the GPU throughout.
-                // This requires the input codec to be VAAPI-decodable
-                // (HEVC Main 10 is supported on AMD).
-                //
-                // 8-bit (SDR): the format=nv12,hwupload path works
-                // correctly because NV12 is the standard VAAPI surface
-                // format. Use -vaapi_device + hwupload as before.
-                //
-                // When a tonemap filter is present, frames must come back
-                // to CPU for the tonemap. In that case hwaccel decode
-                // can't keep frames on GPU, so use hwupload after the
-                // tonemap filter (but only for 8-bit; 10-bit VAAPI encode
-                // with a tonemap is unreliable - fall back to software).
-                if parts.pix_fmt == "p010le" && parts.tonemap_filter.is_none() {
+            if let Some(render_node) = parts.render_device {
+                // Opt-in GPU decoding keeps NV12/P010 frames on the verified
+                // device. CPU filters use software decoding and an explicit
+                // upload; compressed metadata processing is independent.
+                if parts.hardware_decode && parts.tonemap_filter.is_none() {
                     hw_device_init = vec![
                         "-hwaccel".into(),
                         "vaapi".into(),
                         "-hwaccel_device".into(),
-                        render_node,
+                        render_node.into(),
                         "-hwaccel_output_format".into(),
                         "vaapi".into(),
                     ];
@@ -3456,45 +3480,39 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
                     // encoder. Without it, the encoder may receive surfaces
                     // in an unexpected format and produce green/corrupt
                     // frames despite the container reporting Main 10.
-                    hw_upload_filter = Some("scale_vaapi=format=p010".into());
+                    hw_upload_filter = Some(
+                        if crate::video_format::pixel_depth(parts.pix_fmt) == 10 {
+                            "scale_vaapi=format=p010"
+                        } else {
+                            "scale_vaapi=format=nv12"
+                        }
+                        .into(),
+                    );
                 } else {
-                    hw_device_init = vec!["-vaapi_device".into(), render_node];
-                    hw_upload_filter = Some("format=nv12,hwupload".into());
+                    hw_device_init = vec!["-vaapi_device".into(), render_node.into()];
+                    hw_upload_filter = Some(
+                        if crate::video_format::pixel_depth(parts.pix_fmt) == 10 {
+                            "format=p010le,hwupload"
+                        } else {
+                            "format=nv12,hwupload"
+                        }
+                        .into(),
+                    );
                 }
             } else {
-                // No render node found - VAAPI cannot work without one.
-                // test_encode() already gates encoder detection on this, so
-                // reaching here means the queue was built when a GPU was
-                // present but it has since disappeared (hot-unplug, driver
-                // reload). Emit an explicit marker so the failure is
-                // diagnosable from ffmpeg stderr; ffmpeg will fail quickly
-                // because `-c:v hevc_vaapi` without `-vaapi_device` errors
-                // out immediately.
+                // An unverified forced encoder must fail explicitly so the
+                // existing software fallback can handle it. Never silently
+                // initialize a default GPU different from the tested one.
                 hw_device_init = vec!["-vaapi_device".into(), "/dev/dri/renderD_missing".into()];
             }
         }
         #[cfg(target_os = "linux")]
         if is_qsv_encoder(enc) {
-            // QSV needs an Intel GPU. Use find_dri_render_node() to locate
-            // a DRI render node; on multi-GPU systems this is typically the
-            // Intel iGPU (renderD128). Specifying -qsv_device avoids MFX
-            // session creation failures when multiple GPUs are present.
-            if let Some(render_node) = find_dri_render_node() {
-                hw_device_init = vec![
-                    "-init_hw_device".into(),
-                    "qsv=qs".into(),
-                    "-filter_hw_device".into(),
-                    "qs".into(),
-                    "-qsv_device".into(),
-                    render_node,
-                ];
+            // Use QSV's own verified device, independently of VAAPI selection.
+            if let Some(render_node) = parts.render_device {
+                hw_device_init = qsv_device_args(render_node);
             } else {
-                // No render node - QSV cannot work without an Intel GPU.
-                // Emit a sentinel so ffmpeg fails with a clear message.
-                hw_device_init = vec![
-                    "-init_hw_device".into(),
-                    "qsv=qs_child_device_missing".into(),
-                ];
+                hw_device_init = qsv_device_args("/dev/dri/renderD_missing");
             }
             let upload_fmt = if parts.pix_fmt == "p010le" {
                 "format=p010le,hwupload=extra_hw_frames=64"
@@ -3505,6 +3523,15 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
         }
     }
 
+    if parts.tonemap_filter.is_none() && encoder_name != Some("copy") {
+        if let Some(color_filter) = parts.source_format.and_then(|f| f.frame_color_filter()) {
+            hw_upload_filter = Some(match hw_upload_filter {
+                Some(filter) if vaapi_hwaccel_decode => format!("{filter},{color_filter}"),
+                Some(filter) => format!("{color_filter},{filter}"),
+                None => color_filter,
+            });
+        }
+    }
     let mut args: Vec<String> = vec![
         "-err_detect".into(),
         "ignore_err".into(),
@@ -3564,7 +3591,9 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
         } else if let Some(hw_filter) = &hw_upload_filter {
             args.extend(vec!["-vf".into(), hw_filter.clone()]);
         }
-        if !vaapi_hwaccel_decode {
+        if !vaapi_hwaccel_decode
+            && !encoder_name.is_some_and(|e| is_vaapi_encoder(e) || is_qsv_encoder(e))
+        {
             // When using hwaccel decode, the encoder receives frames in
             // VAAPI surface format and auto-negotiates; setting -pix_fmt
             // would force an incorrect software→hw format conversion.
@@ -3597,35 +3626,44 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
     // MP4-specific muxing flags
     if parts.output_path.ends_with(".mp4") {
         args.extend(vec!["-movflags".into(), "+faststart".into()]);
-        // HEVC in MP4: force hvc1 tag (parameter sets out-of-band).
-        // ffmpeg defaults to hev1 (in-band parameter sets), which many
-        // hardware decoders refuse or fallback from: Apple (macOS/iOS/Safari),
-        // Android/MediaCodec, NVIDIA Shield, and Chrome on Windows via DXVA.
-        // hvc1 is de facto standard for universal hardware compatibility.
-        // Only apply when the codec is actually HEVC to avoid tag mismatches.
+        // VAAPI can update picture parameter sets during rate control. hvc1
+        // strips in-band parameter sets, leaving stale headers and corrupt
+        // pictures despite a successful encode and valid HDR flags. Keep hev1
+        // for this encoder to retain the headers required by every picture.
         if parts.codec_family == "hevc" {
-            args.extend(vec!["-tag:v".into(), "hvc1".into()]);
+            // Stream copies must retain parameter sets too, including files
+            // previously produced by VAAPI. Re-tagging them hvc1 can corrupt
+            // otherwise clean input without re-encoding a single picture.
+            let tag = if matches!(encoder_name, Some("hevc_vaapi" | "copy")) {
+                "hev1"
+            } else {
+                "hvc1"
+            };
+            args.extend(vec!["-tag:v".into(), tag.into()]);
         }
     }
 
-    // Colour metadata must come before the output path. Only set for
-    // VAAPI hwaccel decode, which does not propagate colour
-    // primaries/transfer/matrix from the input; without explicit flags
-    // the output has "unknown" colour and players misinterpret 10-bit
-    // data as BT.709 SDR. For all other paths, ffmpeg propagates colour
-    // metadata from the source automatically, and explicit flags cause
-    // haloing around high-contrast text on PQ content.
+    // Signal the source tags without inventing defaults or changing pixel
+    // values. Hardware frame negotiation can otherwise lose these tags.
     if let Some(cm) = &parts.colour_metadata {
-        args.extend(vec![
-            "-color_primaries".into(),
-            cm.primaries.into(),
-            "-color_trc".into(),
-            cm.trc.into(),
-            "-colorspace".into(),
-            cm.matrix.into(),
-            "-color_range".into(),
-            cm.range.into(),
-        ]);
+        for (flag, value) in [
+            ("-color_primaries", cm.primaries),
+            ("-color_trc", cm.trc),
+            ("-colorspace", cm.matrix),
+            ("-color_range", cm.range),
+        ] {
+            if crate::video_format::known(value) {
+                args.extend([flag.into(), value.into()]);
+            }
+        }
+    }
+    if encoder_name == Some("libx265") && parts.tonemap_filter.is_none() {
+        if let Some(format) = parts.source_format {
+            let params = format.x265_hdr_params();
+            if !params.is_empty() {
+                args.extend(["-x265-params".into(), params]);
+            }
+        }
     }
 
     // VAAPI 10-bit HEVC: patch the conformance window in the SPS to crop
@@ -3635,6 +3673,11 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
         args.extend(vec!["-bsf:v".into(), bsf.into()]);
     }
 
+    if parts.output_path.to_ascii_lowercase().ends_with(".mp4") {
+        // FFmpeg otherwise silently omits Dolby Vision configuration boxes
+        // even when the input stream has valid DOVI side data.
+        args.extend(["-strict".into(), "unofficial".into()]);
+    }
     args.push(parts.output_path.to_string());
     args
 }
@@ -3720,6 +3763,16 @@ fn build_audio_args_from_probe(
         let copy_safe = !is_mp4 || is_mp4_compatible_audio(&stream.codec);
 
         match strategy {
+            AudioStrategy::CopyAll => {
+                if !copy_safe {
+                    sink.log(&format!("  WARNING: Audio {} ({}) cannot be copied to MP4. Choose MKV; FFmpeg will report the container incompatibility.", stream.index, stream.codec));
+                }
+                codec_args.extend([format!("-c:a:{output_idx}"), "copy".into()]);
+                sink.log(&format!(
+                    "  Audio {} : {} @ {}kbps - copying without bitrate conversion",
+                    stream.index, stream.codec, stream.bitrate_kbps
+                ));
+            }
             AudioStrategy::CopyCapped { cap_kbps } => {
                 if stream.bitrate_kbps <= *cap_kbps && copy_safe {
                     codec_args.extend([format!("-c:a:{output_idx}"), "copy".into()]);
@@ -4148,6 +4201,112 @@ mod tests {
     use super::*;
     use crate::queue::AudioStreamInfo;
     use crate::test_helpers::{default_encoders, default_settings, NoopSink};
+
+    #[test]
+    fn batch_request_hardware_decoding_is_opt_in() {
+        let request: BatchRequest = serde_json::from_str("{}").unwrap();
+        assert!(!request.into_batch_settings().hardware_decoding);
+        let request: BatchRequest = serde_json::from_str(r#"{"hardwareDecoding":true}"#).unwrap();
+        assert!(request.into_batch_settings().hardware_decoding);
+    }
+
+    #[test]
+    fn duration_validation_accepts_small_measured_rebase_but_rejects_truncation() {
+        assert!(durations_match(10.302, 10.135, 0.167, 0.0, 0.1));
+        assert!(durations_match(10.0, 10.0, 0.167, 0.0, 0.1));
+        assert!(!durations_match(100.0, 90.0, 0.167, 0.0, 0.1));
+        assert!(!durations_match(100.0, 90.0, 10.0, 0.0, 0.1));
+    }
+
+    #[test]
+    fn explicit_audio_copy_never_reencodes_above_the_cap() {
+        let mut settings = crate::test_helpers::default_settings();
+        settings.audio_encoder = "copy".into();
+        settings.audio_cap = 128;
+        let resolved = resolve_file_settings("hevc", "mkv", &settings, &[]);
+        assert!(matches!(resolved.audio_strategy, AudioStrategy::CopyAll));
+        let streams = vec![
+            crate::queue::AudioStreamInfo {
+                index: 0,
+                codec: "eac3".into(),
+                bitrate_kbps: 768,
+            },
+            crate::queue::AudioStreamInfo {
+                index: 1,
+                codec: "truehd".into(),
+                bitrate_kbps: 4000,
+            },
+        ];
+        let (maps, codecs) =
+            build_audio_args_from_probe(&streams, &resolved.audio_strategy, "mkv", &NoopSink);
+        assert_eq!(maps, ["-map", "0:a:0", "-map", "0:a:1"]);
+        assert_eq!(codecs, ["-c:a:0", "copy", "-c:a:1", "copy"]);
+    }
+
+    #[test]
+    fn hdr10_preflight_never_requests_tools_or_overrides_mkv() {
+        let mut item = crate::test_helpers::make_queue_item(
+            "movie.mkv",
+            QueueItemStatus::Pending,
+            crate::probe::ProbeResult::default(),
+        );
+        item.probe.dovi_profile = Some(8);
+        item.probe.dovi_bl_compat_id = Some(1);
+        item.probe.has_hdr10plus = true;
+        item.probe.video_format =
+            crate::video_format::VideoFormat::from_stream(&serde_json::json!({
+                "pix_fmt":"yuv420p10le", "color_primaries":"bt2020",
+                "color_transfer":"smpte2084", "color_space":"bt2020nc"
+            }));
+        assert!(preflight_scan(&[item.clone()]).is_empty());
+        item.probe.dovi_profile = Some(5);
+        let warnings = preflight_scan(&[item]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].missing_tool.is_none());
+        assert!(warnings[0].actual_outcome.contains("blocked"));
+        assert_eq!(resolve_container("movie.mkv", "auto", true), "mkv");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gpu_decode_preserves_surface_depth_and_verified_device_for_all_source_codecs() {
+        for (pixel, expected) in [("yuv420p", "nv12"), ("yuv420p10le", "p010")] {
+            for codec in ["h264", "hevc", "av1"] {
+                let format = crate::video_format::VideoFormat::from_stream(&serde_json::json!({
+                    "pix_fmt":pixel,"color_primaries":"bt709","color_transfer":"bt709","color_space":"bt709","color_range":"tv"
+                }));
+                assert!(format.gpu_decode_eligible(codec, "hevc_vaapi", true, false, false));
+                let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
+                    input_path: "source.mkv",
+                    output_path: "output.mkv",
+                    video_args: &["-c:v", "hevc_vaapi"],
+                    render_device: Some("/test/dri/renderD167"),
+                    hardware_decode: true,
+                    source_format: Some(&format),
+                    pix_fmt: pixel,
+                    audio_map_args: &[],
+                    audio_codec_args: &[],
+                    is_image_source: false,
+                    threads: 0,
+                    tonemap_filter: None,
+                    codec_family: "hevc",
+                    colour_metadata: None,
+                    vaapi_hevc_bsf: None,
+                });
+                let pos = args.iter().position(|a| a == "-hwaccel_device").unwrap();
+                assert_eq!(args[pos + 1], "/test/dri/renderD167");
+                assert!(pos < args.iter().position(|a| a == "-i").unwrap());
+                let filter = &args[args.iter().position(|a| a == "-vf").unwrap() + 1];
+                assert!(filter
+                    .split(',')
+                    .any(|f| f == format!("scale_vaapi=format={expected}")));
+                assert!(filter.contains("setparams=color_primaries=bt709:color_trc=bt709"));
+                assert!(!args.iter().any(|a| a.contains("hwupload")
+                    || a.contains("hwdownload")
+                    || a == "-pix_fmt"));
+            }
+        }
+    }
 
     // ══════════════════════════════════════════════════════════════
     //  1. decide_encode_strategy
@@ -5067,11 +5226,45 @@ mod tests {
     // ══════════════════════════════════════════════════════════════
 
     #[test]
+    fn vaapi_mp4_retains_parameter_sets_without_changing_other_backends() {
+        for (encoder, tag) in [
+            ("hevc_vaapi", "hev1"),
+            ("copy", "hev1"),
+            ("hevc_nvenc", "hvc1"),
+            ("hevc_qsv", "hvc1"),
+            ("libx265", "hvc1"),
+        ] {
+            let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
+                input_path: "input.mkv",
+                output_path: "output.mp4",
+                video_args: &["-c:v", encoder],
+                render_device: Some("/test/render"),
+                hardware_decode: false,
+                source_format: None,
+                pix_fmt: "yuv420p10le",
+                audio_map_args: &[],
+                audio_codec_args: &[],
+                is_image_source: false,
+                threads: 0,
+                tonemap_filter: None,
+                codec_family: "hevc",
+                colour_metadata: None,
+                vaapi_hevc_bsf: None,
+            });
+            let index = args.iter().position(|a| a == "-tag:v").unwrap();
+            assert_eq!(args[index + 1], tag);
+        }
+    }
+
+    #[test]
     fn test_assemble_hevc_in_mp4_has_hvc1_and_faststart() {
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mp4",
             video_args: &["-c:v", "libx265"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: &[],
             audio_codec_args: &[],
@@ -5094,6 +5287,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mp4",
             video_args: &["-c:v", "libx264"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: &[],
             audio_codec_args: &[],
@@ -5117,6 +5313,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "libx265"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: &[],
             audio_codec_args: &[],
@@ -5139,6 +5338,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mp4",
             video_args: &["-c:v", "libx265"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: &[],
             audio_codec_args: &[],
@@ -5169,6 +5371,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "libx265"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: &[],
             audio_codec_args: &[],
@@ -5195,6 +5400,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "libx265"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: &[],
             audio_codec_args: &[],
@@ -5226,6 +5434,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "copy"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: &[],
             audio_codec_args: &[],
@@ -5261,17 +5472,14 @@ mod tests {
         }
     }
 
-    /// Without compat mode, "copy" should produce CopyCapped.
+    /// Explicit Copy bypasses the cap; Auto continues to use CopyCapped.
     #[test]
-    fn test_no_compat_copy_produces_copy_capped() {
+    fn test_no_compat_copy_produces_unmodified_passthrough() {
         let mut settings = default_settings();
         settings.audio_encoder = "copy".to_string();
         let encoders = default_encoders();
         let result = resolve_file_settings("hevc", "mkv", &settings, &encoders);
-        assert!(matches!(
-            result.audio_strategy,
-            AudioStrategy::CopyCapped { .. }
-        ));
+        assert!(matches!(result.audio_strategy, AudioStrategy::CopyAll));
     }
 
     /// Without compat mode, explicit "aac" should produce CompatCapped.
@@ -5510,96 +5718,300 @@ mod tests {
     // lib regression would surface broadly.
 
     // ══════════════════════════════════════════════════════════════
-    //  find_dri_render_node_in (hardware device detection)
+    //  Render-device detection and association
     // ══════════════════════════════════════════════════════════════
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn test_find_dri_render_node_found() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Create a fake render node entry
-        std::fs::File::create(tmp.path().join("renderD128")).unwrap();
-        let result = find_dri_render_node_in(tmp.path());
-        assert_eq!(result, Some(format!("{}/renderD128", tmp.path().display())));
+    fn device_test_args(encoder: &str, device: Option<&str>, pix_fmt: &str) -> Vec<String> {
+        assemble_ffmpeg_args(&FfmpegAssemblyParts {
+            input_path: "input.mkv",
+            output_path: "output.mkv",
+            video_args: &["-c:v", encoder],
+            render_device: device,
+            hardware_decode: false,
+            source_format: None,
+            pix_fmt,
+            audio_map_args: &[],
+            audio_codec_args: &[],
+            is_image_source: false,
+            threads: 0,
+            tonemap_filter: None,
+            codec_family: "hevc",
+            colour_metadata: None,
+            vaapi_hevc_bsf: None,
+        })
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn test_find_dri_render_node_picks_first_numeric() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::File::create(tmp.path().join("renderD129")).unwrap();
-        std::fs::File::create(tmp.path().join("renderD128")).unwrap();
-        let result = find_dri_render_node_in(tmp.path());
-        // read_dir order is not guaranteed, but the result must be
-        // one of the two render nodes
-        assert!(result.is_some());
-        let path = result.unwrap();
-        assert!(path.ends_with("renderD128") || path.ends_with("renderD129"));
+    #[tokio::test]
+    async fn preferred_gpu_is_verified_per_codec_and_reused_without_driver_overrides() {
+        let sysfs = tempfile::tempdir().unwrap();
+        let nodes = vec![
+            "/test/dri/renderD134".to_string(),
+            "/test/dri/renderD167".to_string(),
+        ];
+        for (name, vendor, width, vram) in [
+            ("renderD134", "0x8086", "255", "0"),
+            ("renderD167", "0x1002", "16", "17179869184"),
+        ] {
+            let device = sysfs.path().join(name).join("device");
+            std::fs::create_dir_all(&device).unwrap();
+            for (file, value) in [
+                ("vendor", vendor),
+                ("max_link_width", width),
+                ("mem_info_vram_total", vram),
+            ] {
+                std::fs::write(device.join(file), value).unwrap();
+            }
+        }
+        for (name, family, amd_works, intel_works, expected) in [
+            ("hevc_vaapi", "hevc", true, true, Some(1)),
+            ("h264_vaapi", "h264", false, true, Some(0)),
+            ("av1_vaapi", "av1", false, false, None),
+            ("hevc_qsv", "hevc", false, true, Some(0)),
+        ] {
+            let ranked = devices::preferred_render_nodes(name, &nodes, sysfs.path());
+            let mut attempts = Vec::new();
+            let verified = first_working_device(hardware_probe_devices(name, &ranked), |device| {
+                attempts.push(device.clone());
+                std::future::ready(if device.as_ref() == Some(&nodes[1]) {
+                    amd_works
+                } else {
+                    intel_works
+                })
+            })
+            .await;
+            let mut encoders = Vec::new();
+            if let Some(device) = verified {
+                assert_eq!(device, expected.map(|i| nodes[i].clone()));
+                encoders.push(EncoderInfo {
+                    name: name.into(),
+                    codec_family: family.into(),
+                    is_hardware: true,
+                    render_device: device,
+                });
+            } else {
+                assert_eq!(expected, None);
+            }
+            ensure_fallback(&mut encoders, software_fallback(family), family);
+            let mut settings = default_settings();
+            settings.preserve_av1 = true;
+            let resolved = resolve_file_settings(family, "mkv", &settings, &encoders);
+            let device = encoder_render_device(&encoders, &resolved.encoder_name);
+            if let Some(index) = expected {
+                assert_eq!(device, Some(nodes[index].as_str()));
+                let args = device_test_args(&resolved.encoder_name, device, "nv12");
+                if is_qsv_encoder(name) {
+                    assert!(args.contains(&format!("vaapi=va:{}", nodes[index])));
+                } else {
+                    assert!(args.contains(&nodes[index]));
+                    assert!(!args.contains(&nodes[1 - index]));
+                }
+            } else {
+                assert_eq!(resolved.encoder_name, software_fallback(family));
+                assert!(device.is_none());
+            }
+            assert_eq!(
+                attempts[0],
+                Some(nodes[if is_qsv_encoder(name) { 0 } else { 1 }].clone())
+            );
+            assert_eq!(
+                attempts.len(),
+                if !is_qsv_encoder(name) && !amd_works {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn test_find_dri_render_node_skips_card_nodes() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::File::create(tmp.path().join("card0")).unwrap();
-        std::fs::File::create(tmp.path().join("controlD64")).unwrap();
-        let result = find_dri_render_node_in(tmp.path());
+    #[tokio::test]
+    async fn probes_select_devices_per_encoder_and_encoding_reuses_them() {
+        let nodes = vec![
+            "/test/dri/renderD128".to_string(),
+            "/test/dri/renderD129".to_string(),
+        ];
+        let mut encoders = Vec::new();
+        for (name, family, supported) in [
+            ("hevc_vaapi", "hevc", &nodes[1]),
+            ("h264_vaapi", "h264", &nodes[0]),
+            ("hevc_qsv", "hevc", &nodes[0]),
+        ] {
+            let mut attempts = Vec::new();
+            let verified = first_working_device(hardware_probe_devices(name, &nodes), |device| {
+                attempts.push(device.clone());
+                std::future::ready(device.as_ref() == Some(supported))
+            })
+            .await
+            .unwrap();
+            assert_eq!(verified.as_ref(), Some(supported));
+            assert_eq!(attempts.len(), if supported == &nodes[1] { 2 } else { 1 });
+            encoders.push(EncoderInfo {
+                name: name.into(),
+                codec_family: family.into(),
+                is_hardware: true,
+                render_device: verified,
+            });
+        }
+        let settings = default_settings();
+        let resolved = resolve_file_settings("hevc", "mkv", &settings, &encoders);
+        // Preserve the declared encoder priority instead of picking the last HW entry.
+        assert_eq!(resolved.encoder_name, "hevc_vaapi");
+        for encoder in &encoders {
+            let device = encoder_render_device(&encoders, &encoder.name);
+            let probe = test_encode_args(&encoder.name, device, "probe.mp4");
+            for pix_fmt in ["nv12", "p010le"] {
+                let args = device_test_args(&encoder.name, device, pix_fmt);
+                if is_qsv_encoder(&encoder.name) {
+                    let init = format!("vaapi=va:{}", device.unwrap());
+                    assert!(probe.contains(&init));
+                    assert!(args.contains(&init));
+                    assert!(args.contains(&"qsv=qs@va".into()));
+                } else {
+                    assert!(probe.contains(&device.unwrap().into()));
+                    assert!(args.contains(&device.unwrap().into()));
+                }
+            }
+        }
+        let mut forced = settings;
+        forced.video_encoder = "hevc_qsv".into();
+        let resolved = resolve_file_settings("hevc", "mkv", &forced, &encoders);
         assert_eq!(
-            result, None,
-            "card/control entries must not be treated as render nodes"
+            encoder_render_device(&encoders, &resolved.encoder_name),
+            Some(nodes[0].as_str())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn single_device_and_failed_or_unavailable_devices_fall_back() {
+        let nodes = vec!["/test/dri/renderD128".to_string()];
+        let devices = hardware_probe_devices("hevc_vaapi", &nodes);
+        assert_eq!(
+            first_working_device(devices.clone(), |_| std::future::ready(true)).await,
+            Some(Some(nodes[0].clone()))
+        );
+        // Failed opens (including permissions), unsupported codecs, and no devices.
+        assert_eq!(
+            first_working_device(devices, |_| std::future::ready(false)).await,
+            None
+        );
+        assert_eq!(
+            first_working_device(hardware_probe_devices("hevc_qsv", &[]), |_| async {
+                panic!("no device should be probed")
+            })
+            .await,
+            None
+        );
+        let (encoders, _) = fallback_encoders();
+        let resolved = resolve_file_settings("hevc", "mkv", &default_settings(), &encoders);
+        assert_eq!(resolved.encoder_name, "libx265");
+        assert!(encoder_render_device(&encoders, &resolved.encoder_name).is_none());
+        let args = device_test_args("libx265", Some(&nodes[0]), "p010le");
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("hw_device") || a == "-vaapi_device" || a == &nodes[0]));
+        // A stale verified path stays explicit, allowing FFmpeg to fail and
+        // trigger the existing runtime fallback instead of switching GPUs.
+        let args = device_test_args("hevc_vaapi", Some("/missing/renderD129"), "nv12");
+        assert!(args.contains(&"/missing/renderD129".into()));
+    }
+
+    #[test]
+    fn detection_uses_hd_frames_above_amd_minimum_width() {
+        let args = test_encode_args("hevc_nvenc", None, "probe.mp4");
+        let source = &args[args.iter().position(|a| a == "-i").unwrap() + 1];
+        let size = source
+            .split(':')
+            .find_map(|s| s.strip_prefix("s="))
+            .unwrap();
+        let (width, height) = size.split_once('x').unwrap();
+        let width: u32 = width.parse().unwrap();
+        let height: u32 = height.parse().unwrap();
+        assert!((384..=8192).contains(&width));
+        assert!((128..=4352).contains(&height));
+        assert_eq!((width, height), (1920, 1080));
+    }
+
+    #[tokio::test]
+    async fn non_drm_backends_keep_default_device_detection() {
+        let devices = hardware_probe_devices("hevc_nvenc", &["/test/dri/renderD129".into()]);
+        assert_eq!(devices, vec![None]);
+        assert_eq!(
+            first_working_device(devices, |_| std::future::ready(true)).await,
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn encoder_info_accepts_old_json_and_round_trips_device() {
+        let mut info: EncoderInfo =
+            serde_json::from_str(r#"{"name":"hevc_vaapi","codecFamily":"hevc","isHardware":true}"#)
+                .unwrap();
+        assert!(info.render_device.is_none());
+        info.render_device = Some("/test/dri/renderD129".into());
+        let json = serde_json::to_string(&info).unwrap();
+        let restored: EncoderInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.render_device, info.render_device);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_node_discovery_is_complete_and_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "renderD130",
+            "card0",
+            "renderD129",
+            "renderD128",
+            "renderD",
+            "renderDbad",
+            "renderD128junk",
+        ] {
+            std::fs::File::create(dir.path().join(name)).unwrap();
+        }
+        std::fs::create_dir(dir.path().join("renderD131")).unwrap();
+        let nodes = find_dri_render_nodes_in(dir.path());
+        assert_eq!(
+            nodes,
+            [128, 129, 130].map(|n| dir
+                .path()
+                .join(format!("renderD{n}"))
+                .to_str()
+                .unwrap()
+                .to_string())
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_find_dri_render_node_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = find_dri_render_node_in(tmp.path());
-        assert_eq!(result, None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_find_dri_render_node_nonexistent_dir() {
-        let result = find_dri_render_node_in(std::path::Path::new(
-            "/nonexistent/path/that/does/not/exist",
-        ));
-        assert_eq!(result, None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_find_dri_render_node_mixed_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::File::create(tmp.path().join("card0")).unwrap();
-        std::fs::File::create(tmp.path().join("renderD128")).unwrap();
-        std::fs::File::create(tmp.path().join("controlD64")).unwrap();
-        let result = find_dri_render_node_in(tmp.path());
-        assert!(result.is_some());
-        assert!(result.unwrap().ends_with("renderD128"));
+    fn render_node_discovery_handles_single_empty_and_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(find_dri_render_nodes_in(dir.path()).is_empty());
+        assert!(find_dri_render_nodes_in(&dir.path().join("missing")).is_empty());
+        std::fs::File::create(dir.path().join("renderD128")).unwrap();
+        assert_eq!(find_dri_render_nodes_in(dir.path()).len(), 1);
     }
 
     // ══════════════════════════════════════════════════════════════
     //  hw_device_init / hw_upload_filter in assemble_ffmpeg_args
     // ══════════════════════════════════════════════════════════════
 
-    /// QSV encoder must emit `-init_hw_device qsv=qs` and
-    /// `-filter_hw_device qs` before `-i`, and the hwupload filter
-    /// must appear in `-vf`. Skipped when no DRI render node exists
-    /// (e.g. CI without a GPU); the no-render-node path is covered
-    /// by `test_assemble_qsv_missing_render_node_emits_sentinel`.
+    /// QSV must derive its session from the selected device before `-i`,
+    /// select that session for filtering, and upload frames in `-vf`.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_qsv_emits_hw_device_init_and_upload() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_qsv"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5620,7 +6032,8 @@ mod tests {
         );
 
         // Verify full QSV init chain
-        assert_eq!(args[hw_init_pos + 1], "qsv=qs");
+        assert_eq!(args[hw_init_pos + 1], "vaapi=va:/test/dri/renderD129");
+        assert!(args.iter().any(|a| a == "qsv=qs@va"));
         let filter_hw_pos = args.iter().position(|a| a == "-filter_hw_device").unwrap();
         assert_eq!(args[filter_hw_pos + 1], "qs");
 
@@ -5639,6 +6052,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_qsv"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5655,30 +6071,22 @@ mod tests {
         );
         let hw_init_pos = args.iter().position(|a| a == "-init_hw_device").unwrap();
         let init_value = &args[hw_init_pos + 1];
-        assert!(
-            init_value == "qsv=qs" || init_value == "qsv=qs_child_device_missing",
-            "unexpected QSV init device value: {init_value}"
-        );
+        assert_eq!(init_value, "vaapi=va:/dev/dri/renderD_missing");
     }
 
     /// VAAPI encoder must emit `-vaapi_device` before `-i` and
-    /// `format=nv12,hwupload` as `-vf`. This test only runs on
-    /// systems where `/dev/dri` exists (i.e. Linux with a GPU);
-    /// the no-render-node path is covered separately below.
+    /// `format=nv12,hwupload` as `-vf`, using an injected device path.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_vaapi_emits_hw_device_init_and_upload() {
-        // Skip if no DRI render node available (e.g. CI without GPU)
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
-
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5709,15 +6117,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_vaapi_missing_render_node_still_emits_vaapi_device() {
-        // This test verifies the fallback path where find_dri_render_node()
-        // returns None. We cannot control the real /dev/dri from a test, so
-        // we verify the *invariant*: if the encoder is _vaapi, the args must
-        // contain -vaapi_device regardless of whether a real node exists.
+        // Missing verification must never silently select a default GPU.
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5744,16 +6152,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_vaapi_10bit_tonemap_uses_vaapi_device() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
-
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "p010le",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5790,6 +6196,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "libx265"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5816,6 +6225,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_nvenc"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "yuv420p",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5834,20 +6246,18 @@ mod tests {
 
     /// QSV encoder with tonemap: the hwupload filter must be chained
     /// after the tonemap filter, not replace it. QSV hwupload is emitted
-    /// only by the Linux `assemble_ffmpeg_args` branch and requires a DRI
-    /// render node, so the test is gated accordingly.
+    /// only by the Linux `assemble_ffmpeg_args` branch.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_qsv_tonemap_chains_hwupload() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_qsv"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5876,20 +6286,18 @@ mod tests {
     }
 
     /// VAAPI encoder with tonemap: the hwupload filter must be
-    /// chained after the tonemap filter. Skipped if no /dev/dri.
+    /// chained after the tonemap filter.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_vaapi_tonemap_chains_hwupload() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
-
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5915,25 +6323,21 @@ mod tests {
     //  10-bit (HDR/DV) hwupload format: p010le instead of nv12
     // ══════════════════════════════════════════════════════════════
 
-    /// VAAPI with 10-bit HDR/DV source (no tonemap) must use hwaccel
-    /// decode instead of format=p010le,hwupload, because the hwupload
-    /// path silently produces green frames on AMD VAAPI. The args must
+    /// With optional GPU decoding enabled for a 10-bit source, the args must
     /// contain -hwaccel vaapi, -hwaccel_device, and -hwaccel_output_format,
     /// must use scale_vaapi=format=p010 to force P010 surface format, and must
     /// NOT contain hwupload or -pix_fmt.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_vaapi_10bit_uses_hwaccel_decode() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
-
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: true,
+            source_format: None,
             pix_fmt: "p010le",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -5985,16 +6389,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_vaapi_8bit_uses_nv12() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
-
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -6016,19 +6418,18 @@ mod tests {
 
     /// QSV with 10-bit HDR/DV source must use format=p010le,hwupload.
     /// QSV args are emitted only by the Linux branch of
-    /// `assemble_ffmpeg_args` and require a DRI render node.
+    /// `assemble_ffmpeg_args`; the device is injected for testing.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_qsv_10bit_uses_p010le() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_qsv"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "p010le",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -6054,19 +6455,18 @@ mod tests {
 
     /// QSV with 8-bit SDR source must use format=nv12,hwupload.
     /// QSV args are emitted only by the Linux branch of
-    /// `assemble_ffmpeg_args` and require a DRI render node.
+    /// `assemble_ffmpeg_args`; the device is injected for testing.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_assemble_qsv_8bit_uses_nv12() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mkv",
             video_args: &["-c:v", "hevc_qsv"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -6094,16 +6494,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_colour_metadata_present_for_vaapi_hwaccel_decode() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
-
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mp4",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: true,
+            source_format: None,
             pix_fmt: "p010le",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -6148,6 +6546,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mp4",
             video_args: &["-c:v", "libx265"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "p010le",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -6178,16 +6579,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_colour_metadata_absent_for_vaapi_8bit() {
-        if find_dri_render_node().is_none() {
-            eprintln!("skipping: no /dev/dri/renderD* available");
-            return;
-        }
-
         let empty: &[String] = &[];
         let args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
             input_path: "input.mkv",
             output_path: "output.mp4",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "nv12",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -6215,6 +6614,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mp4",
             video_args: &["-c:v", "hevc_vaapi"],
+            render_device: Some("/test/dri/renderD129"),
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "p010le",
             audio_map_args: empty,
             audio_codec_args: empty,
@@ -6245,6 +6647,9 @@ mod tests {
             input_path: "input.mkv",
             output_path: "output.mp4",
             video_args: &["-c:v", "libx265"],
+            render_device: None,
+            hardware_decode: false,
+            source_format: None,
             pix_fmt: "p010le",
             audio_map_args: empty,
             audio_codec_args: empty,

@@ -53,13 +53,17 @@ fn main() {
         }
     }
 
+    if args.no_hdr {
+        eprintln!(
+            "ERROR: --no-hdr conflicts with source preservation. HDR-to-SDR conversion is blocked."
+        );
+        std::process::exit(4);
+    }
     // Create the CLI event sink (Arc-wrapped for sharing across probe tasks)
     let sink = Arc::new(cli_sink::CliSink::new(args.log_level.clone()));
 
     // Resolve ffmpeg/ffprobe binary paths (no resource dir for CLI)
     histv_lib::ffmpeg::init(None, None, &*sink);
-    #[cfg(feature = "dovi")]
-    histv_lib::dovi_tools::init(None, &*sink);
 
     // Check ffmpeg availability
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime");
@@ -376,6 +380,7 @@ fn compute_decisions(
                     compatibility_mode: args.compat,
                     preserve_av1: args.preserve_av1,
                     precision_mode: args.precision_mode,
+                    hardware_decoding: args.hardware_decoding,
                     output_folder: String::new(),
                     output_mode: String::new(),
                     threshold: args.bitrate,
@@ -570,41 +575,13 @@ fn print_dry_run_plan(
         );
     }
 
-    // DV/HDR10+ pre-flight warnings
-    {
-        let caps = histv_lib::dovi_tools::capabilities();
-        let dv_count = probed_items
-            .iter()
-            .filter(|item| item.probe.dovi_profile.is_some())
-            .count();
-        let dv5_count = probed_items
-            .iter()
-            .filter(|item| item.probe.dovi_profile == Some(5))
-            .count();
-        let hdr10plus_count = probed_items
-            .iter()
-            .filter(|item| item.probe.has_hdr10plus)
-            .count();
-
-        let yellow = if is_tty { "\x1b[33m" } else { "" };
-
-        if dv_count > 0 && !caps.can_package_dovi_mp4 {
-            eprintln!(
-                "  {yellow}{}WARNING:{reset} {} Dolby Vision file{} will fall back to HDR10 (MP4Box not found)",
-                bold, dv_count, if dv_count == 1 { "" } else { "s" },
-            );
-        }
-        if dv5_count > 0 {
-            eprintln!(
-                "  {yellow}{}WARNING:{reset} {} DV Profile 5 file{} will be encoded as HDR10 without mastering metadata",
-                bold, dv5_count, if dv5_count == 1 { "" } else { "s" },
-            );
-        }
-        if hdr10plus_count > 0 && !caps.can_process_hdr10plus {
-            eprintln!(
-                "  {yellow}{}WARNING:{reset} {} HDR10+ file{} will lose dynamic metadata (hdr10plus support not available)",
-                bold, hdr10plus_count, if hdr10plus_count == 1 { "" } else { "s" },
-            );
+    for item in &probed_items {
+        if let Some(reason) = item
+            .probe
+            .video_format
+            .hdr10_fallback_error(item.probe.dovi_profile, item.probe.dovi_bl_compat_id)
+        {
+            eprintln!("  WARNING: {}: {}", item.file_name, reason);
         }
     }
 
@@ -883,6 +860,7 @@ fn run_batch(
         threads: args.threads,
         low_priority: args.low_priority,
         precision_mode: args.precision_mode,
+        hardware_decoding: args.hardware_decoding,
         compatibility_mode: args.compat,
         preserve_av1: args.preserve_av1,
         force_local: false,
@@ -1038,9 +1016,14 @@ fn resolve_encoder(args: &cli::CliArgs, video_encoders: &[EncoderInfo]) -> Strin
         }
     };
 
+    if args.precision_mode {
+        return encoder::software_fallback(target_family).to_string();
+    }
+
     video_encoders
         .iter()
-        .find(|e| e.codec_family == target_family)
+        .filter(|e| e.codec_family == target_family)
+        .min_by_key(|e| !e.is_hardware)
         .map(|e| e.name.clone())
         .unwrap_or_else(|| encoder::software_fallback(target_family).to_string())
 }
@@ -1156,6 +1139,9 @@ fn merge_job_into_args(args: &mut cli::CliArgs, job: &cli::JobFile) {
     }
     if let Some(lp) = job.low_priority {
         args.low_priority = lp;
+    }
+    if let Some(hw) = job.hardware_decoding {
+        args.hardware_decoding = hw;
     }
     if let Some(pm) = job.precision_mode {
         args.precision_mode = pm;
@@ -1334,11 +1320,13 @@ mod tests {
                 name: "libx265".to_string(),
                 codec_family: "hevc".to_string(),
                 is_hardware: false,
+                render_device: None,
             },
             EncoderInfo {
                 name: "libx264".to_string(),
                 codec_family: "h264".to_string(),
                 is_hardware: false,
+                render_device: None,
             },
         ]
     }
@@ -1518,6 +1506,7 @@ mod tests {
             codec: Some("h264".into()),
             threads: Some(4),
             precision_mode: Some(true),
+            hardware_decoding: None,
             ..Default::default()
         };
         merge_job_into_args(&mut args, &job);
@@ -1578,6 +1567,35 @@ mod tests {
     }
 
     // ── resolve_encoder ────────────────────────────────────────
+
+    #[test]
+    fn auto_encoder_prefers_verified_hardware_after_software_entries() {
+        let args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let mut encoders = default_encoders();
+        for name in ["hevc_vaapi", "hevc_qsv"] {
+            encoders.push(EncoderInfo {
+                name: name.into(),
+                codec_family: "hevc".into(),
+                is_hardware: true,
+                render_device: Some("/test/dri/renderD167".into()),
+            });
+        }
+        assert_eq!(resolve_encoder(&args, &encoders), "hevc_vaapi");
+    }
+
+    #[test]
+    fn precision_keeps_software_when_verified_hardware_exists() {
+        let mut args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        args.precision_mode = true;
+        let mut encoders = default_encoders();
+        encoders.push(EncoderInfo {
+            name: "hevc_vaapi".into(),
+            codec_family: "hevc".into(),
+            is_hardware: true,
+            render_device: Some("/test/dri/renderD167".into()),
+        });
+        assert_eq!(resolve_encoder(&args, &encoders), "libx265");
+    }
 
     #[test]
     fn test_resolve_encoder_forced() {

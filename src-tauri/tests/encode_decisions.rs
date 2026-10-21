@@ -12,11 +12,13 @@ fn sw_encoders() -> Vec<EncoderInfo> {
             name: "libx265".to_string(),
             codec_family: "hevc".to_string(),
             is_hardware: false,
+            render_device: None,
         },
         EncoderInfo {
             name: "libx264".to_string(),
             codec_family: "h264".to_string(),
             is_hardware: false,
+            render_device: None,
         },
     ]
 }
@@ -26,6 +28,7 @@ fn base_settings() -> BatchSettings {
         compatibility_mode: false,
         preserve_av1: false,
         precision_mode: false,
+        hardware_decoding: false,
         output_folder: String::new(),
         output_mode: String::new(),
         threshold: 4.0,
@@ -246,6 +249,7 @@ fn precision_mode_forces_software() {
             name: "hevc_nvenc".to_string(),
             codec_family: "hevc".to_string(),
             is_hardware: true,
+            render_device: None,
         },
     );
 
@@ -375,12 +379,13 @@ fn wave_cleanup_auto_container_derives_from_source_ext() {
 /// resolve_container with is_dovi_tier1=true always forces mp4, regardless
 /// of the container_setting or source extension.
 #[test]
-fn resolve_container_dovi_tier1_always_forces_mp4() {
+fn dolby_vision_never_overrides_the_selected_container() {
     for container in &["auto", "mkv", "mp4"] {
         let result = encoder::resolve_container("video.mkv", container, true);
         assert_eq!(
-            result, "mp4",
-            "DV Tier 1 must force mp4 with container={container}"
+            result,
+            if *container == "mp4" { "mp4" } else { "mkv" },
+            "DV must not override container={container}"
         );
     }
 }

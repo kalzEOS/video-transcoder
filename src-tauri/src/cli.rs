@@ -100,6 +100,10 @@ pub struct CliArgs {
     #[arg(long = "precision")]
     pub precision_mode: bool,
 
+    /// Use supported GPU decoding, falling back safely to software decoding.
+    #[arg(long)]
+    pub hardware_decoding: bool,
+
     /// Convert all files to H.264/MP4 with AAC audio for maximum device
     /// compatibility. Overrides --codec, --container, and --audio.
     #[arg(long = "compat", conflicts_with = "preserve_av1")]
@@ -396,6 +400,8 @@ pub struct JobFile {
     pub low_priority: Option<bool>,
     pub precision_mode: Option<bool>,
     #[serde(default)]
+    pub hardware_decoding: Option<bool>,
+    #[serde(default)]
     pub compat: Option<bool>,
     #[serde(default)]
     pub preserve_av1: Option<bool>,
@@ -451,6 +457,7 @@ pub fn export_job_file(args: &CliArgs, path: &std::path::Path) -> Result<(), Str
         threads: Some(args.threads),
         low_priority: Some(args.low_priority),
         precision_mode: Some(args.precision_mode),
+        hardware_decoding: Some(args.hardware_decoding),
         compat: Some(args.compat),
         preserve_av1: Some(args.preserve_av1),
     };

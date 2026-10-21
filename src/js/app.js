@@ -50,6 +50,7 @@
     const rcToggle        = $('#rc-toggle');
     const chkHdr          = $('#chk-hdr');
     const chkPrecision    = $('#chk-precision');
+    const chkHardwareDecoding = $('#chk-hardware-decoding');
     const numThreads      = $('#num-threads');
     const chkLowPriority  = $('#chk-low-priority');
     const selTheme        = $('#sel-theme');
@@ -182,14 +183,14 @@
         numQpI.value = cfg.qpI ?? 20;
         numQpP.value = cfg.qpP ?? 22;
         numCrf.value = cfg.crf ?? 20;
-        chkHdr.checked = cfg.hdr || false;
+        chkHdr.checked = true;
         chkPrecision.checked = cfg.precisionMode || false;
+        chkHardwareDecoding.checked = cfg.hardwareDecoding || false;
 		chkPreserveAv1.checked = cfg.preserveAv1 || false;
         chkCompat.checked = cfg.compatibilityMode || false;
         // Enforce mutual exclusion on load (compat wins if both are saved)
         if (chkCompat.checked) {
           chkPreserveAv1.checked = false;
-          chkHdr.checked = false;
         }
         numThreads.value = cfg.threads ?? 0;
         chkLowPriority.checked = cfg.lowPriority || false;
@@ -247,6 +248,7 @@
               rateControlMode: getCurrentRcMode(),
               hdr: chkHdr.checked,
               precisionMode: chkPrecision.checked,
+              hardwareDecoding: chkHardwareDecoding.checked,
 			  compatibilityMode: chkCompat.checked,
               preserveAv1: chkPreserveAv1.checked,
               threads: parseInt(numThreads.value, 10) || 0,
@@ -918,7 +920,7 @@
 	// ── HDR type label from queue item ──
     function hdrTypeLabel(item) {
       if (item.doviProfile != null) {
-        return 'DV' + item.doviProfile;
+        return 'DV' + item.doviProfile + (item.hasHdr10plus ? ' + HDR10+' : '');
       }
       if (item.hasHdr10plus) return 'HDR10+';
       if (item.isHdr) {
@@ -1486,7 +1488,6 @@
       chkCompat.addEventListener('change', () => {
         if (chkCompat.checked) {
           chkPreserveAv1.checked = false;
-          chkHdr.checked = false;
         }
         updateEncoderSummary();
         updateRcModeVisibility();
@@ -1549,7 +1550,7 @@
       const simpleSaveControls = [
         txtOutputFolder,
         chkOverwrite, chkDeleteSource, chkSaveLog, chkToast, chkAutoClear,
-        chkPrecision, numThreads, chkLowPriority, selPostAction, txtCustomCmd, numCountdown
+        chkPrecision, chkHardwareDecoding, numThreads, chkLowPriority, selPostAction, txtCustomCmd, numCountdown
       ];
       for (const el of simpleSaveControls) {
         el.addEventListener('change', scheduleConfigSave);
@@ -1685,7 +1686,7 @@
         setPeakMultiplier(p.peak);
         chkCompat.checked = p.compat;
         chkPreserveAv1.checked = p.av1;
-        chkHdr.checked = p.hdr;
+        chkHdr.checked = true;
         chkPrecision.checked = false;
         applying = false;
         updateRcModeVisibility();
@@ -2294,21 +2295,6 @@
           if (warnings && warnings.length > 0) {
             const action = await showPreflightModal(warnings);
             if (action === 'cancel') return;
-            if (action === 'download') {
-              try {
-                appendLog('[preflight] Downloading MP4Box...');
-                await invoke('download_mp4box');
-                appendLog('[preflight] MP4Box installed - starting encode');
-                // Re-run preflight; if clear, fall through to start
-                const recheck = await invoke('preflight_check');
-                if (recheck && recheck.length > 0) {
-                  appendLog('[preflight] Warning: some files still affected after download');
-                }
-              } catch (e) {
-                appendLog('[preflight] MP4Box download failed: ' + e);
-                return;
-              }
-            }
             // action === 'continue': fall through
           }
         } catch (e) {
@@ -2356,8 +2342,9 @@
             qpP: parseInt(numQpP.value, 10) || 22,
             crf: parseInt(numCrf.value, 10) || 20,
             rateControlMode: getCurrentRcMode(),
-            pixFmt: chkHdr.checked ? 'p010le' : 'yuv420p',
+            pixFmt: 'p010le', // Legacy field; backend derives precision per source.
             precisionMode: chkPrecision.checked,
+              hardwareDecoding: chkHardwareDecoding.checked,
             compatibilityMode: chkCompat.checked,
             preserveAv1: chkPreserveAv1.checked,
             threads: parseInt(numThreads.value, 10) || 0,
@@ -2562,11 +2549,10 @@
         const modal = $('#modal-preflight');
         const tbody = $('#preflight-table-body');
         tbody.innerHTML = '';
-        const hasMissing = warnings.some(w => w.missingTool);
 
         for (const w of warnings) {
           const tr = document.createElement('tr');
-          for (const text of [w.fileName, w.sourceType, w.actualOutcome, w.missingTool || '-']) {
+          for (const text of [w.fileName, w.sourceType, w.actualOutcome]) {
             const td = document.createElement('td');
             td.textContent = text;
             tr.appendChild(td);
@@ -2574,22 +2560,16 @@
           tbody.appendChild(tr);
         }
 
-        const dlBtn = $('#pf-download');
-        dlBtn.style.display = hasMissing ? '' : 'none';
-
         modal.classList.add('visible');
         trapFocusInModal(modal);
         function cleanup() {
           releaseFocusTrap(modal);
           modal.classList.remove('visible');
-          dlBtn.removeEventListener('click', onDl);
           $('#pf-continue').removeEventListener('click', onCont);
           $('#pf-cancel').removeEventListener('click', onCancel);
         }
-        function onDl()     { cleanup(); resolve('download'); }
         function onCont()   { cleanup(); resolve('continue'); }
         function onCancel() { cleanup(); resolve('cancel'); }
-        dlBtn.addEventListener('click', onDl);
         $('#pf-continue').addEventListener('click', onCont);
         $('#pf-cancel').addEventListener('click', onCancel);
       });
@@ -2743,9 +2723,35 @@
         appendLog(event.payload);
       });
 
+      // Stage percentages describe only the current operation, never the whole job.
+      let processingStage = '';
+      listen('processing-stage', (event) => {
+        const { stage, message, percent } = event.payload;
+        if (stage === 'encoding' && processingStage !== 'encoding') fileEncodeStart = performance.now();
+        processingStage = stage;
+        const terminal = ['failed', 'cancelled', 'complete'].includes(stage);
+        const measured = Number.isFinite(percent);
+        progressBarContainer?.classList.toggle('is-indeterminate', !measured && !terminal);
+        progressBarContainer?.setAttribute('aria-label', message);
+        if (measured) {
+          progressBar.style.width = percent.toFixed(1) + '%';
+          progressBarContainer?.setAttribute('aria-valuenow', Math.round(percent));
+        } else {
+          progressBarContainer?.removeAttribute('aria-valuenow');
+          progressBar.style.width = '0%';
+        }
+        jobStatus.textContent = ({preparing:'Preparing video', encoding:'Encoding video', reinserting:'Reinserting HDR metadata', finalizing:'Finalizing output', failed:'Processing failed', cancelled:'Cancelled', complete:'Completed'})[stage] || 'Processing video';
+        jobProgressText.textContent = message + (measured ? ` (${percent.toFixed(0)}%)` : '');
+        document.title = `${jobStatus.textContent} - ${defaultTitle}`;
+        announceStatus(message);
+      });
+
       // Per-file progress (duration-based)
       listen('file-progress', (event) => {
         const { percent, timeSecs, totalSecs, pass } = event.payload;
+        progressBarContainer?.classList.remove('is-indeterminate');
+        progressBarContainer?.setAttribute('aria-label', 'Video encoding progress');
+        jobStatus.textContent = 'Encoding video';
         progressBar.style.width = percent.toFixed(1) + '%';
         if (progressBarContainer) progressBarContainer.setAttribute('aria-valuenow', Math.round(percent));
         const elapsed = formatDuration(timeSecs);
@@ -2866,13 +2872,15 @@
         const { current, total } = event.payload;
         batchCurrentFile = current;
         batchTotalFiles = total;
-        fileEncodeStart = performance.now();
-        jobStatus.textContent = `Encoding file ${current} of ${total}`;
-        announceStatus(`Encoding file ${current} of ${total}`);
+        fileEncodeStart = 0;
+        processingStage = '';
+        jobStatus.textContent = `Preparing file ${current} of ${total}`;
+        announceStatus(`Preparing file ${current} of ${total}`);
         // Reset per-file progress bar when a new file starts
         progressBar.style.width = '0%';
-        if (progressBarContainer) progressBarContainer.setAttribute('aria-valuenow', 0);
-        jobProgressText.textContent = '0%';
+        progressBarContainer?.classList.add('is-indeterminate');
+        progressBarContainer?.removeAttribute('aria-valuenow');
+        jobProgressText.textContent = 'Preparing video...';
         // Update overall batch progress bar (completed files only)
         const batchPct = total > 0 ? ((current - 1) / total) * 100 : 0;
         batchProgressBar.style.width = batchPct + '%';
@@ -2881,10 +2889,9 @@
 
       // Batch status label (current file name)
       listen('batch-status', (event) => {
-        jobStatus.textContent = 'Encoding...';
         jobFile.textContent = event.payload;
         jobFile.title = event.payload;
-        announceStatus('Encoding ' + event.payload);
+        announceStatus(event.payload);
       });
 
       // Batch command label
@@ -2915,6 +2922,9 @@
         document.title = defaultTitle;
         btnPause.textContent = 'Pause';
         jobStatus.textContent = 'No job running';
+        processingStage = '';
+        progressBarContainer?.classList.remove('is-indeterminate');
+        progressBarContainer?.setAttribute('aria-label', 'File encoding progress');
         statusCmd.textContent = '';
         jobFile.textContent = '';
         jobProgressText.textContent = '';

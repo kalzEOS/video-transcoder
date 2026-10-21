@@ -1,18 +1,14 @@
 pub mod disk_monitor;
-#[cfg(feature = "dovi")]
-pub mod dovi_pipeline;
-pub mod dovi_tools;
 pub mod encoder;
 pub mod events;
 pub mod ffmpeg;
-#[cfg(feature = "dovi")]
-pub mod hdr10plus_pipeline;
-pub mod hevc_utils;
 pub mod mkv_tags;
+pub mod pipeline_progress;
 pub mod probe;
 pub mod queue;
 pub mod remote;
 pub mod staging;
+pub mod video_format;
 pub mod webp_decode;
 
 #[cfg(test)]
@@ -75,6 +71,9 @@ mod gui_commands {
     }
 
     impl EventSink for IndexMappingSink {
+        fn processing_stage(&self, stage: &str, message: &str, percent: Option<f64>) {
+            self.inner.processing_stage(stage, message, percent);
+        }
         fn log(&self, message: &str) {
             self.inner.log(message);
         }
@@ -840,29 +839,6 @@ mod gui_commands {
     ) -> Result<(), String> {
         Err("Download feature not available in this build.".to_string())
     }
-
-    #[cfg(feature = "downloader")]
-    #[tauri::command]
-    pub async fn download_mp4box(app: tauri::AppHandle) -> Result<(), String> {
-        use tauri::Manager;
-        let sink = tauri_sink::TauriSink::new(app.clone());
-        dovi_tools::download_mp4box(&sink).await?;
-
-        // Re-resolve MP4Box path now that it's installed
-        let resource_dir = app.path().resource_dir().ok();
-        dovi_tools::reinit(resource_dir.as_deref(), &sink);
-
-        // Restore encoder summary in case it was overwritten by any
-        // download-progress events that leaked into the wrong UI element.
-        let _ = app.emit("encoder-detection-done", ());
-        Ok(())
-    }
-
-    #[cfg(not(feature = "downloader"))]
-    #[tauri::command]
-    pub async fn download_mp4box(_app: tauri::AppHandle) -> Result<(), String> {
-        Err("Download feature not available in this build.".to_string())
-    }
 }
 
 // ── App entry ───────────────────────────────────────────────────
@@ -924,7 +900,6 @@ pub fn run() {
             check_ffmpeg_available,
             get_ffmpeg_dir,
             download_ffmpeg,
-            download_mp4box,
             reveal_file,
             open_file,
         ])
@@ -934,9 +909,6 @@ pub fn run() {
             // Resolve ffmpeg/ffprobe binary paths (sidecar or PATH)
             let resource_dir = app.path().resource_dir().ok();
             ffmpeg::init(resource_dir.as_deref(), None, &sink);
-
-            // Resolve DV tool paths (MP4Box)
-            dovi_tools::init(resource_dir.as_deref(), &sink);
 
             // Load config
             let loaded_config = config::load_config(app.handle());

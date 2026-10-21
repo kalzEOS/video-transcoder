@@ -39,12 +39,14 @@ impl EventSink for NoopSink {
 /// `EventSink` that records all `log()` calls for later assertion.
 pub struct RecordingSink {
     pub logs: Mutex<Vec<String>>,
+    pub stages: Mutex<Vec<(String, String, Option<f64>)>>,
 }
 
 impl RecordingSink {
     pub fn new() -> Self {
         Self {
             logs: Mutex::new(Vec::new()),
+            stages: Mutex::new(Vec::new()),
         }
     }
 
@@ -61,6 +63,12 @@ impl Default for RecordingSink {
 }
 
 impl EventSink for RecordingSink {
+    fn processing_stage(&self, stage: &str, message: &str, percent: Option<f64>) {
+        self.stages
+            .lock()
+            .unwrap()
+            .push((stage.into(), message.into(), percent));
+    }
     fn log(&self, message: &str) {
         self.logs.lock().unwrap().push(message.to_string());
     }
@@ -231,6 +239,7 @@ pub fn default_settings() -> BatchSettings {
         threads: 0,
         low_priority: false,
         precision_mode: false,
+        hardware_decoding: false,
         compatibility_mode: false,
         preserve_av1: false,
         force_local: false,
@@ -249,16 +258,19 @@ pub fn default_encoders() -> Vec<EncoderInfo> {
             name: "hevc_nvenc".to_string(),
             codec_family: "hevc".to_string(),
             is_hardware: true,
+            render_device: None,
         },
         EncoderInfo {
             name: "h264_nvenc".to_string(),
             codec_family: "h264".to_string(),
             is_hardware: true,
+            render_device: None,
         },
         EncoderInfo {
             name: "libsvtav1".to_string(),
             codec_family: "av1".to_string(),
             is_hardware: false,
+            render_device: None,
         },
     ]
 }
@@ -277,6 +289,11 @@ pub fn synthetic_probe(
     hdr: bool,
 ) -> ProbeResult {
     ProbeResult {
+        video_format: crate::video_format::VideoFormat {
+            pixel_format: if hdr { "yuv420p10le" } else { "yuv420p" }.into(),
+            bit_depth: if hdr { 10 } else { 8 },
+            ..Default::default()
+        },
         video_codec: codec.to_string(),
         video_width: 1920,
         video_height: 1080,
@@ -294,6 +311,7 @@ pub fn synthetic_probe(
             bitrate_kbps: 128,
         }],
         duration_secs,
+        start_time_secs: 0.0,
         dovi_profile: None,
         dovi_bl_compat_id: None,
         has_hdr10plus: false,

@@ -8,6 +8,8 @@ use crate::queue::AudioStreamInfo;
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResult {
     pub video_codec: String,
+    #[serde(default)]
+    pub video_format: crate::video_format::VideoFormat,
     pub video_width: u32,
     pub video_height: u32,
     pub video_bitrate_bps: f64,
@@ -16,6 +18,8 @@ pub struct ProbeResult {
     pub color_transfer: String,
     pub audio_streams: Vec<AudioStreamInfo>,
     pub duration_secs: f64,
+    #[serde(default)]
+    pub start_time_secs: f64,
     pub dovi_profile: Option<u8>,
     pub dovi_bl_compat_id: Option<u8>,
     pub has_hdr10plus: bool,
@@ -25,7 +29,12 @@ pub struct ProbeResult {
 
 /// Run ffprobe with the given arguments and return trimmed stdout.
 async fn run_ffprobe(args: &[&str]) -> Result<String, String> {
+    run_ffprobe_mode(args, false).await
+}
+
+async fn run_ffprobe_mode(args: &[&str], verify_decode: bool) -> Result<String, String> {
     let output = ffmpeg::ffprobe_command()
+        .kill_on_drop(true)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -35,7 +44,33 @@ async fn run_ffprobe(args: &[&str]) -> Result<String, String> {
         .await
         .map_err(|e| format!("ffprobe wait failed: {e}"))?;
 
+    if verify_decode {
+        check_decoded_probe(output.status.success(), &output.stderr)?;
+    }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn check_decoded_probe(success: bool, stderr: &[u8]) -> Result<(), String> {
+    if !success || !stderr.is_empty() {
+        return Err(format!(
+            "Encoded video failed decoding validation: {}",
+            String::from_utf8_lossy(stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod decode_validation_tests {
+    #[test]
+    fn concealed_decoder_errors_are_rejected_even_with_exit_zero() {
+        assert!(
+            super::check_decoded_probe(true, b"The cu_qp_delta is outside the valid range")
+                .is_err()
+        );
+        assert!(super::check_decoded_probe(false, b"").is_err());
+        assert!(super::check_decoded_probe(true, b"").is_ok());
+    }
 }
 
 /// Public ffprobe runner for use by other modules (e.g. mkv_tags deep repair).
@@ -77,6 +112,23 @@ fn parse_numeric(s: &str) -> Option<f64> {
 /// metadata in one go. Only the packet-counting bitrate fallback (tier 4)
 /// requires a second invocation, and that's rare.
 pub async fn probe_file(file_path: &str, sink: &dyn EventSink) -> Result<ProbeResult, String> {
+    probe_file_mode(file_path, sink, false).await
+}
+
+/// Reuse the existing bounded frame probe, but reject decoder errors instead
+/// of accepting concealed/corrupt pictures merely because HDR tags are valid.
+pub async fn probe_file_for_validation(
+    file_path: &str,
+    sink: &dyn EventSink,
+) -> Result<ProbeResult, String> {
+    probe_file_mode(file_path, sink, true).await
+}
+
+async fn probe_file_mode(
+    file_path: &str,
+    sink: &dyn EventSink,
+    verify_decode: bool,
+) -> Result<ProbeResult, String> {
     // Animated WebP: ffprobe can't extract metadata, use RIFF parser
     if file_path.to_lowercase().ends_with(".webp") {
         if let Ok(Some(info)) = crate::webp_decode::probe_webp(std::path::Path::new(file_path)) {
@@ -89,6 +141,11 @@ pub async fn probe_file(file_path: &str, sink: &dyn EventSink) -> Result<ProbeRe
             };
             return Ok(ProbeResult {
                 video_codec: "webp".to_string(),
+                video_format: crate::video_format::VideoFormat {
+                    pixel_format: "yuv420p".into(),
+                    bit_depth: 8,
+                    ..Default::default()
+                },
                 video_width: info.width,
                 video_height: info.height,
                 video_bitrate_bps: bitrate_bps,
@@ -97,6 +154,7 @@ pub async fn probe_file(file_path: &str, sink: &dyn EventSink) -> Result<ProbeRe
                 color_transfer: String::new(),
                 audio_streams: Vec::new(),
                 duration_secs: duration,
+                start_time_secs: 0.0,
                 dovi_profile: None,
                 dovi_bl_compat_id: None,
                 has_hdr10plus: false,
@@ -134,6 +192,7 @@ pub async fn probe_file(file_path: &str, sink: &dyn EventSink) -> Result<ProbeRe
     // ── Single-pass stream extraction (#9) ──
     // Extract both video and audio stream info in one iteration.
     let mut video_codec = String::new();
+    let mut video_format = crate::video_format::VideoFormat::default();
     let mut video_width: u32 = 0;
     let mut video_height: u32 = 0;
     let mut stream_bitrate: Option<f64> = None;
@@ -157,6 +216,7 @@ pub async fn probe_file(file_path: &str, sink: &dyn EventSink) -> Result<ProbeRe
             }
 
             if codec_type == "video" && video_codec.is_empty() {
+                video_format = crate::video_format::VideoFormat::from_stream(s);
                 // First video stream
 
                 // ── Dolby Vision / HDR10+ side data detection ──
@@ -367,7 +427,68 @@ pub async fn probe_file(file_path: &str, sink: &dyn EventSink) -> Result<ProbeRe
 
     let video_bitrate_mbps = video_bitrate_bps / 1_000_000.0;
 
+    // Static HDR SEI and HDR10+ may be attached to frames rather than streams.
+    // Inspect a bounded initial interval, never a full movie packet scan.
+    {
+        let frame_result = run_ffprobe_mode(&[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-read_intervals",
+            "%+#24",
+            "-show_frames",
+            "-show_entries",
+            "frame=pix_fmt,color_primaries,color_transfer,color_space,color_range,side_data_list",
+            "-of",
+            "json",
+            file_path,
+        ], verify_decode).await;
+        if verify_decode {
+            if let Err(error) = &frame_result {
+                return Err(error.clone());
+            }
+        }
+        if let Ok(raw) = frame_result {
+            if let Ok(frames) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(frames) = frames["frames"].as_array() {
+                    if verify_decode && frames.is_empty() {
+                        return Err("Encoded video contains no decodable pictures".into());
+                    }
+                    for frame in frames {
+                        let frame_format = crate::video_format::VideoFormat::from_stream(frame);
+                        if !crate::video_format::known(&video_format.primaries) {
+                            video_format.primaries = frame_format.primaries;
+                        }
+                        if !crate::video_format::known(&video_format.transfer) {
+                            video_format.transfer = frame_format.transfer;
+                        }
+                        if !crate::video_format::known(&video_format.matrix) {
+                            video_format.matrix = frame_format.matrix;
+                        }
+                        if !crate::video_format::known(&video_format.range) {
+                            video_format.range = frame_format.range;
+                        }
+                        video_format.absorb_side_data(&frame["side_data_list"]);
+                        if let Some(data) = frame["side_data_list"].as_array() {
+                            has_hdr10plus |= data.iter().any(|v| {
+                                v["side_data_type"].as_str().is_some_and(|s| {
+                                    s.contains("HDR Dynamic Metadata") || s.contains("SMPTE2094-40")
+                                })
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    is_hdr |= matches!(video_format.transfer.as_str(), "smpte2084" | "arib-std-b67")
+        || !video_format.static_hdr.is_empty();
+    if crate::video_format::known(&video_format.transfer) {
+        color_transfer = video_format.transfer.clone();
+    }
     Ok(ProbeResult {
+        video_format,
         video_codec,
         video_width,
         video_height,
@@ -377,6 +498,10 @@ pub async fn probe_file(file_path: &str, sink: &dyn EventSink) -> Result<ProbeRe
         color_transfer,
         audio_streams,
         duration_secs,
+        start_time_secs: format["start_time"]
+            .as_str()
+            .and_then(parse_numeric)
+            .unwrap_or(0.0),
         dovi_profile,
         dovi_bl_compat_id,
         has_hdr10plus,

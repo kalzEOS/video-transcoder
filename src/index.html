@@ -174,10 +174,17 @@
             <div class="section-header">Behaviour</div>
 
             <div class="checkbox-row has-tooltip">
-              <input type="checkbox" id="chk-hdr" />
-              <label for="chk-hdr">Preserve HDR</label>
+              <input type="checkbox" id="chk-hdr" checked disabled />
+              <label for="chk-hdr">Preserve source HDR and bit depth</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">When ticked, HDR files stay HDR (Dolby Vision / HDR10+ preserved when tools are available). When unticked, HDR is converted to SDR with proper tonemapping.</span>
+              <span class="tooltip-text">Always preserves source bit depth and HDR. 8-bit stays 8-bit; 10-bit stays 10-bit. HDR10 color and static metadata are verified. Compatible Dolby Vision Profile 8 uses its HDR10 base layer. Dolby Vision and HDR10+ dynamic metadata are not guaranteed on re-encoding.</span>
+            </div>
+
+            <div class="checkbox-row has-tooltip">
+              <input type="checkbox" id="chk-hardware-decoding" />
+              <label for="chk-hardware-decoding">Hardware Decoding (GPU)</label>
+              <span class="tooltip-icon">?</span>
+              <span class="tooltip-text">Enable to try GPU decoding and encoding on the same verified device. Unsupported formats or failed GPU decoding automatically use CPU decoding while keeping the GPU encoder when compatible. Source bit depth and HDR10 colors are preserved.</span>
             </div>
 
             <div class="checkbox-row has-tooltip">
@@ -191,7 +198,7 @@
               <input type="checkbox" id="chk-compat" />
               <label for="chk-compat">Compatibility mode</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">Convert everything to H.264/MP4 for maximum device support back to ~2010.</span>
+              <span class="tooltip-text">Use H.264/MP4 for compatible 8-bit SDR sources. HDR and higher bit-depth sources are blocked rather than converted to SDR or reduced precision.</span>
             </div>
 
             <div class="checkbox-row has-tooltip">
@@ -393,10 +400,10 @@
       </div>
     </div>
 
-    <!-- ═══ Modal: Pre-flight DV/HDR10+ warnings ═══ -->
+    <!-- ═══ Modal: HDR10 fallback safety warnings ═══ -->
     <div class="modal-overlay" id="modal-preflight" role="dialog" aria-modal="true" aria-labelledby="modal-preflight-title">
       <div class="modal-box modal-wide">
-        <div class="modal-title" id="modal-preflight-title">Some files need additional tools for best results</div>
+        <div class="modal-title" id="modal-preflight-title">Some files have no safe HDR10 fallback</div>
         <div class="modal-body" id="preflight-body">
           <table class="preflight-table">
             <thead>
@@ -404,15 +411,13 @@
                 <th>File</th>
                 <th>Source</th>
                 <th>Outcome</th>
-                <th>Missing</th>
               </tr>
             </thead>
             <tbody id="preflight-table-body"></tbody>
           </table>
         </div>
         <div class="modal-buttons">
-          <button class="btn btn-primary" id="pf-download">Download tools</button>
-          <button class="btn" id="pf-continue">Encode anyway</button>
+          <button class="btn" id="pf-continue">Continue with safety checks</button>
           <button class="btn" id="pf-cancel">Cancel</button>
         </div>
       </div>

@@ -76,6 +76,14 @@ impl TauriSink {
 }
 
 impl EventSink for TauriSink {
+    fn processing_stage(&self, stage: &str, message: &str, percent: Option<f64>) {
+        let _ = self.app.emit(
+            "processing-stage",
+            serde_json::json!({
+                "stage": stage, "message": message, "percent": percent
+            }),
+        );
+    }
     fn log(&self, message: &str) {
         let _ = self.app.emit("log", message);
     }

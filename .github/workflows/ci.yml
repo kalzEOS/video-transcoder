@@ -62,10 +62,10 @@ jobs:
 
       - name: Run tests (library, integration, CLI binary)
         working-directory: src-tauri
-        # `--features dovi,cli` already compiles and tests every crate in the
+        # `--features cli` already compiles and tests every crate in the
         # workspace, histv-cli included; a separate `--bin histv-cli` run added
         # no unique coverage, so it was removed.
-        run: cargo test --features dovi,cli
+        run: cargo test --features cli
 
       - name: Feature combination check (CLI-only, no dovi)
         working-directory: src-tauri
@@ -73,11 +73,11 @@ jobs:
 
       - name: Feature combination check (all features)
         working-directory: src-tauri
-        run: cargo check --features dovi,cli,downloader
+        run: cargo check --features cli,downloader
 
       - name: Clippy lint check
         working-directory: src-tauri
-        run: cargo clippy --features dovi,cli -- -D warnings
+        run: cargo clippy --features cli -- -D warnings
 
       - name: Frontend JS tests
         run: node --test src/js/lib.test.js
@@ -89,9 +89,9 @@ jobs:
       matrix:
         include:
           - os: macos-14
-            features: "dovi,cli"
+            features: "cli"
           - os: windows-2022
-            features: "dovi,cli"
+            features: "cli"
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout

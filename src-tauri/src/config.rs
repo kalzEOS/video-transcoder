@@ -34,6 +34,7 @@ pub struct AppConfig {
     pub threads: u32,
     pub low_priority: bool,
     pub precision_mode: bool,
+    pub hardware_decoding: bool,
     #[serde(default)]
     pub compatibility_mode: bool,
     #[serde(default)]
@@ -70,6 +71,7 @@ impl Default for AppConfig {
             threads: 0,
             low_priority: false,
             precision_mode: false,
+            hardware_decoding: false,
             compatibility_mode: false,
             preserve_av1: false,
             force_local: false,
@@ -154,6 +156,20 @@ pub fn save_config(app: &AppHandle, config: &AppConfig) -> Result<(), Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hardware_decoding_defaults_off_and_persists() {
+        let old: AppConfig = serde_json::from_str(r#"{"hdr":true}"#).unwrap();
+        assert!(!old.hardware_decoding);
+        let mut config = old;
+        config.hardware_decoding = true;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let restored: AppConfig = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(restored.hardware_decoding);
+        assert!(restored.hdr);
+    }
 
     #[test]
     fn test_default_round_trip() {
