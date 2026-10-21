@@ -1,0 +1,681 @@
+//! HEVC Annex B utilities for optional HDR10+ preservation.
+//!
+//! Provides a streaming NAL unit reader/writer that processes bitstreams
+//! without loading them entirely into memory.
+
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::path::Path;
+
+use tempfile::TempDir;
+
+/// Annex B start code (4-byte form).
+pub const START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+
+/// HEVC NAL unit types.
+pub const HEVC_NAL_UNSPEC62: u8 = 62; // Dolby Vision RPU
+pub const HEVC_NAL_SEI_PREFIX: u8 = 39;
+
+/// A parsed NAL unit from an Annex B bitstream.
+pub struct NalUnit {
+    /// NAL unit type (6 bits from first byte of the NAL header).
+    pub nal_type: u8,
+    /// Raw NAL unit data (excluding the start code, including the NAL header).
+    pub data: Vec<u8>,
+}
+
+impl NalUnit {
+    /// Whether this is a VCL NAL unit (types 0-31).
+    pub fn is_vcl(&self) -> bool {
+        self.nal_type <= 31
+    }
+
+    /// Whether this is the first slice segment of a new picture.
+    /// Checks the `first_slice_segment_in_pic_flag` (MSB of the byte
+    /// after the 2-byte NAL header).
+    pub fn is_first_slice_of_picture(&self) -> bool {
+        self.is_vcl() && self.data.len() > 2 && (self.data[2] & 0x80) != 0
+    }
+}
+
+// ── Streaming NAL Reader ──────────────────────────────────────────
+
+/// Maximum allowed NAL unit size (256 MB). A legitimate 4K HEVC slice is
+/// at most a few MB. If we accumulate beyond this without finding the next
+/// start code, the bitstream is malformed. Without this guard, a truncated
+/// or corrupted bitstream could cause the reader to buffer the entire
+/// remaining file (potentially tens of GB) looking for a start code.
+const MAX_NAL_SIZE: usize = 256 * 1024 * 1024;
+
+/// Reads NAL units one at a time from an Annex B bitstream without
+/// loading the entire file into memory.
+///
+/// Uses a state machine that scans for start codes (0x000001 or 0x00000001)
+/// in a buffered reader, accumulating each NAL unit's bytes.
+pub struct NalReader<R: Read> {
+    bytes_scanned: u64,
+    reader: BufReader<R>,
+    /// Accumulator for the current NAL unit being read.
+    buf: Vec<u8>,
+    /// Number of consecutive zero bytes seen.
+    zeros: u32,
+    /// Whether we've found the first start code yet.
+    started: bool,
+    /// Whether the underlying reader is exhausted.
+    eof: bool,
+}
+
+impl<R: Read> NalReader<R> {
+    /// Reuse the largest discarded NAL allocation on the next read.
+    pub fn recycle(&mut self, mut nalu: NalUnit) {
+        if nalu.data.capacity() > self.buf.capacity() {
+            nalu.data.clear();
+            self.buf = nalu.data;
+        }
+    }
+    pub fn bytes_scanned(&self) -> u64 {
+        self.bytes_scanned
+    }
+    pub fn new(reader: R) -> Self {
+        Self {
+            bytes_scanned: 0,
+            // 2 MB read buffer — 4K HEVC slices can be several MB each
+            reader: BufReader::with_capacity(2 * 1024 * 1024, reader),
+            buf: Vec::with_capacity(256 * 1024),
+            zeros: 0,
+            started: false,
+            eof: false,
+        }
+    }
+
+    /// Read the next NAL unit from the stream.
+    /// Returns `None` at end of stream.
+    pub fn next_nalu(&mut self) -> io::Result<Option<NalUnit>> {
+        if self.eof {
+            return Ok(None);
+        }
+
+        loop {
+            // Scan the buffer for start codes. When a start code is found
+            // that terminates a NAL we've been accumulating, break out of
+            // the inner loop so the fill_buf borrow is released before we
+            // call flush_current().
+            let mut nalu_complete = false;
+            let mut sc_trim = 0usize;
+            let consumed;
+
+            {
+                let available = self.reader.fill_buf()?;
+                if available.is_empty() {
+                    self.eof = true;
+                    consumed = 0;
+                    nalu_complete = self.started && !self.buf.is_empty();
+                    // Will flush below after the borrow is released
+                } else {
+                    let len = available.len();
+                    let mut pos = len; // default: consume everything
+                    let mut i = 0;
+
+                    while i < len {
+                        let byte = available[i];
+
+                        if byte == 0 {
+                            self.zeros += 1;
+                            if self.started {
+                                self.buf.push(byte);
+                            }
+                            i += 1;
+                            continue;
+                        }
+
+                        if byte == 1 && self.zeros >= 2 {
+                            // Found a start code
+                            let sc_zeros = self.zeros.min(3) as usize;
+
+                            if self.started {
+                                // Remove trailing zeros (they're the start code, not NAL data)
+                                sc_trim = sc_zeros;
+                                nalu_complete = true;
+                                pos = i + 1;
+                                self.zeros = 0;
+                                break;
+                            }
+
+                            // First start code found
+                            self.started = true;
+                            self.zeros = 0;
+                            i += 1;
+                            continue;
+                        }
+
+                        // Non-special byte: batch contiguous non-zero bytes
+                        // into a single extend_from_slice call.
+                        self.zeros = 0;
+                        if self.started {
+                            let run_start = i;
+                            i += 1;
+                            while i < len && available[i] != 0 {
+                                i += 1;
+                            }
+                            self.buf.extend_from_slice(&available[run_start..i]);
+                        } else {
+                            i += 1;
+                        }
+                        continue;
+                    }
+
+                    consumed = pos;
+                }
+            }
+            // fill_buf borrow released here
+
+            if consumed > 0 {
+                self.reader.consume(consumed);
+                self.bytes_scanned += consumed as u64;
+            }
+
+            if self.eof {
+                return Ok(self.flush_current());
+            }
+
+            // Guard against malformed bitstreams: if the accumulator has grown
+            // beyond any sane NAL size without finding the next start code,
+            // the bitstream is corrupt. Bail instead of buffering the entire file.
+            if !nalu_complete && self.buf.len() > MAX_NAL_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "NAL unit exceeds {} MB without a terminating start code — \
+                         bitstream appears malformed",
+                        MAX_NAL_SIZE / (1024 * 1024),
+                    ),
+                ));
+            }
+
+            if nalu_complete {
+                let trim = self.buf.len().saturating_sub(sc_trim);
+                self.buf.truncate(trim);
+
+                let nalu = self.flush_current();
+                self.started = true;
+
+                if let Some(n) = nalu {
+                    return Ok(Some(n));
+                }
+                // Empty NAL (shouldn't happen), continue
+            }
+        }
+    }
+
+    /// Finalize the current NAL unit buffer into a NalUnit.
+    fn flush_current(&mut self) -> Option<NalUnit> {
+        if self.buf.is_empty() {
+            return None;
+        }
+
+        let data = std::mem::take(&mut self.buf);
+        let nal_type = (data[0] >> 1) & 0x3F;
+        Some(NalUnit { nal_type, data })
+    }
+}
+
+// ── Streaming NAL Writer ──────────────────────────────────────────
+
+/// Writes NAL units to an Annex B bitstream with buffered I/O.
+pub struct NalWriter<W: Write> {
+    writer: BufWriter<W>,
+}
+
+impl<W: Write> NalWriter<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer: BufWriter::with_capacity(2 * 1024 * 1024, writer),
+        }
+    }
+
+    /// Write a NAL unit with a 4-byte start code prefix.
+    pub fn write_nalu(&mut self, data: &[u8]) -> io::Result<()> {
+        self.writer.write_all(&START_CODE)?;
+        self.writer.write_all(data)?;
+        Ok(())
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+// ── NAL diagnostics ────────────────────────────────────────────────
+
+/// Human-readable name for an HEVC NAL unit type (for diagnostics).
+pub fn nal_type_name(t: u8) -> &'static str {
+    match t {
+        0 | 1 => "TRAIL", // Trailing pictures (non-IRAP)
+        2 | 3 => "TSA",   // Temporal sub-layer access
+        4 | 5 => "STSA",  // Step-wise temporal sub-layer access
+        6 | 7 => "RADL",  // Random access decodable leading
+        8 | 9 => "RASL",  // Random access skippable leading
+        16..=18 => "BLA", // Broken link access (IRAP)
+        19 | 20 => "IDR", // Instantaneous decoding refresh (IRAP)
+        21 => "CRA",      // Clean random access (IRAP)
+        22..=31 => "VCL_OTHER",
+        32 => "VPS",
+        33 => "SPS",
+        34 => "PPS",
+        35 => "AUD",
+        36 => "EOS",
+        37 => "EOB",
+        38 => "FD",
+        39 => "SEI_PREFIX",
+        40 => "SEI_SUFFIX",
+        62 => "RPU",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Accumulates NAL unit statistics during a bitstream transform.
+/// Used by DV and HDR10+ injection pipelines for diagnostic logging.
+pub struct NalDiagnostics {
+    nal_counts: std::collections::HashMap<u8, usize>,
+    total_nalus: usize,
+    first_slice_count: usize,
+    non_vcl_after_vcl_count: usize,
+}
+
+impl Default for NalDiagnostics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NalDiagnostics {
+    pub fn new() -> Self {
+        Self {
+            nal_counts: std::collections::HashMap::new(),
+            total_nalus: 0,
+            first_slice_count: 0,
+            non_vcl_after_vcl_count: 0,
+        }
+    }
+
+    /// Record a NAL unit observed during bitstream processing.
+    pub fn observe(&mut self, nalu: &NalUnit, in_frame: bool) {
+        self.total_nalus += 1;
+        *self.nal_counts.entry(nalu.nal_type).or_insert(0) += 1;
+        if nalu.is_first_slice_of_picture() {
+            self.first_slice_count += 1;
+        }
+        if in_frame && !nalu.is_vcl() {
+            self.non_vcl_after_vcl_count += 1;
+        }
+    }
+
+    /// Total NAL units observed.
+    pub fn total(&self) -> usize {
+        self.total_nalus
+    }
+
+    /// Number of first-slice-of-picture NAL units.
+    pub fn first_slice_count(&self) -> usize {
+        self.first_slice_count
+    }
+
+    /// Number of non-VCL NAL units that followed VCL NAL units.
+    pub fn non_vcl_after_vcl_count(&self) -> usize {
+        self.non_vcl_after_vcl_count
+    }
+
+    /// Formatted summary of NAL type distribution (e.g. "VPS:1,SPS:1,PPS:1,VCL_IRAP:100").
+    pub fn type_summary(&self) -> String {
+        let mut sorted: Vec<_> = self.nal_counts.iter().collect();
+        sorted.sort_by_key(|(&t, _)| t);
+        sorted
+            .iter()
+            .map(|(t, c)| format!("{}:{}", nal_type_name(**t), c))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+// ── Convenience functions ─────────────────────────────────────────
+
+/// Extract specific NAL units from a bitstream file using streaming I/O.
+/// The `filter` closure receives each NAL unit and returns `true` to collect it.
+/// Only the collected NAL data is held in memory.
+pub fn extract_nalus_filtered<F>(path: &Path, mut filter: F) -> io::Result<Vec<Vec<u8>>>
+where
+    F: FnMut(&NalUnit) -> bool,
+{
+    let file = std::fs::File::open(path)?;
+    let mut reader = NalReader::new(file);
+    let mut collected = Vec::new();
+
+    while let Some(nalu) = reader.next_nalu()? {
+        if filter(&nalu) {
+            collected.push(nalu.data);
+        }
+    }
+
+    Ok(collected)
+}
+
+/// Cancellable variant for full-movie metadata scans.
+pub fn extract_nalus_controlled<F>(
+    path: &Path,
+    sink: &dyn crate::events::EventSink,
+    message: &str,
+    mut filter: F,
+) -> io::Result<Vec<Vec<u8>>>
+where
+    F: FnMut(&NalUnit) -> bool,
+{
+    let file = std::fs::File::open(path)?;
+    let total = file.metadata()?.len();
+    let mut reader = NalReader::new(file);
+    let mut last_emit = std::time::Instant::now();
+    let mut collected = Vec::new();
+    loop {
+        crate::pipeline_progress::check(sink)?;
+        let Some(nalu) = reader.next_nalu()? else {
+            break;
+        };
+        if total > 0 && last_emit.elapsed() >= std::time::Duration::from_millis(250) {
+            sink.processing_stage(
+                "preparing",
+                message,
+                Some(reader.bytes_scanned as f64 / total as f64 * 100.0),
+            );
+            last_emit = std::time::Instant::now();
+        }
+        if filter(&nalu) {
+            collected.push(nalu.data);
+        }
+    }
+    if total > 0 {
+        sink.processing_stage("preparing", message, Some(100.0));
+    }
+    Ok(collected)
+}
+
+/// Process a bitstream file: for each NAL unit, call `processor` which can
+/// emit zero or more NAL units to the writer. Streams through without
+/// loading the full file.
+pub fn transform_bitstream<F>(
+    input_path: &Path,
+    output_path: &Path,
+    mut processor: F,
+) -> io::Result<()>
+where
+    F: FnMut(&NalUnit, &mut NalWriter<std::fs::File>) -> io::Result<()>,
+{
+    let in_file = std::fs::File::open(input_path)?;
+    let out_file = std::fs::File::create(output_path)?;
+    let mut reader = NalReader::new(in_file);
+    let mut writer = NalWriter::new(out_file);
+
+    while let Some(nalu) = reader.next_nalu()? {
+        processor(&nalu, &mut writer)?;
+        reader.recycle(nalu);
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+// ── Pipeline helpers ─────────────────────────────────────────────
+
+/// Demux a video file to raw Annex B HEVC using ffmpeg.
+/// Pipes stderr and returns it on failure for diagnostics.
+pub async fn demux_to_annexb(
+    input_path: &Path,
+    output_path: &Path,
+    sink: &dyn crate::events::EventSink,
+    label: &str,
+) -> Result<(), String> {
+    crate::pipeline_progress::check(sink).map_err(|e| e.to_string())?;
+    let child = crate::ffmpeg::ffmpeg_command()
+        .kill_on_drop(true)
+        .args([
+            "-y",
+            "-i",
+            &input_path.to_string_lossy(),
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-bsf:v",
+            "hevc_mp4toannexb",
+            "-an",
+            "-sn",
+            "-f",
+            "hevc",
+            &output_path.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to launch ffmpeg for {label} demux: {e}"))?;
+    let demux_output = crate::pipeline_progress::wait_output(child, sink).await?;
+
+    if !demux_output.status.success() {
+        let stderr = String::from_utf8_lossy(&demux_output.stderr);
+        sink.log(&format!("  {label} demux stderr: {stderr}"));
+        return Err(format!(
+            "ffmpeg {label} demux to raw HEVC failed (exit {})",
+            demux_output.status
+        ));
+    }
+
+    Ok(())
+}
+
+/// Create a secure working directory on the explicitly selected filesystem.
+/// Never silently place a full movie's bitstream on the system tmpfs.
+pub fn make_tempdir(prefix: &str, near: Option<&Path>) -> Result<TempDir, String> {
+    let parent = near.ok_or("No output directory for HDR10+ temporary files")?;
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in(parent)
+        .map_err(|e| format!("Could not create HDR10+ working directory: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal Annex B bitstream from raw NAL payloads.
+    fn annex_b(nalus: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nalu in nalus {
+            out.extend_from_slice(&START_CODE);
+            out.extend_from_slice(nalu);
+        }
+        out
+    }
+
+    #[test]
+    fn nal_reader_parses_two_nalus() {
+        // NAL type is (first_byte >> 1) & 0x3F.
+        // Type 1 (coded slice): 0x02, 0x01 header → (0x02 >> 1) & 0x3F = 1
+        // Type 39 (SEI_PREFIX): 0x4E, 0x01 header → (0x4E >> 1) & 0x3F = 39
+        let nalu1 = &[0x02, 0x01, 0xAA, 0xBB]; // VCL type 1
+        let nalu2 = &[0x4E, 0x01, 0xCC]; // SEI_PREFIX type 39
+        let stream = annex_b(&[nalu1, nalu2]);
+
+        let mut reader = NalReader::new(std::io::Cursor::new(&stream));
+
+        let n1 = reader.next_nalu().unwrap().unwrap();
+        assert_eq!(n1.nal_type, 1);
+        assert_eq!(n1.data, nalu1);
+        assert!(n1.is_vcl());
+
+        let n2 = reader.next_nalu().unwrap().unwrap();
+        assert_eq!(n2.nal_type, HEVC_NAL_SEI_PREFIX);
+        assert_eq!(n2.data, &[0x4E, 0x01, 0xCC]);
+        assert!(!n2.is_vcl());
+
+        assert!(reader.next_nalu().unwrap().is_none());
+    }
+
+    #[test]
+    fn nal_reader_handles_three_byte_start_code() {
+        // 3-byte start code: 00 00 01
+        let mut stream = vec![0x00, 0x00, 0x01, 0x02, 0x01, 0xFF];
+        // Second NAL with 4-byte start code
+        stream.extend_from_slice(&START_CODE);
+        stream.extend_from_slice(&[0x4E, 0x01]);
+
+        let mut reader = NalReader::new(std::io::Cursor::new(&stream));
+
+        let n1 = reader.next_nalu().unwrap().unwrap();
+        assert_eq!(n1.nal_type, 1);
+
+        let n2 = reader.next_nalu().unwrap().unwrap();
+        assert_eq!(n2.nal_type, HEVC_NAL_SEI_PREFIX);
+
+        assert!(reader.next_nalu().unwrap().is_none());
+    }
+
+    #[test]
+    fn nal_reader_empty_stream() {
+        let mut reader = NalReader::new(std::io::Cursor::new(&[]));
+        assert!(reader.next_nalu().unwrap().is_none());
+    }
+
+    #[test]
+    fn nal_reader_single_nalu_no_trailing_start_code() {
+        let stream = annex_b(&[&[0x02, 0x01, 0xDE, 0xAD]]);
+        let mut reader = NalReader::new(std::io::Cursor::new(&stream));
+
+        let n = reader.next_nalu().unwrap().unwrap();
+        assert_eq!(n.data, &[0x02, 0x01, 0xDE, 0xAD]);
+        assert!(reader.next_nalu().unwrap().is_none());
+    }
+
+    #[test]
+    fn is_first_slice_of_picture() {
+        // VCL NAL (type 1) with first_slice_segment_in_pic_flag set (MSB of byte 2)
+        let n = NalUnit {
+            nal_type: 1,
+            data: vec![0x02, 0x01, 0x80],
+        };
+        assert!(n.is_first_slice_of_picture());
+
+        // Same but flag not set
+        let n2 = NalUnit {
+            nal_type: 1,
+            data: vec![0x02, 0x01, 0x00],
+        };
+        assert!(!n2.is_first_slice_of_picture());
+
+        // Non-VCL NAL — never first slice regardless of flag
+        let n3 = NalUnit {
+            nal_type: 39,
+            data: vec![0x4E, 0x01, 0x80],
+        };
+        assert!(!n3.is_first_slice_of_picture());
+    }
+
+    #[test]
+    fn nal_writer_round_trip() {
+        let nalu1 = vec![0x02, 0x01, 0xAA];
+        let nalu2 = vec![0x4E, 0x01, 0xBB, 0xCC];
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = NalWriter::new(&mut buf);
+            writer.write_nalu(&nalu1).unwrap();
+            writer.write_nalu(&nalu2).unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Read them back
+        let mut reader = NalReader::new(std::io::Cursor::new(&buf));
+        let n1 = reader.next_nalu().unwrap().unwrap();
+        assert_eq!(n1.data, nalu1);
+        let n2 = reader.next_nalu().unwrap().unwrap();
+        assert_eq!(n2.data, nalu2);
+        assert!(reader.next_nalu().unwrap().is_none());
+    }
+
+    // ── Property-based tests ─────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn nal_reader_no_panic(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let cursor = std::io::Cursor::new(&data);
+            let mut reader = NalReader::new(cursor);
+            // Should never panic, only return Ok(Some/None) or Err
+            while let Ok(Some(_)) = reader.next_nalu() {}
+        }
+
+        #[test]
+        fn nal_round_trip(
+            payloads in proptest::collection::vec(
+                proptest::collection::vec(
+                    proptest::strategy::Just(()).prop_flat_map(|_| {
+                        // Generate Annex B safe payloads: no 0x00 0x00 0x0[0-3]
+                        // sequences allowed (start codes or emulation prevention
+                        // triggers). NalWriter writes raw payloads; it does not
+                        // add emulation prevention bytes, so the test must only
+                        // use data that is already safe.
+                        any::<u8>().prop_filter(
+                            "byte in safe Annex B payload",
+                            |_| true, // individual bytes are fine; filter at sequence level below
+                        )
+                    }),
+                    1..256
+                ).prop_filter("avoid Annex B start-code patterns",
+                    |v| !v.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] <= 3)
+                ),
+                1..16
+            )
+        ) {
+            // Write NALUs then read them back
+            let mut buf = Vec::new();
+            {
+                let mut writer = NalWriter::new(&mut buf);
+                for p in &payloads {
+                    writer.write_nalu(p).unwrap();
+                }
+                writer.flush().unwrap();
+            }
+
+            let mut reader = NalReader::new(std::io::Cursor::new(&buf));
+            let mut read_back = Vec::new();
+            while let Ok(Some(nalu)) = reader.next_nalu() {
+                read_back.push(nalu.data);
+            }
+            prop_assert_eq!(payloads.len(), read_back.len());
+            for (orig, read) in payloads.iter().zip(read_back.iter()) {
+                prop_assert_eq!(orig, read);
+            }
+        }
+    }
+
+    #[test]
+    fn make_tempdir_near_valid_dir() {
+        let td = super::make_tempdir("histv_test_", Some(std::path::Path::new("/tmp")));
+        assert!(td.is_ok());
+        let td = td.unwrap();
+        assert!(td.path().exists());
+        assert!(td.path().to_string_lossy().contains("histv_test_"));
+    }
+
+    #[test]
+    fn make_tempdir_rejects_unavailable_output_filesystem() {
+        let td = super::make_tempdir(
+            "histv_test_",
+            Some(std::path::Path::new("/nonexistent/path")),
+        );
+        assert!(td.is_err());
+    }
+
+    #[test]
+    fn make_tempdir_requires_explicit_filesystem() {
+        let td = super::make_tempdir("histv_test_", None);
+        assert!(td.is_err());
+    }
+}

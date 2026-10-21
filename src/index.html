@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Honey, I Shrunk The Vids v2.6.1</title>
+  <title>Honey, I Shrunk The Vids v2.7.0</title>
   <link rel="stylesheet" href="css/app.css" />
 </head>
 <body>
@@ -177,7 +177,14 @@
               <input type="checkbox" id="chk-hdr" checked disabled />
               <label for="chk-hdr">Preserve HDR10 and source bit depth</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">8-bit stays 8-bit; 10-bit stays 10-bit. HDR10 color and supported static metadata are verified. Re-encoding intentionally discards Dolby Vision and HDR10+ dynamic metadata. Compatible Dolby Vision Profile 8.1 uses its HDR10 base layer; unsafe fallback is blocked. SDR and HLG remain SDR and HLG.</span>
+              <span class="tooltip-text">8-bit stays 8-bit; 10-bit stays 10-bit. HDR10 color and supported static metadata are verified. Re-encoding discards Dolby Vision. HDR10+ dynamic metadata is discarded unless the optional preservation checkbox is enabled. Compatible Dolby Vision Profile 8.1 uses its HDR10 base layer; unsafe fallback is blocked. SDR and HLG remain SDR and HLG.</span>
+            </div>
+
+            <div class="checkbox-row has-tooltip">
+              <input type="checkbox" id="chk-preserve-hdr10plus" />
+              <label for="chk-preserve-hdr10plus">Preserve HDR10+ metadata (slower)</label>
+              <span class="tooltip-icon">?</span>
+              <span class="tooltip-text">Optional; off by default for the fast HDR10 path. On adds full-video extraction, metadata alignment, reinsertion and verification, using temporary disk space. Supports 10-bit HEVC with constant frame timing and preserves your selected container. Failure stops the file and retains the source. Dolby Vision is not restored. GPU decoding and encoding settings remain independent.</span>
             </div>
 
             <div class="checkbox-row has-tooltip">

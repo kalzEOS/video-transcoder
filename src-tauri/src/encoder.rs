@@ -894,6 +894,8 @@ pub struct BatchRequest {
     #[serde(default)]
     pub hardware_decoding: bool,
     #[serde(default)]
+    pub preserve_hdr10plus: bool,
+    #[serde(default)]
     pub compatibility_mode: bool,
     #[serde(default)]
     pub preserve_av1: bool,
@@ -967,6 +969,7 @@ impl BatchRequest {
             low_priority: self.low_priority,
             precision_mode: self.precision_mode,
             hardware_decoding: self.hardware_decoding,
+            preserve_hdr10plus: self.preserve_hdr10plus,
             compatibility_mode: self.compatibility_mode,
             preserve_av1: self.preserve_av1,
             force_local: self.force_local,
@@ -993,6 +996,7 @@ pub struct BatchSettings {
     pub low_priority: bool,
     pub precision_mode: bool,
     pub hardware_decoding: bool,
+    pub preserve_hdr10plus: bool,
     pub compatibility_mode: bool,
     pub preserve_av1: bool,
     pub force_local: bool,
@@ -1029,6 +1033,24 @@ struct WaveWork {
     total_waves: u32,
 }
 
+fn metadata_failure(
+    idx: usize,
+    queue: &mut [QueueItem],
+    output: Option<&std::path::Path>,
+    reason: &str,
+    sink: &dyn EventSink,
+) -> bool {
+    if let Some(output) = output {
+        let _ = std::fs::remove_file(output);
+    }
+    if !sink.cancellation_requested() {
+        sink.log(&format!("  ERROR: HDR10+ preservation failed: {reason}. Source retained. Disable Preserve HDR10+ metadata for the fast HDR10 path."));
+        queue[idx].status = QueueItemStatus::Failed;
+        sink.queue_item_updated(idx, "Failed");
+    }
+    false
+}
+
 /// Post-encode processing: size check, HDR10 validation, MKV tag
 /// patching, and source replacement/deletion.
 ///
@@ -1049,6 +1071,7 @@ async fn handle_post_encode(
     is_replace_mode: bool,
     item_duration_secs: f64,
     final_frame_count: Option<u64>,
+    metadata: &Option<crate::hdr10plus_pipeline::ExtractedHdr10Plus>,
     settings: &BatchSettings,
     audio_strategy: &AudioStrategy,
     log_writer: &mut Option<std::io::BufWriter<std::fs::File>>,
@@ -1057,6 +1080,15 @@ async fn handle_post_encode(
 ) -> bool {
     if sink.cancellation_requested() {
         return false;
+    }
+    if let Some(metadata) = metadata {
+        if !matches!(decision, EncodeDecision::Copy) {
+            if let Err(reason) =
+                crate::hdr10plus_pipeline::inject_pending(temp_output_file, metadata, sink).await
+            {
+                return metadata_failure(idx, queue, Some(temp_output_file), &reason, sink);
+            }
+        }
     }
     sink.processing_stage("finalizing", "Validating and finalizing output...", None);
     // Post-encode size check
@@ -1229,6 +1261,14 @@ async fn handle_post_encode(
                 Err(e) => {
                     sink.log(&format!("  WARNING: Could not update MKV tags: {e}"));
                 }
+            }
+        }
+
+        if let Some(metadata) = metadata {
+            if let Err(reason) =
+                crate::hdr10plus_pipeline::verify_output(temp_output_file, metadata, sink).await
+            {
+                return metadata_failure(idx, queue, Some(temp_output_file), &reason, sink);
             }
         }
 
@@ -1596,10 +1636,64 @@ async fn encode_single_file(
         if item_dovi_profile.is_some() {
             sink.log("  Dolby Vision is not retained: encoding the verified HDR10-compatible base layer.");
         }
-        if queue[idx].probe.has_hdr10plus {
+        if queue[idx].probe.has_hdr10plus && !settings.preserve_hdr10plus {
             sink.log("  HDR10+ dynamic metadata is intentionally discarded; standard HDR10 is preserved. No metadata extraction passes.");
         }
     }
+
+    if settings.preserve_hdr10plus
+        && queue[idx].probe.has_hdr10plus
+        && !crate::hdr10plus_pipeline::preservation_requested(
+            true,
+            &item_video_codec,
+            source_format.bit_depth,
+        )
+    {
+        metadata_failure(
+            idx,
+            queue,
+            None,
+            "HDR10+ preservation requires a 10-bit HEVC source",
+            sink,
+        );
+        return EncodeFileResult::Failed;
+    }
+    let metadata = if crate::hdr10plus_pipeline::preservation_requested(
+        settings.preserve_hdr10plus,
+        &item_video_codec,
+        source_format.bit_depth,
+    ) {
+        sink.log("  HDR10+ preservation enabled: extra extraction, alignment, reinsertion and full metadata verification passes. Dolby Vision restoration remains disabled.");
+        match crate::hdr10plus_pipeline::prepare(
+            std::path::Path::new(&item_full_path),
+            temp_output_file.parent(),
+            target_codec,
+            sink,
+        )
+        .await
+        {
+            Ok(result) => {
+                if queue[idx].probe.has_hdr10plus && result.is_none() {
+                    metadata_failure(
+                        idx,
+                        queue,
+                        None,
+                        "Advertised HDR10+ metadata could not be recovered",
+                        sink,
+                    );
+                    return EncodeFileResult::Failed;
+                }
+                result
+            }
+            Err(_) if sink.cancellation_requested() => None,
+            Err(reason) => {
+                metadata_failure(idx, queue, None, &reason, sink);
+                return EncodeFileResult::Failed;
+            }
+        }
+    } else {
+        None
+    };
 
     if sink.cancellation_requested() {
         queue[idx].status = QueueItemStatus::Cancelled;
@@ -2284,6 +2378,7 @@ async fn encode_single_file(
         is_replace_mode,
         item_duration_secs,
         final_frame_count,
+        &metadata,
         settings,
         &resolved.audio_strategy,
         log_writer,
@@ -4199,6 +4294,40 @@ mod tests {
     use super::*;
     use crate::queue::AudioStreamInfo;
     use crate::test_helpers::{default_encoders, default_settings, NoopSink};
+
+    #[test]
+    fn batch_request_hdr10plus_defaults_off_and_keeps_explicit_selection() {
+        let request: BatchRequest = serde_json::from_str("{}").unwrap();
+        assert!(!request.into_batch_settings().preserve_hdr10plus);
+        let request: BatchRequest = serde_json::from_str(r#"{"preserveHdr10plus":true}"#).unwrap();
+        let settings = request.into_batch_settings();
+        assert!(settings.preserve_hdr10plus);
+        assert!(!settings.hardware_decoding);
+    }
+
+    #[test]
+    fn metadata_preparation_failure_does_not_remove_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("existing.mkv");
+        std::fs::write(&output, b"previous successful output").unwrap();
+        let mut queue = vec![crate::test_helpers::make_queue_item(
+            "source.mkv",
+            QueueItemStatus::Pending,
+            crate::test_helpers::synthetic_probe("hevc", 8.0, 60.0, true),
+        )];
+        assert!(!metadata_failure(
+            0,
+            &mut queue,
+            None,
+            "preparation failed",
+            &NoopSink
+        ));
+        assert_eq!(
+            std::fs::read(output).unwrap(),
+            b"previous successful output"
+        );
+        assert_eq!(queue[0].status, QueueItemStatus::Failed);
+    }
 
     #[test]
     fn batch_request_hardware_decoding_is_opt_in() {

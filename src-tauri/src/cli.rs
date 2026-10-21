@@ -104,6 +104,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub hardware_decoding: bool,
 
+    /// Preserve HDR10+ metadata with additional processing passes (HEVC 10-bit CFR).
+    #[arg(long = "preserve-hdr10plus")]
+    pub preserve_hdr10plus: bool,
+
     /// Convert all files to H.264/MP4 with AAC audio for maximum device
     /// compatibility. Overrides --codec, --container, and --audio.
     #[arg(long = "compat", conflicts_with = "preserve_av1")]
@@ -402,6 +406,8 @@ pub struct JobFile {
     #[serde(default)]
     pub hardware_decoding: Option<bool>,
     #[serde(default)]
+    pub preserve_hdr10plus: Option<bool>,
+    #[serde(default)]
     pub compat: Option<bool>,
     #[serde(default)]
     pub preserve_av1: Option<bool>,
@@ -458,6 +464,7 @@ pub fn export_job_file(args: &CliArgs, path: &std::path::Path) -> Result<(), Str
         low_priority: Some(args.low_priority),
         precision_mode: Some(args.precision_mode),
         hardware_decoding: Some(args.hardware_decoding),
+        preserve_hdr10plus: Some(args.preserve_hdr10plus),
         compat: Some(args.compat),
         preserve_av1: Some(args.preserve_av1),
     };
@@ -661,6 +668,20 @@ mod tests {
         assert!(back.codec.is_none());
         assert!(back.bitrate.is_none());
         assert!(back.output.is_none());
+        assert!(back.preserve_hdr10plus.is_none());
+    }
+
+    #[test]
+    fn hdr10plus_flag_is_opt_in_and_exports_to_job() {
+        assert!(!CliArgs::parse_from(["histv-cli", "source.mkv"]).preserve_hdr10plus);
+        let args = CliArgs::parse_from(["histv-cli", "--preserve-hdr10plus", "source.mkv"]);
+        assert!(args.preserve_hdr10plus);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.json");
+        export_job_file(&args, &path).unwrap();
+        let job: JobFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(job.preserve_hdr10plus, Some(true));
+        assert_eq!(job.hardware_decoding, Some(false));
     }
 
     #[test]

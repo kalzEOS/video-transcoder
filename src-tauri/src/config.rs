@@ -35,6 +35,7 @@ pub struct AppConfig {
     pub low_priority: bool,
     pub precision_mode: bool,
     pub hardware_decoding: bool,
+    pub preserve_hdr10plus: bool,
     #[serde(default)]
     pub compatibility_mode: bool,
     #[serde(default)]
@@ -72,6 +73,7 @@ impl Default for AppConfig {
             low_priority: false,
             precision_mode: false,
             hardware_decoding: false,
+            preserve_hdr10plus: false,
             compatibility_mode: false,
             preserve_av1: false,
             force_local: false,
@@ -156,6 +158,19 @@ pub fn save_config(app: &AppHandle, config: &AppConfig) -> Result<(), Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr10plus_is_opt_in_and_saved_independently_of_gpu_decoding() {
+        let mut config: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.preserve_hdr10plus);
+        config.preserve_hdr10plus = true;
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["preserveHdr10plus"], true);
+        let restored: AppConfig = serde_json::from_value(json).unwrap();
+        assert!(restored.preserve_hdr10plus);
+        assert!(!restored.hardware_decoding);
+        assert_eq!(restored.hdr, AppConfig::default().hdr);
+    }
 
     #[test]
     fn hardware_decoding_defaults_off_and_persists() {

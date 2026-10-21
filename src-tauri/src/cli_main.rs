@@ -381,6 +381,7 @@ fn compute_decisions(
                     preserve_av1: args.preserve_av1,
                     precision_mode: args.precision_mode,
                     hardware_decoding: args.hardware_decoding,
+                    preserve_hdr10plus: args.preserve_hdr10plus,
                     output_folder: String::new(),
                     output_mode: String::new(),
                     threshold: args.bitrate,
@@ -861,6 +862,7 @@ fn run_batch(
         low_priority: args.low_priority,
         precision_mode: args.precision_mode,
         hardware_decoding: args.hardware_decoding,
+        preserve_hdr10plus: args.preserve_hdr10plus,
         compatibility_mode: args.compat,
         preserve_av1: args.preserve_av1,
         force_local: false,
@@ -1139,6 +1141,9 @@ fn merge_job_into_args(args: &mut cli::CliArgs, job: &cli::JobFile) {
     }
     if let Some(lp) = job.low_priority {
         args.low_priority = lp;
+    }
+    if let Some(preserve) = job.preserve_hdr10plus {
+        args.preserve_hdr10plus = preserve;
     }
     if let Some(hw) = job.hardware_decoding {
         args.hardware_decoding = hw;

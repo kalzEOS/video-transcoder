@@ -240,6 +240,7 @@ pub fn default_settings() -> BatchSettings {
         low_priority: false,
         precision_mode: false,
         hardware_decoding: false,
+        preserve_hdr10plus: false,
         compatibility_mode: false,
         preserve_av1: false,
         force_local: false,

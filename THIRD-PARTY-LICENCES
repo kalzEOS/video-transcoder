@@ -1,6 +1,20 @@
 THIRD-PARTY LICENCES
 ====================
 
+CachyOS optional HDR10+ build
+----------------------------
+
+The 2.7.0 optional-HDR10+ AppImage uses the host's /usr/bin/ffmpeg and
+/usr/bin/ffprobe. It additionally bundles an unmodified static MP4Box
+from GPAC v26.02.0 (commit 118e60a905878e56dc4f9c5b309143c5f447c702),
+used only when HDR10+ preservation is selected. GPAC's complete source,
+COPYING licence and build instructions are included in the AppImage at
+usr/share/licenses/gpac/. Source: https://github.com/gpac/gpac/tree/v26.02.0
+
+The hdr10plus Rust library is Copyright (c) quietvoid and distributed
+under the MIT licence: https://github.com/quietvoid/hdr10plus_tool
+Its licence is included at usr/share/licenses/hdr10plus/ in this AppImage.
+
 This file applies to the "-full" builds of Honey, I Shrunk the Vids,
 which bundle FFmpeg and FFprobe binaries alongside the application.
 The standard builds do not include FFmpeg.

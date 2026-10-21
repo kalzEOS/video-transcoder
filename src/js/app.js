@@ -51,6 +51,7 @@
     const chkHdr          = $('#chk-hdr');
     const chkPrecision    = $('#chk-precision');
     const chkHardwareDecoding = $('#chk-hardware-decoding');
+    const chkPreserveHdr10Plus = $('#chk-preserve-hdr10plus');
     const numThreads      = $('#num-threads');
     const chkLowPriority  = $('#chk-low-priority');
     const selTheme        = $('#sel-theme');
@@ -186,6 +187,7 @@
         chkHdr.checked = true;
         chkPrecision.checked = cfg.precisionMode || false;
         chkHardwareDecoding.checked = cfg.hardwareDecoding || false;
+        chkPreserveHdr10Plus.checked = cfg.preserveHdr10plus || false;
 		chkPreserveAv1.checked = cfg.preserveAv1 || false;
         chkCompat.checked = cfg.compatibilityMode || false;
         // Enforce mutual exclusion on load (compat wins if both are saved)
@@ -249,6 +251,7 @@
               hdr: chkHdr.checked,
               precisionMode: chkPrecision.checked,
               hardwareDecoding: chkHardwareDecoding.checked,
+              preserveHdr10plus: chkPreserveHdr10Plus.checked,
 			  compatibilityMode: chkCompat.checked,
               preserveAv1: chkPreserveAv1.checked,
               threads: parseInt(numThreads.value, 10) || 0,
@@ -1550,7 +1553,7 @@
       const simpleSaveControls = [
         txtOutputFolder,
         chkOverwrite, chkDeleteSource, chkSaveLog, chkToast, chkAutoClear,
-        chkPrecision, chkHardwareDecoding, numThreads, chkLowPriority, selPostAction, txtCustomCmd, numCountdown
+        chkPrecision, chkHardwareDecoding, chkPreserveHdr10Plus, numThreads, chkLowPriority, selPostAction, txtCustomCmd, numCountdown
       ];
       for (const el of simpleSaveControls) {
         el.addEventListener('change', scheduleConfigSave);
@@ -2345,6 +2348,7 @@
             pixFmt: 'p010le', // Legacy field; backend derives precision per source.
             precisionMode: chkPrecision.checked,
               hardwareDecoding: chkHardwareDecoding.checked,
+              preserveHdr10plus: chkPreserveHdr10Plus.checked,
             compatibilityMode: chkCompat.checked,
             preserveAv1: chkPreserveAv1.checked,
             threads: parseInt(numThreads.value, 10) || 0,

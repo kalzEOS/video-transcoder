@@ -77,6 +77,90 @@ impl EventSink for PipelineSink<'_> {
     }
 }
 
+pub fn check(sink: &dyn EventSink) -> std::io::Result<()> {
+    if sink.cancellation_requested() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Metadata parsing uses synchronous buffered file IO. Let Tokio replace this
+/// worker while it runs so GUI commands (especially Cancel) remain responsive.
+pub async fn metadata_work<F: std::future::Future>(future: F) -> F::Output {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+    } else {
+        future.await
+    }
+}
+
+/// Drain stderr concurrently, poll cancellation, and reap the child before
+/// returning, so TempDir cleanup never races a live metadata subprocess.
+pub async fn wait_output(
+    mut child: tokio::process::Child,
+    sink: &dyn EventSink,
+) -> Result<std::process::Output, String> {
+    use tokio::io::AsyncReadExt;
+    let stderr = child.stderr.take();
+    let reader = tokio::spawn(async move {
+        let mut tail = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tail.extend_from_slice(&buf[..n]);
+                        if tail.len() > 65536 {
+                            tail.drain(..tail.len() - 65536);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        tail
+    });
+    let result = loop {
+        if sink.cancellation_requested() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            break Err("Cancelled".to_string());
+        }
+        tokio::select! {
+            status = child.wait() => break status.map_err(|e| e.to_string()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+    };
+    let stderr = reader.await.map_err(|e| e.to_string())?;
+    Ok(std::process::Output {
+        status: result?,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
+/// Throttle frame-based progress without inventing time estimates.
+pub fn frames(
+    sink: &dyn EventSink,
+    stage: &str,
+    message: &str,
+    done: usize,
+    total: usize,
+) -> std::io::Result<()> {
+    check(sink)?;
+    if total > 0 && (done == total || done.is_multiple_of(256)) {
+        sink.processing_stage(stage, message, Some(done as f64 / total as f64 * 100.0));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +205,45 @@ mod tests {
         control.cancel_current.store(false, Ordering::SeqCst);
         control.cancel_all.store(true, Ordering::SeqCst);
         assert!(sink.cancellation_requested());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_metadata_child_is_killed_and_reaped() {
+        let inner = RecordingSink::new();
+        let control = CancellableBatchControl::new();
+        control.cancel_current.store(true, Ordering::SeqCst);
+        let sink = PipelineSink {
+            inner: &inner,
+            control: &control,
+        };
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), wait_output(child, &sink))
+                .await
+                .unwrap();
+        assert_eq!(result.unwrap_err(), "Cancelled");
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subprocess_failure_retains_stderr_without_classifying_it_as_encoder_failure() {
+        let child = tokio::process::Command::new("cat")
+            .arg("/nonexistent/histv-metadata-test-input")
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = wait_output(child, &crate::test_helpers::NoopSink)
+            .await
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("histv-metadata-test-input"));
     }
 }
