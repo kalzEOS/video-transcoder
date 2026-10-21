@@ -415,3 +415,13 @@ fn resolve_container_auto_derives_from_source() {
     );
     assert_eq!(encoder::resolve_container("video.ts", "auto", false), "mkv");
 }
+
+// GUI batches must not silently re-encode Dolby Atmos audio to a bitrate cap.
+#[test]
+fn gui_defaults_to_audio_passthrough() {
+    let request: encoder::BatchRequest = serde_json::from_str("{}").unwrap();
+    let settings = request.into_batch_settings();
+    assert_eq!(settings.audio_encoder, "copy");
+    let resolved = encoder::resolve_file_settings("hevc", "mkv", &settings, &sw_encoders());
+    assert!(matches!(resolved.audio_strategy, encoder::AudioStrategy::CopyAll));
+}
