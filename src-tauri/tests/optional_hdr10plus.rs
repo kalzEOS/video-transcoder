@@ -54,6 +54,226 @@ fn packets(path: &Path, selector: &str) -> serde_json::Value {
     .unwrap()
 }
 
+/// Sparse subtitles force the second input far ahead while the GPAC video
+/// input waits. The default interleave timeout used to flush future audio
+/// before earlier video, despite every stream having valid timestamps.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires FFmpeg with libx265/E-AC3 and MP4Box; no GPU required"]
+async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("intermediate.mkv");
+    let subtitles = root.path().join("sparse.srt");
+    std::fs::write(
+        &subtitles,
+        "1\n00:00:00,000 --> 00:00:01,000\nBeginning\n\n2\n00:00:24,000 --> 00:00:25,000\nLater\n",
+    )
+    .unwrap();
+    run(Command::new("ffmpeg").args([
+        "-v", "error", "-y", "-f", "lavfi", "-i",
+        "testsrc2=size=384x216:rate=24000/1001:duration=32",
+        "-f", "lavfi", "-i",
+        "aevalsrc=0.1*sin(2*PI*440*t)|0.1*sin(2*PI*550*t)|0.1*sin(2*PI*660*t)|0|0.1*sin(2*PI*770*t)|0.1*sin(2*PI*880*t):s=48000:d=32:c=5.1(side)",
+        "-i",
+    ]).arg(&subtitles).args([
+        "-map", "0:v", "-map", "1:a", "-map", "2:s",
+        "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+        "-x265-params", "pools=2:frame-threads=2:bframes=3:repeat-headers=1:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1):max-cll=1000,400",
+        "-c:a", "eac3", "-b:a", "768k", "-c:s", "srt",
+        "-metadata:s:a:0", "language=eng", "-metadata:s:s:0", "language=spa",
+    ]).arg(&source));
+    let inspect = |path: &Path| -> serde_json::Value {
+        serde_json::from_slice(
+            &run(Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_packets",
+                    "-show_streams",
+                    "-show_format",
+                    "-show_data_hash",
+                    "sha256",
+                    "-of",
+                    "json",
+                ])
+                .arg(path))
+            .stdout,
+        )
+        .unwrap()
+    };
+    let original = inspect(&source);
+    let count = original["packets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["stream_index"] == 0)
+        .count();
+    let metadata = hdr::ExtractedHdr10Plus {
+        frames: (0..count)
+            .map(|i| {
+                let value = Hdr10PlusMetadata {
+                    itu_t_t35_country_code: 0xb5,
+                    itu_t_t35_terminal_provider_code: 0x003c,
+                    itu_t_t35_terminal_provider_oriented_code: 1,
+                    application_identifier: 4,
+                    application_version: 1,
+                    num_windows: 1,
+                    targeted_system_display_maximum_luminance: 500,
+                    average_maxrgb: 100 + i as u32,
+                    ..Default::default()
+                };
+                vec![encode_hdr10plus_nal(&value, false).unwrap()]
+            })
+            .collect(),
+    };
+    let output = root.path().join("preserved.mkv");
+    assert!(
+        hdr::inject_hdr10plus(&source, &output, &metadata, &Sink)
+            .await
+            .unwrap()
+            .success
+    );
+    hdr::verify_output(&output, &metadata, &Sink).await.unwrap();
+    let actual = inspect(&output);
+    let mut last = [None::<f64>; 2];
+    let mut worst_lead = 0.0f64;
+    for packet in actual["packets"].as_array().unwrap() {
+        let index = packet["stream_index"].as_u64().unwrap() as usize;
+        if index > 1 {
+            continue;
+        }
+        let timestamp = packet["dts_time"]
+            .as_str()
+            .or(packet["pts_time"].as_str())
+            .unwrap();
+        last[index] = Some(timestamp.parse().unwrap());
+        if let [Some(video), Some(audio)] = last {
+            worst_lead = worst_lead.max((video - audio).abs());
+        }
+    }
+    assert!(
+        worst_lead < 0.5,
+        "Audio/video packets must stay physically interleaved; maximum lead was {worst_lead:.3}s"
+    );
+    // Per-stream order and every compressed audio/subtitle packet are exact.
+    for selector in ["a", "s"] {
+        assert_eq!(packets(&source, selector), packets(&output, selector));
+    }
+    for stream in 0..3 {
+        let timeline = |value: &serde_json::Value| -> Vec<(String, String, String)> {
+            value["packets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["stream_index"] == stream)
+                .map(|p| {
+                    (
+                        p["pts_time"].to_string(),
+                        p["dts_time"].to_string(),
+                        p["duration_time"].to_string(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            timeline(&original),
+            timeline(&actual),
+            "Stream {stream} timing changed"
+        );
+    }
+    assert_eq!(actual["streams"][0]["pix_fmt"], "yuv420p10le");
+    for field in ["color_primaries", "color_transfer", "color_space"] {
+        assert_eq!(original["streams"][0][field], actual["streams"][0][field]);
+    }
+    // MKV may expose static SEIs only on decoded frames, while GPAC also
+    // exposes them at stream level. Compare their decoded meaning.
+    let static_hdr = |path: &Path| -> Vec<serde_json::Value> {
+        let value: serde_json::Value = serde_json::from_slice(
+            &run(Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-read_intervals",
+                    "%+#24",
+                    "-show_frames",
+                    "-of",
+                    "json",
+                ])
+                .arg(path))
+            .stdout,
+        )
+        .unwrap();
+        value["frames"][0]["side_data_list"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry["side_data_type"].as_str(),
+                    Some("Mastering display metadata" | "Content light level metadata")
+                )
+            })
+            .cloned()
+            .collect()
+    };
+    let source_hdr = static_hdr(&source);
+    assert_eq!(source_hdr.len(), 2);
+    assert_eq!(source_hdr, static_hdr(&output));
+    for field in [
+        "codec_name",
+        "profile",
+        "sample_rate",
+        "channels",
+        "channel_layout",
+        "bit_rate",
+    ] {
+        assert_eq!(original["streams"][1][field], actual["streams"][1][field]);
+    }
+    assert_eq!(actual["streams"][1]["tags"]["language"], "eng");
+    assert_eq!(actual["streams"][2]["tags"]["language"], "spa");
+    let decode = run(Command::new("ffmpeg")
+        .args(["-v", "error", "-xerror", "-i"])
+        .arg(&output)
+        .args(["-map", "0:v", "-map", "0:a", "-f", "null", "-"]));
+    assert!(
+        decode.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&decode.stderr)
+    );
+    if Command::new("mpv").arg("--version").output().is_ok() {
+        // Stress the same player engine as Haruna without speakers or GPU.
+        // A small queue exposes bad packet ordering even with tiny video.
+        let playback = run(Command::new("mpv")
+            .args([
+                "--no-config",
+                "--vo=null",
+                "--ao=pcm",
+                "--untimed",
+                "--msg-level=all=warn",
+                "--demuxer-max-bytes=512KiB",
+            ])
+            .arg(format!(
+                "--ao-pcm-file={}",
+                root.path().join("playback.wav").display()
+            ))
+            .arg(&output));
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&playback.stdout),
+            String::from_utf8_lossy(&playback.stderr)
+        );
+        assert!(
+            !log.contains("Too many packets"),
+            "Player demux queue overflow: {log}"
+        );
+        assert!(
+            !log.contains("Could not find ref"),
+            "Player lost video reference packets: {log}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Linux VAAPI, x265 and bundled MP4Box beside test executable"]
 async fn opt_in_preserves_sparse_late_metadata_with_cpu_or_gpu_decode() {

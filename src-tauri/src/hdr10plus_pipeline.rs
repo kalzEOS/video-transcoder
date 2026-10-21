@@ -254,33 +254,45 @@ pub async fn inject_hdr10plus(
             String::from_utf8_lossy(&packaged.stderr)
         ));
     }
-    let child = ffbin::ffmpeg_command()
-        .kill_on_drop(true)
-        .args([
-            "-y",
-            "-copyts",
-            "-itsoffset",
-            &timeline.first_pts.to_string(),
-            "-i",
-            &video_mp4.to_string_lossy(),
-            "-i",
-            &encoded_path.to_string_lossy(),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a?",
-            "-map",
-            "1:s?",
-            "-map_metadata",
-            "1",
-            "-map_chapters",
-            "1",
-            "-c",
-            "copy",
-            "-strict",
-            "unofficial",
-            &output_path.to_string_lossy(),
-        ])
+    let mut remux = ffbin::ffmpeg_command();
+    remux.kill_on_drop(true).args([
+        "-y",
+        "-copyts",
+        "-itsoffset",
+        &timeline.first_pts.to_string(),
+        "-i",
+        &video_mp4.to_string_lossy(),
+        "-i",
+        &encoded_path.to_string_lossy(),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-map",
+        "1:s?",
+        "-map_metadata",
+        "1",
+        "-map_chapters",
+        "1",
+        "-c",
+        "copy",
+        "-strict",
+        "unofficial",
+    ]);
+    if output_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mkv"))
+    {
+        // Sparse subtitles in input 1 can advance its audio far ahead of
+        // input 0's video. The default 10 s timeout then flushes future audio
+        // before earlier video, overflowing player demux queues. Wait for
+        // proper DTS interleaving instead; do not rewrite either timeline.
+        // This can buffer packets until the next sparse subtitle or EOF.
+        remux.args(["-max_interleave_delta", "0"]);
+    }
+    let child = remux
+        .arg(output_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
