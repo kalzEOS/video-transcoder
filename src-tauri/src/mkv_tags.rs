@@ -525,13 +525,10 @@ pub fn lightweight_repair(
     Ok((patched, video_bps))
 }
 
-/// Probe-and-repair: checks if a file is MKV with valid duration, then runs
-/// `lightweight_repair` and returns the corrected video bitrate if any tags
-/// were updated. Encapsulates the pattern duplicated across lib.rs, cli_main.rs,
-/// and encoder.rs.
-///
-/// Returns `Some(corrected_video_bps)` if tags were patched, `None` otherwise.
-pub fn repair_after_probe(
+/// Estimate the queue bitrate without changing source tags. Import, dry-run,
+/// and cancelled encodes must leave source files untouched. Explicit repair
+/// commands and completed-output tag updates still use `lightweight_repair`.
+pub fn estimate_bitrate_after_probe(
     file_path: &str,
     duration_secs: f64,
     audio_streams: &[crate::queue::AudioStreamInfo],
@@ -548,15 +545,30 @@ pub fn repair_after_probe(
         .iter()
         .map(|s| s.bitrate_kbps as u64 * 1000)
         .sum();
-    match lightweight_repair(
-        std::path::Path::new(file_path),
-        file_size,
-        duration_secs,
-        audio_total_bps,
-        None,
-    ) {
-        Ok((n, bps)) if n > 0 => Some(bps),
-        _ => None,
+    let audio_bytes = (audio_total_bps as f64 * duration_secs / 8.0) as u64;
+    Some((file_size.saturating_sub(audio_bytes) as f64 * 8.0 / duration_secs) as u64)
+}
+
+#[cfg(test)]
+mod import_safety_tests {
+    #[test]
+    fn bitrate_estimation_never_writes_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.mkv");
+        let original = vec![42; 4096];
+        std::fs::write(&file, &original).unwrap();
+        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions).unwrap();
+        assert_eq!(
+            super::estimate_bitrate_after_probe(file.to_str().unwrap(), 2.0, &[]),
+            Some(16384)
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+        assert_eq!(
+            super::estimate_bitrate_after_probe(file.to_str().unwrap(), 0.0, &[]),
+            None
+        );
     }
 }
 

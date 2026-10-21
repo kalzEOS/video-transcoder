@@ -139,7 +139,7 @@ fn main() {
 // ── Extracted orchestration functions ─────────────────────────
 
 /// Collect input files (glob / directory walk), probe each one in parallel,
-/// and apply lightweight MKV tag repair. Returns the full queue — callers
+/// and estimate MKV bitrates without source writes. Returns the full queue — callers
 /// filter by `QueueItemStatus::Pending` as needed.
 fn collect_and_probe_files(
     args: &cli::CliArgs,
@@ -206,9 +206,9 @@ fn collect_and_probe_files(
 
         match result {
             Ok(pr) => {
-                // Lightweight MKV tag repair: fix stale statistics
-                // so the queue shows the real bitrate from import.
-                let repair = histv_lib::mkv_tags::repair_after_probe(
+                // Queue bitrate correction is read-only; repairing source tags
+                // requires the explicit repair command.
+                let repair = histv_lib::mkv_tags::estimate_bitrate_after_probe(
                     &file_path,
                     pr.duration_secs,
                     &pr.audio_streams,

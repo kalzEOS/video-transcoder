@@ -1517,12 +1517,10 @@ async fn encode_single_file(
         }
     }
 
-    // Pre-decision MKV tag repair: fix stale statistics tags on input
-    // files so the encoding decision uses the actual bitrate. This is
-    // lightweight (no I/O beyond a stat + in-place tag write) and runs
-    // automatically before every encode.
+    // Correct stale queue bitrate estimates using file size, without writing
+    // source tags. Explicit Repair remains available separately.
     let mut item_video_bitrate_mbps = item_video_bitrate_mbps;
-    if let Some(bps) = crate::mkv_tags::repair_after_probe(
+    if let Some(bps) = crate::mkv_tags::estimate_bitrate_after_probe(
         &item_full_path,
         item_duration_secs,
         &queue[idx].probe.audio_streams,
@@ -1530,7 +1528,7 @@ async fn encode_single_file(
         let corrected_mbps = bps as f64 / 1_000_000.0;
         if (corrected_mbps - item_video_bitrate_mbps).abs() > 0.1 {
             sink.log(&format!(
-                "  Tag repair: {:.2}Mbps → {:.2}Mbps",
+                "  Bitrate estimate: {:.2}Mbps → {:.2}Mbps",
                 item_video_bitrate_mbps, corrected_mbps
             ));
             item_video_bitrate_mbps = corrected_mbps;
@@ -1599,7 +1597,7 @@ async fn encode_single_file(
             sink.log("  Dolby Vision is not retained: encoding the verified HDR10-compatible base layer.");
         }
         if queue[idx].probe.has_hdr10plus {
-            sink.log("  HDR10+ dynamic metadata is not guaranteed; standard HDR10 is preserved. No metadata extraction passes.");
+            sink.log("  HDR10+ dynamic metadata is intentionally discarded; standard HDR10 is preserved. No metadata extraction passes.");
         }
     }
 

@@ -1,6 +1,7 @@
 //! Opt-in physical media regression: set HISTV_HDR10_TEST_CASES to the path of
 //! a JSON array of {"name":..., "path":...}, then run with --ignored.
 //! All outputs and logs are isolated in a TempDir, never beside the source.
+use sha2::{Digest, Sha256};
 use std::{path::Path, process::Command};
 
 fn probe(path: &Path, count: bool) -> serde_json::Value {
@@ -70,6 +71,7 @@ fn real_sources_keep_hdr10_pixels_tracks_and_container_without_metadata_passes()
     for case in cases.as_array().unwrap() {
         let source = Path::new(case["path"].as_str().unwrap());
         let original = probe(source, true);
+        let source_hash = Sha256::digest(std::fs::read(source).unwrap());
         for gpu in [false, true] {
             let dest = root
                 .path()
@@ -103,6 +105,11 @@ fn real_sources_keep_hdr10_pixels_tracks_and_container_without_metadata_passes()
                 String::from_utf8_lossy(&result.stderr)
             );
             assert!(result.status.success(), "{log}");
+            assert_eq!(
+                Sha256::digest(std::fs::read(source).unwrap()),
+                source_hash,
+                "Import/encoding must not rewrite original MKV statistics tags"
+            );
             assert!(log.contains("-c:v hevc_vaapi"), "{log}");
             // Metadata paths are absent from the application, not just skipped
             // based on whether the first decoded frame happened to advertise HDR.

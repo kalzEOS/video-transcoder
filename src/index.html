@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Honey, I Shrunk The Vids v2.6.0</title>
+  <title>Honey, I Shrunk The Vids v2.6.1</title>
   <link rel="stylesheet" href="css/app.css" />
 </head>
 <body>
@@ -175,9 +175,9 @@
 
             <div class="checkbox-row has-tooltip">
               <input type="checkbox" id="chk-hdr" checked disabled />
-              <label for="chk-hdr">Preserve source HDR and bit depth</label>
+              <label for="chk-hdr">Preserve HDR10 and source bit depth</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">Always preserves source bit depth and HDR. 8-bit stays 8-bit; 10-bit stays 10-bit. HDR10 color and static metadata are verified. Compatible Dolby Vision Profile 8 uses its HDR10 base layer. Dolby Vision and HDR10+ dynamic metadata are not guaranteed on re-encoding.</span>
+              <span class="tooltip-text">8-bit stays 8-bit; 10-bit stays 10-bit. HDR10 color and supported static metadata are verified. Re-encoding intentionally discards Dolby Vision and HDR10+ dynamic metadata. Compatible Dolby Vision Profile 8.1 uses its HDR10 base layer; unsafe fallback is blocked. SDR and HLG remain SDR and HLG.</span>
             </div>
 
             <div class="checkbox-row has-tooltip">

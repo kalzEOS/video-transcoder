@@ -386,9 +386,9 @@ mod gui_commands {
             if index < q.len() {
                 match &result {
                     Ok(pr) => {
-                        // Lightweight MKV tag repair: fix stale statistics
-                        // so the queue shows the real bitrate from import.
-                        let repair = crate::mkv_tags::repair_after_probe(
+                        // Estimate queue bitrate without modifying the source.
+                        // Tag repair remains an explicit user action.
+                        let repair = crate::mkv_tags::estimate_bitrate_after_probe(
                             &file_path,
                             pr.duration_secs,
                             &pr.audio_streams,
