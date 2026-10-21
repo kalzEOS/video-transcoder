@@ -958,7 +958,9 @@ impl BatchRequest {
             rate_control_mode: self.rate_control_mode,
             video_encoder: "auto".to_string(),
             codec_family: "auto".to_string(),
-            audio_encoder: "auto".to_string(),
+            // GUI defaults to passthrough so Atmos and other source audio are preserved.
+            // Compatibility mode still enforces MP4-compatible AAC where necessary.
+            audio_encoder: "copy".to_string(),
             audio_cap: 640,
             pix_fmt: self.pix_fmt,
             delete_source: self.delete_source,
