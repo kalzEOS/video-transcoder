@@ -423,5 +423,8 @@ fn gui_defaults_to_audio_passthrough() {
     let settings = request.into_batch_settings();
     assert_eq!(settings.audio_encoder, "copy");
     let resolved = encoder::resolve_file_settings("hevc", "mkv", &settings, &sw_encoders());
-    assert!(matches!(resolved.audio_strategy, encoder::AudioStrategy::CopyAll));
+    assert!(matches!(
+        resolved.audio_strategy,
+        encoder::AudioStrategy::CopyAll
+    ));
 }
