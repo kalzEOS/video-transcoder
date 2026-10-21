@@ -346,6 +346,25 @@ pub async fn prepare(
     codec: &str,
     sink: &dyn EventSink,
 ) -> Result<Option<ExtractedHdr10Plus>, String> {
+    // A missing packager should fail immediately, not after an expensive
+    // HEVC extraction and HDR10+ metadata scan.
+    if codec != "hevc" {
+        return Err("Preserving HDR10+ requires HEVC output. Select HEVC or disable Preserve HDR10+ metadata.".into());
+    }
+    let child = mp4box_command()?
+        .arg("-version")
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Cannot start HDR10+ packaging tool: {e}"))?;
+    if !crate::pipeline_progress::wait_output(child, sink)
+        .await?
+        .status
+        .success()
+    {
+        return Err("HDR10+ packaging tool is unavailable; source retained".into());
+    }
     let result = crate::pipeline_progress::metadata_work(extract_hdr10plus_in(
         source,
         sink,
@@ -354,24 +373,7 @@ pub async fn prepare(
     ))
     .await?;
     if result.is_some() {
-        if codec != "hevc" {
-            return Err("Preserving HDR10+ requires HEVC output. Select HEVC or disable Preserve HDR10+ metadata.".into());
-        }
-        // Fail before the main encode, not after spending hours encoding.
-        let child = mp4box_command()?
-            .arg("-version")
-            .kill_on_drop(true)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Cannot start HDR10+ packaging tool: {e}"))?;
-        if !crate::pipeline_progress::wait_output(child, sink)
-            .await?
-            .status
-            .success()
-        {
-            return Err("HDR10+ packaging tool is unavailable; source retained".into());
-        }
+        // MP4Box was validated before metadata extraction.
     } else {
         sink.log(
             "  HDR10+ scan complete: no dynamic metadata found; continuing with normal encoding.",
