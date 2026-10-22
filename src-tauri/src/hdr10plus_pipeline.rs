@@ -235,7 +235,15 @@ pub async fn inject_hdr10plus(
         return Err("HDR10+ timing preservation requires a working MP4Box; source retained".into());
     }
     let video_mp4 = temp_dir.path().join("hdr10plus-video.mp4");
-    let child = mp4box_command()?
+    // GPAC may create additional temporary files while packaging. Keep them
+    // on the same disk-backed filesystem as the HDR10+ workspace instead of
+    // falling back to a potentially small RAM-backed /tmp.
+    let mut packager = mp4box_command()?;
+    packager
+        .env("TMPDIR", temp_dir.path())
+        .env("TMP", temp_dir.path())
+        .env("TEMP", temp_dir.path());
+    let child = packager
         .kill_on_drop(true)
         .args([
             "-add",
