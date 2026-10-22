@@ -1043,7 +1043,51 @@ fn metadata_failure(
     sink: &dyn EventSink,
 ) -> bool {
     if let Some(output) = output {
-        let _ = std::fs::remove_file(output);
+        // FFmpeg already completed the video encode. A later HDR10+ packaging
+        // failure must not throw away that work. Retain it as a recovery file,
+        // without labeling it as HDR10+-verified or touching the source.
+        if output.is_file() {
+            let filename = output
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "encoded.mkv".to_string());
+            let mut preserved = None;
+            for suffix in 0..1000 {
+                let recovery_name = if suffix == 0 {
+                    format!("{filename}.hdr10plus-failed-encoded")
+                } else {
+                    format!("{filename}.hdr10plus-failed-encoded-{suffix}")
+                };
+                let candidate = output.with_file_name(recovery_name);
+                if candidate.exists() {
+                    continue;
+                }
+                match std::fs::rename(output, &candidate) {
+                    Ok(()) => {
+                        preserved = Some(candidate);
+                        break;
+                    }
+                    Err(error) => {
+                        sink.log(&format!(
+                            "  WARNING: Could not move encoded video to a recovery file: {error}. Original encoded file remains at {}",
+                            output.display()
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(path) = preserved {
+                sink.log(&format!(
+                    "  RECOVERY: Completed encode preserved at {} (HDR10+ finalization was unsuccessful; HDR10+ metadata is not verified).",
+                    path.display()
+                ));
+            } else if output.exists() {
+                sink.log(&format!(
+                    "  RECOVERY: Encoded file retained at {} (HDR10+ not verified).",
+                    output.display()
+                ));
+            }
+        }
     }
     if !sink.cancellation_requested() {
         sink.log(&format!("  ERROR: HDR10+ preservation failed: {reason}. Source retained. Disable Preserve HDR10+ metadata for the fast HDR10 path."));
