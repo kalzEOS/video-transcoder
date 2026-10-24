@@ -72,6 +72,24 @@ fn rc_crf() -> RateControlParams<'static> {
     }
 }
 
+#[test]
+fn hdr_to_sdr_plan_reencodes_even_when_bitrate_would_copy() {
+    let copy = encoder::decide_encode_strategy(2.0, 4.0, "hevc", "h264", &rc_qp(), 1.5);
+    assert!(matches!(copy, EncodeDecision::Copy));
+    assert!(matches!(
+        encoder::require_tonemap_encode(copy, true, &rc_qp()),
+        EncodeDecision::Cqp { .. }
+    ));
+    assert!(matches!(
+        encoder::require_tonemap_encode(EncodeDecision::Copy, true, &rc_crf()),
+        EncodeDecision::Crf { .. }
+    ));
+    assert!(matches!(
+        encoder::require_tonemap_encode(EncodeDecision::Copy, false, &rc_qp()),
+        EncodeDecision::Copy
+    ));
+}
+
 // ── Copy decisions ──────────────────────────────────────────────
 
 #[test]

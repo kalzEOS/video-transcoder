@@ -934,6 +934,7 @@
         crf: parseInt(numCrf.value, 10) || 20,
         rcMode: getCurrentRcMode(),
         targetCodecFamily: chkCompat.checked ? 'h264' : 'hevc',
+        toneMapHdr: !chkHdr.checked && !chkPreserveHdr10Plus.checked,
       };
     }
 	
@@ -977,7 +978,7 @@
       if (mbps > settings.target * 1.15 || (mbps > settings.target && !isSameCodec)) {
         const peak = (settings.target * settings.peakMultiplier).toFixed(1).replace(/\.0$/, '');
         return `${settings.target}/${peak}Mbps (VBR)`;
-      } else if (isNonCopyable) {
+      } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
         if (settings.rcMode === 'CRF') {
           return `CRF ${settings.crf}`;
         }
@@ -1015,7 +1016,7 @@
         // VBR decision
         const estimatedBytes = (settings.target * 1000000 * item.durationSecs) / 8;
         return { bytes: Math.round(estimatedBytes), approx: false };
-      } else if (isNonCopyable) {
+      } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
         // CQP/CRF for non-copyable codecs
         return { bytes: item.sourceBytes, approx: true };
       } else if (mbps > 0) {
@@ -1541,6 +1542,7 @@
           chkCompat.checked = false;
         }
         updateHdrModeNote();
+        scheduleRefreshTargetBitrates();
         scheduleConfigSave();
       });
       chkPreserveHdr10Plus.addEventListener('change', () => {
@@ -1549,6 +1551,7 @@
           chkCompat.checked = false;
         }
         updateHdrModeNote();
+        scheduleRefreshTargetBitrates();
         scheduleConfigSave();
       });
 
@@ -1670,10 +1673,10 @@
       // shrink threshold: files above it are shrunk to it, files below are
       // re-encoded for quality at the QP values.
       const PROFILES = {
-        'archive-high':     { bitrate: 12, rc: 'QP', qpI: 18, qpP: 20, peak: '2.5', compat: false, av1: true,  hdr: true },
-        'archive-balanced': { bitrate: 6,  rc: 'QP', qpI: 20, qpP: 22, peak: '2',   compat: false, av1: true,  hdr: true },
-        'space-saver':      { bitrate: 3,  rc: 'QP', qpI: 24, qpP: 26, peak: '1.5', compat: false, av1: true,  hdr: true },
-        'max-compat':       { bitrate: 6,  rc: 'QP', qpI: 22, qpP: 24, peak: '1.5', compat: true,  av1: false, hdr: false },
+        'archive-high':     { bitrate: 12, rc: 'QP', qpI: 18, qpP: 20, peak: '2.5', compat: false, av1: true },
+        'archive-balanced': { bitrate: 6,  rc: 'QP', qpI: 20, qpP: 22, peak: '2',   compat: false, av1: true },
+        'space-saver':      { bitrate: 3,  rc: 'QP', qpI: 24, qpP: 26, peak: '1.5', compat: false, av1: true },
+        'max-compat':       { bitrate: 6,  rc: 'QP', qpI: 22, qpP: 24, peak: '1.5', compat: true,  av1: false },
       };
 
       let applying = false;
@@ -1709,10 +1712,11 @@
         numQpI.value = p.qpI;
         numQpP.value = p.qpP;
         setPeakMultiplier(p.peak);
+        const hdrMode = profileHdrSelection(chkHdr.checked, chkPreserveHdr10Plus.checked, p.compat);
         chkCompat.checked = p.compat;
         chkPreserveAv1.checked = p.av1;
-        chkHdr.checked = p.hdr;
-        chkPreserveHdr10Plus.checked = false;
+        chkHdr.checked = hdrMode.preserveHdr;
+        chkPreserveHdr10Plus.checked = hdrMode.preserveHdr10plus;
         updateHdrModeNote();
         chkPrecision.checked = false;
         applying = false;

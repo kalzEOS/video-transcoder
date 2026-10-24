@@ -317,6 +317,30 @@ pub fn decide_encode_strategy(
     }
 }
 
+/// An HDR-to-SDR filter cannot run with stream copy. Keep the plan and the
+/// encode loop on the same quality-based fallback when a copy was selected.
+pub fn require_tonemap_encode(
+    decision: EncodeDecision,
+    tone_mapped: bool,
+    rc: &RateControlParams<'_>,
+) -> EncodeDecision {
+    if !tone_mapped || !matches!(decision, EncodeDecision::Copy) {
+        return decision;
+    }
+    if rc.mode.eq_ignore_ascii_case("CRF") {
+        EncodeDecision::Crf {
+            crf: rc.crf_val,
+            qi_fallback: rc.qp_i,
+            qp_fallback: rc.qp_p,
+        }
+    } else {
+        EncodeDecision::Cqp {
+            qi: rc.qp_i,
+            qp: rc.qp_p,
+        }
+    }
+}
+
 // ── Encoder detection (§8) ──────────────────────────────────────
 
 /// Detect available encoders by running `ffmpeg -encoders`, then verifying
@@ -1662,37 +1686,25 @@ async fn encode_single_file(
         settings.peak_multiplier,
     );
 
-    // Tonemapping requires re-encoding — a stream copy can't apply a
-    // `-vf` filter. If the decision is Copy but we've committed to an
-    // HDR→SDR tonemap, ffmpeg will reject `-c:v copy -vf zscale=...`
-    // with EINVAL (exit 234). Override to a quality-based transcode so
-    // the user's SDR request is actually honoured. We use CRF/CQP
-    // (not VBR) because the source is already at/below the bitrate
-    // threshold — VBR would risk inflating the file.
-    let decision = if tonemap_filter.is_some() && matches!(decision, EncodeDecision::Copy) {
-        if settings.rate_control_mode.eq_ignore_ascii_case("CRF") {
-            EncodeDecision::Crf {
-                crf: settings.crf_val,
-                qi_fallback: settings.qp_i,
-                qp_fallback: settings.qp_p,
-            }
-        } else {
-            EncodeDecision::Cqp {
-                qi: settings.qp_i,
-                qp: settings.qp_p,
-            }
-        }
-    } else {
-        decision
-    };
+    let decision = require_tonemap_encode(
+        decision,
+        tonemap_filter.is_some(),
+        &RateControlParams {
+            mode: &settings.rate_control_mode,
+            qp_i: settings.qp_i,
+            qp_p: settings.qp_p,
+            crf_val: settings.crf_val,
+        },
+    );
 
     if !matches!(decision, EncodeDecision::Copy) && !is_image_source {
         let invalid = source_format.preservation_error(
             target_codec,
-            settings.compatibility_mode && tonemap_filter.is_none(),
+            settings.compatibility_mode,
             item_is_hdr,
             item_dovi_profile,
             queue[idx].probe.dovi_bl_compat_id,
+            tonemap_filter.is_some(),
         );
         if let Some(reason) = invalid {
             sink.log(&format!("  ERROR: {reason}"));

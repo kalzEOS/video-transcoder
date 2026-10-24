@@ -52,14 +52,15 @@ impl VideoFormat {
         hdr: bool,
         dv: Option<u8>,
         compat: Option<u8>,
+        tone_mapped: bool,
     ) -> Option<String> {
-        if compatibility && (self.bit_depth != 8 || hdr || dv.is_some()) {
+        if compatibility && !tone_mapped && (self.bit_depth != 8 || hdr || dv.is_some()) {
             return Some("Compatibility mode cannot preserve this source. Disable compatibility mode; its H.264/SDR conversion is blocked.".into());
         }
         if let Some(reason) = self.hdr10_fallback_error(dv, compat) {
             return Some(reason);
         }
-        if self.bit_depth > 10 && codec != "hevc" {
+        if !tone_mapped && self.bit_depth > 10 && codec != "hevc" {
             return Some("12-bit preservation requires software HEVC. Select HEVC or Auto.".into());
         }
         self.software_format().err()
@@ -356,7 +357,7 @@ mod tests {
         let source = VideoFormat::from_stream(&json!({"pix_fmt":"yuv420p10le",
             "color_transfer":"smpte2084","color_primaries":"bt2020","color_space":"bt2020nc"}));
         assert!(source
-            .preservation_error("hevc", false, true, Some(8), Some(1))
+            .preservation_error("hevc", false, true, Some(8), Some(1), false)
             .is_none());
         for (profile, compat) in [
             (Some(5), Some(0)),
@@ -373,7 +374,7 @@ mod tests {
         invalid.transfer = "arib-std-b67".into();
         assert!(invalid.hdr10_fallback_error(Some(8), Some(1)).is_some());
         assert!(source
-            .preservation_error("h264", true, true, None, None)
+            .preservation_error("h264", true, true, None, None, false)
             .is_some());
         assert!(source
             .verify(
@@ -381,6 +382,23 @@ mod tests {
                 false
             )
             .is_err());
+    }
+    #[test]
+    fn twelve_bit_hdr_can_explicitly_tonemap_to_compatibility_sdr() {
+        let source = VideoFormat::from_stream(&json!({
+            "pix_fmt":"yuv420p12le", "color_primaries":"bt2020",
+            "color_transfer":"smpte2084", "color_space":"bt2020nc"
+        }));
+        assert!(source
+            .preservation_error("h264", true, true, None, None, true)
+            .is_none());
+        assert!(source
+            .preservation_error("h264", true, true, None, None, false)
+            .is_some());
+        // SDR conversion does not waive the Dolby Vision base-layer safety check.
+        assert!(source
+            .preservation_error("h264", true, true, Some(5), Some(0), true)
+            .is_some());
     }
     #[test]
     fn depths_sdr_hdr_and_unsupported_formats() {

@@ -400,19 +400,21 @@ fn compute_decisions(
                 },
                 detected_encoders,
             );
-            encoder::decide_encode_strategy(
+            let rc = encoder::RateControlParams {
+                mode: &rate_control_mode,
+                qp_i: args.qp_i,
+                qp_p: args.qp_p,
+                crf_val: args.crf,
+            };
+            let decision = encoder::decide_encode_strategy(
                 item.probe.video_bitrate_mbps,
                 args.bitrate,
                 &item.probe.video_codec,
                 &resolved.codec_family,
-                &encoder::RateControlParams {
-                    mode: &rate_control_mode,
-                    qp_i: args.qp_i,
-                    qp_p: args.qp_p,
-                    crf_val: args.crf,
-                },
+                &rc,
                 args.peak_multiplier,
-            )
+            );
+            encoder::require_tonemap_encode(decision, item.probe.is_hdr && args.no_hdr, &rc)
         })
         .collect()
 }

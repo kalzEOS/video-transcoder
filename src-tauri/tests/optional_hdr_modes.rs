@@ -133,3 +133,53 @@ fn hdr_and_sdr_choices_preserve_audio_and_never_silently_restore_source_hdr() {
             .args(["-map", "0:v", "-map", "0:a", "-f", "null", "-"]));
     }
 }
+
+#[test]
+#[ignore = "requires FFmpeg with 12-bit libx265/libx264 and the cli feature; no GPU required"]
+fn twelve_bit_hdr_tonemaps_to_eight_bit_compatibility_sdr() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.mkv");
+    run(Command::new("ffmpeg").args([
+        "-v", "error", "-y", "-f", "lavfi", "-i",
+        "testsrc2=size=384x216:rate=24:duration=2", "-c:v", "libx265",
+        "-preset", "ultrafast", "-pix_fmt", "yuv420p12le", "-x265-params",
+        "pools=2:frame-threads=2:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:log-level=error",
+        "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+    ]).arg(&source));
+    let original = probe(&source);
+    assert_eq!(original["streams"][0]["pix_fmt"], "yuv420p12le");
+    assert_eq!(original["frames"][0]["color_transfer"], "smpte2084");
+
+    let destination = root.path().join("output");
+    run(Command::new(env!("CARGO_BIN_EXE_histv-cli"))
+        .args([
+            "--no-hdr",
+            "--compat",
+            "--encoder",
+            "libx264",
+            "--codec",
+            "h264",
+            "--bitrate",
+            "100",
+            "--fallback",
+            "no",
+            "--overwrite",
+            "yes",
+            "--log-level",
+            "quiet",
+            "--output",
+        ])
+        .arg(&destination)
+        .arg(&source));
+    let output = destination.join("source.mp4");
+    let video = probe(&output);
+    assert_eq!(video["streams"][0]["codec_name"], "h264");
+    assert_eq!(video["streams"][0]["pix_fmt"], "yuv420p");
+    for field in ["color_primaries", "color_transfer", "color_space"] {
+        assert_eq!(video["frames"][0][field], "bt709");
+    }
+    run(Command::new("ffmpeg")
+        .args(["-v", "error", "-xerror", "-i"])
+        .arg(&output)
+        .args(["-map", "0:v", "-f", "null", "-"]));
+}
