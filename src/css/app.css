@@ -320,7 +320,7 @@ input[type="radio"]:checked::after { content: ""; position: absolute; inset: 4px
 #drop-overlay.visible { display: flex; }
 
 /* Queue table — clean, legible */
-#queue-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-variant-numeric: tabular-nums; }
+#queue-table { width: max-content; border-collapse: collapse; table-layout: fixed; font-variant-numeric: tabular-nums; }
 #queue-table thead { position: sticky; top: 0; z-index: 2; }
 #queue-table th {
   position: relative; background: var(--background); color: var(--text-muted); text-align: left;
@@ -328,7 +328,7 @@ input[type="radio"]:checked::after { content: ""; position: absolute; inset: 4px
   padding: var(--s2) var(--s3); border-bottom: 1px solid var(--glass-border);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none;
 }
-.col-check { width: 36px; text-align: center !important; }
+.col-check { text-align: center !important; }
 #queue-table th:nth-child(3), #queue-table td:nth-child(3),
 #queue-table th:nth-child(4), #queue-table td:nth-child(4),
 #queue-table th:nth-child(7), #queue-table td:nth-child(7),
@@ -508,11 +508,9 @@ tr.status-encoding .status-badge::before { background: var(--accent); animation:
    RESPONSIVE
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Medium: tighten rail, drop the two bitrate columns, let the strip breathe */
+/* Medium: tighten rail while keeping every table column available by scrolling */
 @media (max-width: 1040px) {
   :root { --rail-w: 280px; }
-  #queue-table th:nth-child(7), #queue-table td:nth-child(7),
-  #queue-table th:nth-child(8), #queue-table td:nth-child(8) { display: none; }
   #status-strip-bars { width: 168px; }
 }
 
@@ -532,17 +530,6 @@ tr.status-encoding .status-badge::before { background: var(--accent); animation:
   .profile-card[data-profile="archive-balanced"]::after { display: none; }   /* chip clutters the compact row */
   #splitter { display: none; }                               /* no horizontal resize in column mode */
   #left-panel { min-width: 0; width: auto !important; }       /* drop any inline width set by the splitter drag */
-  /* queue hides resolution + HDR too; keeps Filename / From / To / Status */
-  #queue-table th:nth-child(5), #queue-table td:nth-child(5),
-  #queue-table th:nth-child(6), #queue-table td:nth-child(6) { display: none; }
-  /* compact fallback: surface the dropped Resolution / HDR / bitrate as a
-     muted second line under the filename so the data isn't simply lost */
-  #queue-table td:nth-child(2)[data-compact]:not([data-compact=""])::after {
-    content: attr(data-compact);
-    display: block; margin-top: 2px;
-    font-size: 11px; color: var(--text-muted);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
   #status-strip { flex-wrap: wrap; min-height: 0; padding: var(--s2) var(--s4); gap: var(--s3); }
   #status-strip-bars { width: 100%; order: 3; }
   #status-strip-info { order: 1; flex: 1 1 60%; }

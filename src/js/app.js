@@ -126,7 +126,7 @@
       setupClipboardPaste();
       setupKeyboardShortcuts();
       setupDragReorder();
-      setupColumnResize();
+      setupQueueColumnResize($('#queue-table'), $('#queue-container'));
       setupTooltips();
       setupModalButtons();
       setupBottomButtons();
@@ -1339,38 +1339,6 @@
     let reorderStartY = 0;
     let reorderLastIndicator = null; // { index, position: 'above'|'below' }
     const REORDER_THRESHOLD = 5; // pixels before drag activates
-
-    // ── Column resize handles (§5.9) ──
-    function setupColumnResize() {
-      const ths = document.querySelectorAll('#queue-table thead th');
-      ths.forEach((th, i) => {
-        // Skip checkbox column and filename column (flexible)
-        if (i === 0 || i === 1) return;
-        const handle = document.createElement('div');
-        handle.className = 'col-resize-handle';
-        th.appendChild(handle);
-
-        let startX, startW;
-        handle.addEventListener('mousedown', (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          startX = e.clientX;
-          startW = th.offsetWidth;
-          handle.classList.add('active');
-          // table-layout:fixed propagates th width to all td cells automatically
-          const onMove = (ev) => {
-            th.style.width = Math.max(30, startW + ev.clientX - startX) + 'px';
-          };
-          const onUp = () => {
-            handle.classList.remove('active');
-            document.removeEventListener('mousemove', onMove);
-            document.removeEventListener('mouseup', onUp);
-          };
-          document.addEventListener('mousemove', onMove);
-          document.addEventListener('mouseup', onUp);
-        });
-      });
-    }
 
     function setupDragReorder() {
       queueBody.addEventListener('mousedown', (e) => {
