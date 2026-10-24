@@ -44,7 +44,7 @@ function computeTargetBitrateLabel(item, settings) {
   if (mbps > settings.target * 1.15 || (mbps > settings.target && !isSameCodec)) {
     const peak = (settings.target * settings.peakMultiplier).toFixed(1).replace(/\.0$/, '');
     return `${settings.target}/${peak}Mbps (VBR)`;
-  } else if (isNonCopyable) {
+  } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
     if (settings.rcMode === 'CRF') {
       return `CRF ${settings.crf}`;
     }
@@ -76,7 +76,7 @@ function computeEstimatedSize(item, settings) {
   if (mbps > settings.target * 1.15 || (mbps > settings.target && !isSameCodec)) {
     const estimatedBytes = (settings.target * 1000000 * item.durationSecs) / 8;
     return { bytes: Math.round(estimatedBytes), approx: false };
-  } else if (isNonCopyable) {
+  } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
     return { bytes: item.sourceBytes, approx: true };
   } else if (mbps > 0) {
     return { bytes: item.sourceBytes, approx: false };

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Honey, I Shrunk The Vids v2.7.0</title>
+  <title>Honey, I Shrunk The Vids v2.7.1</title>
   <link rel="stylesheet" href="css/app.css" />
 </head>
 <body>
@@ -24,12 +24,15 @@
             <div class="empty-hint">or use Add — pick a quality on the left, then Start. Folders are scanned automatically.</div>
           </div>
           <table id="queue-table">
+            <colgroup>
+              <col><col><col><col><col><col><col><col><col>
+            </colgroup>
             <thead>
               <tr>
                 <th class="col-check"><input type="checkbox" id="select-all" title="Select / deselect all"></th>
                 <th>Filename</th>
                 <th>From</th>
-                <th class="has-tooltip">To (est.)<span class="tooltip-icon">?</span><span class="tooltip-text">Estimated output size for the chosen quality. Tilde (~) means the exact size can't be predicted for quality-based encoding.</span></th>
+                <th class="has-tooltip">To (est.)<span class="tooltip-icon">?</span><span class="tooltip-text">For VBR, “@ target” shows the size if the video averages the requested bitrate, plus known copied audio. Hardware encoders may use much less bitrate, so the actual movie can be substantially smaller. Other quality-based sizes are approximate.</span></th>
                 <th>Resolution</th>
                 <th>HDR</th>
                 <th>From B/R</th>
@@ -173,25 +176,25 @@
 
             <div class="section-header">Behaviour</div>
 
-            <div class="checkbox-row has-tooltip">
-              <input type="checkbox" id="chk-hdr" checked disabled />
-              <label for="chk-hdr">Preserve HDR10 and source bit depth</label>
-              <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">8-bit stays 8-bit; 10-bit stays 10-bit. HDR10 color and supported static metadata are verified. Re-encoding discards Dolby Vision. HDR10+ dynamic metadata is discarded unless the optional preservation checkbox is enabled. Compatible Dolby Vision Profile 8.1 uses its HDR10 base layer; unsafe fallback is blocked. SDR and HLG remain SDR and HLG.</span>
+            <div class="form-row hdr-mode-row">
+              <div class="hdr-mode-heading">
+                <label for="sel-hdr-mode">HDR Preservation</label>
+                <button type="button" class="hdr-help-button" id="btn-hdr-help" aria-label="About HDR preservation" title="Explain HDR modes">?</button>
+              </div>
+              <select id="sel-hdr-mode" aria-describedby="hdr-mode-note">
+                <option value="auto">Auto</option>
+                <option value="sdr">SDR</option>
+                <option value="hdr10">HDR10</option>
+                <option value="hdr10plus">HDR10+</option>
+              </select>
             </div>
-
-            <div class="checkbox-row has-tooltip">
-              <input type="checkbox" id="chk-preserve-hdr10plus" />
-              <label for="chk-preserve-hdr10plus">Preserve HDR10+ metadata (slower)</label>
-              <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">Optional; off by default for the fast HDR10 path. On adds full-video extraction, metadata alignment, reinsertion and verification, using temporary disk space. Supports 10-bit HEVC with constant frame timing and preserves your selected container. Failure stops the file and retains the source. Dolby Vision is not restored. GPU decoding and encoding settings remain independent.</span>
-            </div>
+            <div class="hdr-mode-note" id="hdr-mode-note" aria-live="polite"></div>
 
             <div class="checkbox-row has-tooltip">
               <input type="checkbox" id="chk-hardware-decoding" />
               <label for="chk-hardware-decoding">Hardware Decoding (GPU)</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">Enable to try GPU decoding and encoding on the same verified device. Unsupported formats or failed GPU decoding automatically use CPU decoding while keeping the GPU encoder when compatible. Source bit depth and HDR10 colors are preserved.</span>
+              <span class="tooltip-text">Enable to try GPU decoding and encoding on the same verified device. Unsupported formats or failed GPU decoding automatically use CPU decoding while keeping the GPU encoder when compatible. HDR output follows the selected HDR mode.</span>
             </div>
 
             <div class="checkbox-row has-tooltip">
@@ -205,7 +208,7 @@
               <input type="checkbox" id="chk-compat" />
               <label for="chk-compat">Compatibility mode</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">Use H.264/MP4 for compatible 8-bit SDR sources. HDR and higher bit-depth sources are blocked rather than converted to SDR or reduced precision.</span>
+              <span class="tooltip-text">Use H.264/MP4 and SDR output. Selecting this mode also selects SDR; HDR and HLG sources are deliberately tone-mapped to 8-bit BT.709.</span>
             </div>
 
             <div class="checkbox-row has-tooltip">
@@ -395,6 +398,33 @@
       </div>
     </div>
 
+    <!-- ═══ Modal: HDR preservation help ═══ -->
+    <div class="modal-overlay" id="modal-hdr-help" role="dialog" aria-modal="true" aria-labelledby="modal-hdr-help-title">
+      <div class="modal-box">
+        <div class="modal-title" id="modal-hdr-help-title">HDR Preservation</div>
+        <div class="modal-body hdr-help-body">
+          <p><strong>Auto:</strong> Keep the source format. Compatible 10-bit HEVC HDR video is scanned for HDR10+ metadata before encoding.</p>
+          <p><strong>SDR:</strong> Tone-map HDR or HLG to 8-bit BT.709. SDR sources keep their original bit depth.</p>
+          <p><strong>HDR10:</strong> Keep 10-bit HDR color and supported static metadata. No dynamic-metadata processing is added.</p>
+          <p><strong>HDR10+:</strong> Also preserve and verify dynamic metadata. This takes longer and needs 10-bit HEVC with constant frame timing.</p>
+          <p>Dolby Vision dynamic metadata is not restored when re-encoding. A verified HDR10-compatible base layer can remain.</p>
+        </div>
+        <div class="modal-buttons"><button class="btn btn-primary" id="hdr-help-close">Close</button></div>
+      </div>
+    </div>
+
+    <!-- ═══ Modal: Close during conversion ═══ -->
+    <div class="modal-overlay" id="modal-close-encoding" role="dialog" aria-modal="true" aria-labelledby="modal-close-encoding-title">
+      <div class="modal-box">
+        <div class="modal-title" id="modal-close-encoding-title">Conversion in progress</div>
+        <div class="modal-body" id="close-encoding-body">Closing now will cancel the conversion and remove the partial output. Source files will remain untouched.</div>
+        <div class="modal-buttons">
+          <button class="btn" id="close-encoding-cancel">Keep Encoding</button>
+          <button class="btn btn-primary" id="close-encoding-anyway">Close Anyway</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ═══ Modal: Delete-source confirmation ═══ -->
     <div class="modal-overlay" id="modal-delete-confirm" role="dialog" aria-modal="true" aria-labelledby="modal-delete-title">
       <div class="modal-box">
@@ -476,6 +506,8 @@
   <!-- Tooltip popup (positioned by JS) -->
   <div id="tooltip-popup"></div>
 
+  <script src="js/hdr-options.js"></script>
+  <script src="js/queue-columns.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

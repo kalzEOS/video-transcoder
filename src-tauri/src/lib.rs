@@ -682,7 +682,7 @@ mod gui_commands {
         });
 
         tokio::spawn(async move {
-            let (done, failed, skipped, _was_cancelled) = encoder::run_encode_loop(
+            let (done, failed, skipped, was_cancelled) = encoder::run_encode_loop(
                 mapping_sink.as_ref(),
                 batch_ctrl.as_ref(),
                 &mut pending_items,
@@ -716,7 +716,7 @@ mod gui_commands {
                 ));
             }
 
-            if post_action != "None" {
+            if post_action != "None" && !was_cancelled && !batch_ctrl.should_cancel_all() {
                 mapping_sink.post_batch(&post_action, post_countdown);
             }
 
@@ -971,7 +971,5 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-// Note: Window close confirmation during a batch (§16.4) is handled in the
-// frontend via the beforeunload event combined with checking is_batch_running.
-// Tauri v2's on_window_event with CloseRequested can be added here if the
-// frontend approach proves insufficient on a particular platform.
+// The frontend handles Tauri's close-requested event during a batch and waits
+// for cancellation cleanup before issuing the final window close.

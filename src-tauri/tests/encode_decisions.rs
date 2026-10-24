@@ -29,7 +29,9 @@ fn base_settings() -> BatchSettings {
         preserve_av1: false,
         precision_mode: false,
         hardware_decoding: false,
+        preserve_hdr: true,
         preserve_hdr10plus: false,
+        hdr_mode: None,
         output_folder: String::new(),
         output_mode: String::new(),
         threshold: 4.0,
@@ -69,6 +71,24 @@ fn rc_crf() -> RateControlParams<'static> {
         qp_p: 22,
         crf_val: 20,
     }
+}
+
+#[test]
+fn hdr_to_sdr_plan_reencodes_even_when_bitrate_would_copy() {
+    let copy = encoder::decide_encode_strategy(2.0, 4.0, "hevc", "h264", &rc_qp(), 1.5);
+    assert!(matches!(copy, EncodeDecision::Copy));
+    assert!(matches!(
+        encoder::require_tonemap_encode(copy, true, &rc_qp()),
+        EncodeDecision::Cqp { .. }
+    ));
+    assert!(matches!(
+        encoder::require_tonemap_encode(EncodeDecision::Copy, true, &rc_crf()),
+        EncodeDecision::Crf { .. }
+    ));
+    assert!(matches!(
+        encoder::require_tonemap_encode(EncodeDecision::Copy, false, &rc_qp()),
+        EncodeDecision::Copy
+    ));
 }
 
 // ── Copy decisions ──────────────────────────────────────────────

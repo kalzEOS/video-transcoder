@@ -143,6 +143,12 @@ describe('computeTargetBitrateLabel', () => {
     const label = computeTargetBitrateLabel(item, baseSettings);
     assert.match(label, /VBR/);
   });
+
+  it('shows a quality encode when HDR is being tone-mapped below threshold', () => {
+    const item = { videoBitrateMbps: 2.0, videoCodec: 'hevc', isHdr: true };
+    assert.equal(computeTargetBitrateLabel(item, { ...baseSettings, toneMapHdr: true }), 'CQP (20/22)');
+    assert.equal(computeTargetBitrateLabel(item, baseSettings), 'Copy');
+  });
 });
 
 // ── computeEstimatedSize ───────────────────────────────────────
@@ -168,6 +174,12 @@ describe('computeEstimatedSize', () => {
     const est = computeEstimatedSize(item, baseSettings);
     assert.equal(est.bytes, 50000000);
     assert.equal(est.approx, false);
+  });
+
+  it('marks HDR-to-SDR output size approximate because it re-encodes', () => {
+    const item = { sourceBytes: 50000000, videoBitrateMbps: 2.0, videoCodec: 'hevc', durationSecs: 60, isHdr: true };
+    assert.equal(computeEstimatedSize(item, { ...baseSettings, toneMapHdr: true }).approx, true);
+    assert.equal(computeEstimatedSize(item, baseSettings).approx, false);
   });
 
   it('returns VBR estimate for above threshold', () => {

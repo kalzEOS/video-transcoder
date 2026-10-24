@@ -29,8 +29,8 @@ pub fn pixel_depth(format: &str) -> u8 {
 }
 
 impl VideoFormat {
-    /// Preservation is automatic; legacy HDR/compatibility settings must not
-    /// silently request tone mapping, bit-depth reduction or unsupported codecs.
+    /// Reject unsupported preservation paths. Deliberate HDR-to-SDR conversion
+    /// is selected by the caller and verified separately.
     pub fn hdr10_fallback_error(&self, dv: Option<u8>, compat: Option<u8>) -> Option<String> {
         dv?;
         if dv != Some(8)
@@ -52,14 +52,15 @@ impl VideoFormat {
         hdr: bool,
         dv: Option<u8>,
         compat: Option<u8>,
+        tone_mapped: bool,
     ) -> Option<String> {
-        if compatibility && (self.bit_depth != 8 || hdr || dv.is_some()) {
+        if compatibility && !tone_mapped && (self.bit_depth != 8 || hdr || dv.is_some()) {
             return Some("Compatibility mode cannot preserve this source. Disable compatibility mode; its H.264/SDR conversion is blocked.".into());
         }
         if let Some(reason) = self.hdr10_fallback_error(dv, compat) {
             return Some(reason);
         }
-        if self.bit_depth > 10 && codec != "hevc" {
+        if !tone_mapped && self.bit_depth > 10 && codec != "hevc" {
             return Some("12-bit preservation requires software HEVC. Select HEVC or Auto.".into());
         }
         self.software_format().err()
@@ -242,6 +243,20 @@ impl VideoFormat {
                 output.bit_depth
             ));
         }
+        if tone_mapped {
+            for (name, value) in [
+                ("primaries", &output.primaries),
+                ("transfer", &output.transfer),
+                ("matrix", &output.matrix),
+            ] {
+                if value != "bt709" {
+                    return Err(format!("SDR {name} was not BT.709: {value}"));
+                }
+            }
+            if !output.static_hdr.is_empty() {
+                return Err("SDR output still carries static HDR metadata".into());
+            }
+        }
         if !tone_mapped {
             let chroma = |pixel: &str| {
                 if pixel.contains("422") {
@@ -342,7 +357,7 @@ mod tests {
         let source = VideoFormat::from_stream(&json!({"pix_fmt":"yuv420p10le",
             "color_transfer":"smpte2084","color_primaries":"bt2020","color_space":"bt2020nc"}));
         assert!(source
-            .preservation_error("hevc", false, true, Some(8), Some(1))
+            .preservation_error("hevc", false, true, Some(8), Some(1), false)
             .is_none());
         for (profile, compat) in [
             (Some(5), Some(0)),
@@ -359,7 +374,7 @@ mod tests {
         invalid.transfer = "arib-std-b67".into();
         assert!(invalid.hdr10_fallback_error(Some(8), Some(1)).is_some());
         assert!(source
-            .preservation_error("h264", true, true, None, None)
+            .preservation_error("h264", true, true, None, None, false)
             .is_some());
         assert!(source
             .verify(
@@ -367,6 +382,23 @@ mod tests {
                 false
             )
             .is_err());
+    }
+    #[test]
+    fn twelve_bit_hdr_can_explicitly_tonemap_to_compatibility_sdr() {
+        let source = VideoFormat::from_stream(&json!({
+            "pix_fmt":"yuv420p12le", "color_primaries":"bt2020",
+            "color_transfer":"smpte2084", "color_space":"bt2020nc"
+        }));
+        assert!(source
+            .preservation_error("h264", true, true, None, None, true)
+            .is_none());
+        assert!(source
+            .preservation_error("h264", true, true, None, None, false)
+            .is_some());
+        // SDR conversion does not waive the Dolby Vision base-layer safety check.
+        assert!(source
+            .preservation_error("h264", true, true, Some(5), Some(0), true)
+            .is_some());
     }
     #[test]
     fn depths_sdr_hdr_and_unsupported_formats() {
@@ -418,6 +450,29 @@ mod tests {
             assert!(!f.gpu_decode_eligible("hevc", "hevc_vaapi", true, true, false)); // CPU filters
             assert!(!f.gpu_decode_eligible("hevc", "hevc_vaapi", false, false, false));
         }
+    }
+    #[test]
+    fn deliberate_tonemap_requires_eight_bit_sdr_without_hdr_metadata() {
+        let source = VideoFormat::from_stream(&json!({
+            "pix_fmt":"yuv420p10le", "color_primaries":"bt2020",
+            "color_transfer":"smpte2084", "color_space":"bt2020nc"
+        }));
+        let sdr = VideoFormat::from_stream(&json!({
+            "pix_fmt":"yuv420p", "color_primaries":"bt709",
+            "color_transfer":"bt709", "color_space":"bt709"
+        }));
+        assert!(source.verify(&sdr, true).is_ok());
+        assert!(source.verify(&sdr, false).is_err());
+        let mut bad = sdr.clone();
+        bad.transfer = "smpte2084".into();
+        assert!(source.verify(&bad, true).is_err());
+        bad = sdr.clone();
+        bad.bit_depth = 10;
+        assert!(source.verify(&bad, true).is_err());
+        bad = sdr;
+        bad.static_hdr
+            .push(json!({"side_data_type":"Content light level metadata"}));
+        assert!(source.verify(&bad, true).is_err());
     }
     #[tokio::test]
     async fn failure_retries_once_and_cancellation_never_retries() {

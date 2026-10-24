@@ -133,6 +133,41 @@ async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
             .success
     );
     hdr::verify_output(&output, &metadata, &Sink).await.unwrap();
+    // A successful mux and metadata scan alone do not rule out a frozen
+    // picture. Compare decoded frames at the start and after a later seek.
+    let decoded_frames = |path: &Path, start: Option<&str>| -> Vec<String> {
+        let mut command = Command::new("ffmpeg");
+        command.args(["-v", "error", "-xerror"]);
+        if let Some(start) = start {
+            command.args(["-ss", start]);
+        }
+        let result = run(command
+            .arg("-i")
+            .arg(path)
+            .args(["-map", "0:v:0", "-t", "4", "-f", "framemd5", "-"]));
+        String::from_utf8(result.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(|line| line.rsplit(',').next().unwrap().trim().to_string())
+            .collect()
+    };
+    for seek in [None, Some("20")] {
+        let before = decoded_frames(&source, seek);
+        let after = decoded_frames(&output, seek);
+        assert_eq!(
+            before, after,
+            "HDR10+ reinsertion changed video after seek {seek:?}"
+        );
+        assert!(
+            after.len() > 80,
+            "Too few decoded pictures after seek {seek:?}"
+        );
+        assert!(
+            after.windows(2).any(|pair| pair[0] != pair[1]),
+            "Frozen video after seek {seek:?}"
+        );
+    }
     let actual = inspect(&output);
     let mut last = [None::<f64>; 2];
     let mut worst_lead = 0.0f64;

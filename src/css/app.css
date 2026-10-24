@@ -228,6 +228,13 @@ input[type="radio"]:checked::after { content: ""; position: absolute; inset: 4px
 .checkbox-row { display: flex; align-items: flex-start; gap: var(--s2); margin-bottom: var(--s2); min-height: 22px; font-size: 12px; }
 .checkbox-row label { line-height: 1.35; padding-top: 1px; cursor: pointer; flex: 1 1 auto; }
 .checkbox-row input[type="checkbox"] { margin-top: 1px; }
+.hdr-mode-row { align-items: stretch; flex-direction: column; gap: var(--s1); }
+.hdr-mode-heading { display: flex; align-items: center; gap: var(--s2); }
+.hdr-mode-heading label { font-size: 12px; color: var(--text); }
+.hdr-mode-row select { flex: none; width: 100%; }
+.hdr-mode-note { margin: 0 0 var(--s3); color: var(--text-muted); font-size: 11px; line-height: 1.35; }
+.hdr-help-button { width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--glass-border); background: var(--glass-toggle-bg); color: var(--text-muted); font-size: 11px; font-weight: 700; cursor: pointer; }
+.hdr-help-button:hover, .hdr-help-button:focus-visible { color: var(--accent); border-color: var(--accent); }
 .radio-group { display: flex; flex-direction: column; gap: 5px; }
 .radio-label { display: flex; align-items: center; gap: var(--s2); font-size: 12px; cursor: pointer; }
 .inline-check { display: inline-flex; align-items: center; gap: var(--s2); font-size: 12px; white-space: nowrap; cursor: pointer; margin-left: var(--s1); }
@@ -313,7 +320,7 @@ input[type="radio"]:checked::after { content: ""; position: absolute; inset: 4px
 #drop-overlay.visible { display: flex; }
 
 /* Queue table — clean, legible */
-#queue-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-variant-numeric: tabular-nums; }
+#queue-table { width: max-content; border-collapse: collapse; table-layout: fixed; font-variant-numeric: tabular-nums; }
 #queue-table thead { position: sticky; top: 0; z-index: 2; }
 #queue-table th {
   position: relative; background: var(--background); color: var(--text-muted); text-align: left;
@@ -321,7 +328,7 @@ input[type="radio"]:checked::after { content: ""; position: absolute; inset: 4px
   padding: var(--s2) var(--s3); border-bottom: 1px solid var(--glass-border);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none;
 }
-.col-check { width: 36px; text-align: center !important; }
+.col-check { text-align: center !important; }
 #queue-table th:nth-child(3), #queue-table td:nth-child(3),
 #queue-table th:nth-child(4), #queue-table td:nth-child(4),
 #queue-table th:nth-child(7), #queue-table td:nth-child(7),
@@ -467,10 +474,13 @@ tr.status-encoding .status-badge::before { background: var(--accent); animation:
 .modal-overlay { display: none; position: fixed; inset: 0; z-index: 1000; align-items: center; justify-content: center; padding: var(--s6); background: var(--glass-overlay-bg); backdrop-filter: blur(var(--glass-blur)); }
 .modal-overlay.visible { display: flex; }
 .modal-box { width: 100%; max-width: 440px; padding: var(--s5); background: var(--surface); border: 1px solid var(--glass-border); border-radius: var(--radius); box-shadow: var(--shadow-pop); animation: pop-in 180ms cubic-bezier(0.2, 0.7, 0.3, 1); }
+.modal-overlay#modal-hdr-help .modal-box { max-height: calc(100vh - 2 * var(--s6)); overflow-y: auto; }
 .modal-wide { max-width: 680px; }
 @keyframes pop-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
 .modal-title { font-size: 16px; font-weight: 700; margin-bottom: var(--s3); color: var(--text); }
 .modal-body { font-size: 13px; color: var(--text-muted); line-height: 1.55; margin-bottom: var(--s4); }
+.hdr-help-body p { margin: 0 0 var(--s2); }
+.hdr-help-body p:last-child { margin-bottom: 0; }
 .modal-buttons { display: flex; gap: var(--s2); justify-content: flex-end; flex-wrap: wrap; }
 .preflight-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: var(--s1); }
 .preflight-table thead tr { border-bottom: 1px solid var(--glass-border); }
@@ -498,11 +508,9 @@ tr.status-encoding .status-badge::before { background: var(--accent); animation:
    RESPONSIVE
    ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Medium: tighten rail, drop the two bitrate columns, let the strip breathe */
+/* Medium: tighten rail while keeping every table column available by scrolling */
 @media (max-width: 1040px) {
   :root { --rail-w: 280px; }
-  #queue-table th:nth-child(7), #queue-table td:nth-child(7),
-  #queue-table th:nth-child(8), #queue-table td:nth-child(8) { display: none; }
   #status-strip-bars { width: 168px; }
 }
 
@@ -522,17 +530,6 @@ tr.status-encoding .status-badge::before { background: var(--accent); animation:
   .profile-card[data-profile="archive-balanced"]::after { display: none; }   /* chip clutters the compact row */
   #splitter { display: none; }                               /* no horizontal resize in column mode */
   #left-panel { min-width: 0; width: auto !important; }       /* drop any inline width set by the splitter drag */
-  /* queue hides resolution + HDR too; keeps Filename / From / To / Status */
-  #queue-table th:nth-child(5), #queue-table td:nth-child(5),
-  #queue-table th:nth-child(6), #queue-table td:nth-child(6) { display: none; }
-  /* compact fallback: surface the dropped Resolution / HDR / bitrate as a
-     muted second line under the filename so the data isn't simply lost */
-  #queue-table td:nth-child(2)[data-compact]:not([data-compact=""])::after {
-    content: attr(data-compact);
-    display: block; margin-top: 2px;
-    font-size: 11px; color: var(--text-muted);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
   #status-strip { flex-wrap: wrap; min-height: 0; padding: var(--s2) var(--s4); gap: var(--s3); }
   #status-strip-bars { width: 100%; order: 3; }
   #status-strip-info { order: 1; flex: 1 1 60%; }

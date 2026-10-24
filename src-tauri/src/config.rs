@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub crf: u32,
     pub rate_control_mode: String, // "QP" | "CRF"
     pub hdr: bool,
+    /// None denotes a config written by a build that forced HDR preservation.
+    pub preserve_hdr: Option<bool>,
     pub audio_codec: String, // "AC3" | "EAC3" | "AAC" | "Copy"
     pub audio_bitrate_cap: u32,
     pub auto_clear_completed: bool,
@@ -36,6 +38,8 @@ pub struct AppConfig {
     pub precision_mode: bool,
     pub hardware_decoding: bool,
     pub preserve_hdr10plus: bool,
+    /// New single HDR selector. None migrates the legacy checkboxes.
+    pub hdr_mode: Option<crate::encoder::HdrMode>,
     #[serde(default)]
     pub compatibility_mode: bool,
     #[serde(default)]
@@ -64,6 +68,7 @@ impl Default for AppConfig {
             crf: 20,
             rate_control_mode: "QP".to_string(),
             hdr: false,
+            preserve_hdr: None,
             audio_codec: "AC3".to_string(),
             audio_bitrate_cap: 640,
             auto_clear_completed: false,
@@ -74,6 +79,7 @@ impl Default for AppConfig {
             precision_mode: false,
             hardware_decoding: false,
             preserve_hdr10plus: false,
+            hdr_mode: None,
             compatibility_mode: false,
             preserve_av1: false,
             force_local: false,
@@ -170,6 +176,28 @@ mod tests {
         assert!(restored.preserve_hdr10plus);
         assert!(!restored.hardware_decoding);
         assert_eq!(restored.hdr, AppConfig::default().hdr);
+    }
+
+    #[test]
+    fn legacy_hdr_config_does_not_silently_opt_into_sdr_conversion() {
+        let old: AppConfig = serde_json::from_str(r#"{"hdr":false}"#).unwrap();
+        assert_eq!(old.preserve_hdr, None);
+        let mut selected = old;
+        selected.preserve_hdr = Some(false);
+        let restored: AppConfig =
+            serde_json::from_value(serde_json::to_value(selected).unwrap()).unwrap();
+        assert_eq!(restored.preserve_hdr, Some(false));
+    }
+
+    #[test]
+    fn single_hdr_mode_round_trips_without_changing_legacy_fields() {
+        let mut config: AppConfig = serde_json::from_str(r#"{"preserveHdr":false}"#).unwrap();
+        config.hdr_mode = Some(crate::encoder::HdrMode::Auto);
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["hdrMode"], "auto");
+        assert_eq!(saved["preserveHdr"], false);
+        let restored: AppConfig = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.hdr_mode, Some(crate::encoder::HdrMode::Auto));
     }
 
     #[test]

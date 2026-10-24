@@ -80,7 +80,7 @@ pub struct CliArgs {
     pub hdr: bool,
 
     /// Force SDR output even for HDR sources
-    #[arg(long = "no-hdr", conflicts_with = "hdr")]
+    #[arg(long = "no-hdr", conflicts_with_all = ["hdr", "preserve_hdr10plus"])]
     pub no_hdr: bool,
 
     /// Limit the number of CPU threads ffmpeg may use (0 = auto, max 64)

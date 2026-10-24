@@ -53,12 +53,6 @@ fn main() {
         }
     }
 
-    if args.no_hdr {
-        eprintln!(
-            "ERROR: --no-hdr conflicts with source preservation. HDR-to-SDR conversion is blocked."
-        );
-        std::process::exit(4);
-    }
     // Create the CLI event sink (Arc-wrapped for sharing across probe tasks)
     let sink = Arc::new(cli_sink::CliSink::new(args.log_level.clone()));
 
@@ -381,7 +375,9 @@ fn compute_decisions(
                     preserve_av1: args.preserve_av1,
                     precision_mode: args.precision_mode,
                     hardware_decoding: args.hardware_decoding,
+                    preserve_hdr: !args.no_hdr,
                     preserve_hdr10plus: args.preserve_hdr10plus,
+                    hdr_mode: None,
                     output_folder: String::new(),
                     output_mode: String::new(),
                     threshold: args.bitrate,
@@ -405,19 +401,21 @@ fn compute_decisions(
                 },
                 detected_encoders,
             );
-            encoder::decide_encode_strategy(
+            let rc = encoder::RateControlParams {
+                mode: &rate_control_mode,
+                qp_i: args.qp_i,
+                qp_p: args.qp_p,
+                crf_val: args.crf,
+            };
+            let decision = encoder::decide_encode_strategy(
                 item.probe.video_bitrate_mbps,
                 args.bitrate,
                 &item.probe.video_codec,
                 &resolved.codec_family,
-                &encoder::RateControlParams {
-                    mode: &rate_control_mode,
-                    qp_i: args.qp_i,
-                    qp_p: args.qp_p,
-                    crf_val: args.crf,
-                },
+                &rc,
                 args.peak_multiplier,
-            )
+            );
+            encoder::require_tonemap_encode(decision, item.probe.is_hdr && args.no_hdr, &rc)
         })
         .collect()
 }
@@ -862,7 +860,9 @@ fn run_batch(
         low_priority: args.low_priority,
         precision_mode: args.precision_mode,
         hardware_decoding: args.hardware_decoding,
+        preserve_hdr: !args.no_hdr,
         preserve_hdr10plus: args.preserve_hdr10plus,
+        hdr_mode: None,
         compatibility_mode: args.compat,
         preserve_av1: args.preserve_av1,
         force_local: false,
