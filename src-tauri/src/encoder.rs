@@ -882,6 +882,112 @@ pub fn preflight_scan(queue: &[QueueItem]) -> Vec<PreflightWarning> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HdrMode {
+    Auto,
+    Sdr,
+    Hdr10,
+    #[serde(rename = "hdr10plus")]
+    Hdr10Plus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HdrPlan {
+    preserve_hdr: bool,
+    scan_hdr10plus: bool,
+    require_hdr10plus: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HdrPlanInput<'a> {
+    mode: Option<HdrMode>,
+    legacy_hdr: bool,
+    legacy_hdr10plus: bool,
+    is_hdr: bool,
+    transfer: &'a str,
+    source_codec: &'a str,
+    bit_depth: u8,
+    target_codec: &'a str,
+    container: &'a str,
+    compatibility: bool,
+    detected_hdr10plus: bool,
+}
+
+fn hdr_plan(input: HdrPlanInput<'_>) -> Result<HdrPlan, String> {
+    let HdrPlanInput {
+        mode,
+        legacy_hdr,
+        legacy_hdr10plus,
+        is_hdr,
+        transfer,
+        source_codec,
+        bit_depth,
+        target_codec,
+        container,
+        compatibility,
+        detected_hdr10plus,
+    } = input;
+    let mode = match mode {
+        Some(mode) => mode,
+        None => {
+            return Ok(HdrPlan {
+                preserve_hdr: legacy_hdr || legacy_hdr10plus,
+                scan_hdr10plus: legacy_hdr10plus,
+                require_hdr10plus: legacy_hdr10plus && detected_hdr10plus,
+            });
+        }
+    };
+    if mode == HdrMode::Sdr {
+        return Ok(HdrPlan {
+            preserve_hdr: false,
+            scan_hdr10plus: false,
+            require_hdr10plus: false,
+        });
+    }
+    if mode == HdrMode::Hdr10 && (!is_hdr || transfer != "smpte2084" || bit_depth != 10) {
+        return Err(
+            "HDR10 mode requires a 10-bit HDR10/PQ source. Choose Auto for SDR or HLG video."
+                .into(),
+        );
+    }
+    if mode == HdrMode::Hdr10 && (compatibility || !matches!(target_codec, "hevc" | "av1")) {
+        return Err(
+            "HDR10 mode needs a 10-bit HEVC or AV1 encoder without Compatibility mode.".into(),
+        );
+    }
+    if mode == HdrMode::Auto && detected_hdr10plus && (!is_hdr || transfer != "smpte2084") {
+        return Err("HDR10+ metadata was detected, but the source is not tagged as PQ/HDR10. Choose an explicit mode rather than silently discarding dynamic metadata.".into());
+    }
+    let scan_hdr10plus = match mode {
+        HdrMode::Auto => {
+            is_hdr && transfer == "smpte2084" && source_codec == "hevc" && bit_depth == 10
+        }
+        HdrMode::Hdr10Plus => true,
+        _ => false,
+    };
+    // A short FFprobe sample can miss sparse metadata. A requested HDR10+
+    // workflow always scans the complete source before encoding.
+    if (scan_hdr10plus || (mode == HdrMode::Auto && detected_hdr10plus))
+        && (source_codec != "hevc"
+            || bit_depth != 10
+            || target_codec != "hevc"
+            || !matches!(container, "mkv" | "mp4")
+            || compatibility)
+    {
+        return Err("HDR10+ preservation requires a 10-bit HEVC source, HEVC output, and MKV or MP4. Choose SDR or a compatible HEVC workflow; no automatic HDR10+ downgrade was made.".into());
+    }
+    if mode == HdrMode::Hdr10Plus && (!is_hdr || transfer != "smpte2084") {
+        return Err("HDR10+ mode requires a PQ/HDR10 source with dynamic metadata.".into());
+    }
+    Ok(HdrPlan {
+        preserve_hdr: true,
+        scan_hdr10plus,
+        require_hdr10plus: mode == HdrMode::Hdr10Plus
+            || (mode == HdrMode::Auto && detected_hdr10plus),
+    })
+}
+
 /// Typed deserialization target for the frontend's `startBatch` JSON payload.
 ///
 /// Field names use `camelCase` to match the frontend keys.  Each field has a
@@ -924,6 +1030,8 @@ pub struct BatchRequest {
     pub preserve_hdr: bool,
     #[serde(default)]
     pub preserve_hdr10plus: bool,
+    #[serde(default)]
+    pub hdr_mode: Option<HdrMode>,
     #[serde(default)]
     pub compatibility_mode: bool,
     #[serde(default)]
@@ -1005,6 +1113,7 @@ impl BatchRequest {
             hardware_decoding: self.hardware_decoding,
             preserve_hdr: self.preserve_hdr,
             preserve_hdr10plus: self.preserve_hdr10plus,
+            hdr_mode: self.hdr_mode,
             compatibility_mode: self.compatibility_mode,
             preserve_av1: self.preserve_av1,
             force_local: self.force_local,
@@ -1033,6 +1142,7 @@ pub struct BatchSettings {
     pub hardware_decoding: bool,
     pub preserve_hdr: bool,
     pub preserve_hdr10plus: bool,
+    pub hdr_mode: Option<HdrMode>,
     pub compatibility_mode: bool,
     pub preserve_av1: bool,
     pub force_local: bool,
@@ -1076,6 +1186,12 @@ fn metadata_failure(
     reason: &str,
     sink: &dyn EventSink,
 ) -> bool {
+    if sink.cancellation_requested() {
+        if let Some(output) = output {
+            let _ = std::fs::remove_file(output);
+        }
+        return false;
+    }
     if let Some(output) = output {
         // FFmpeg already completed the video encode. A later HDR10+ packaging
         // failure must not throw away that work. Retain it as a recovery file,
@@ -1124,7 +1240,7 @@ fn metadata_failure(
         }
     }
     if !sink.cancellation_requested() {
-        sink.log(&format!("  ERROR: HDR10+ preservation failed: {reason}. Source retained. Disable Preserve HDR10+ metadata for the fast HDR10 path."));
+        sink.log(&format!("  ERROR: HDR10+ preservation could not complete: {reason}. Source retained. Choose HDR10 in HDR Preservation for the faster output without dynamic metadata."));
         queue[idx].status = QueueItemStatus::Failed;
         sink.queue_item_updated(idx, "Failed");
     }
@@ -1514,6 +1630,33 @@ async fn encode_single_file(
     }
     let file_encoder = &resolved.encoder_name;
     let file_codec_family = &resolved.codec_family;
+    let planned_ext =
+        resolve_output_ext(&item_full_path, item_dovi_profile, settings, preserve_hdr);
+    let hdr_plan = match hdr_plan(HdrPlanInput {
+        mode: settings.hdr_mode,
+        legacy_hdr: settings.preserve_hdr,
+        legacy_hdr10plus: settings.preserve_hdr10plus,
+        is_hdr: item_is_hdr,
+        transfer: &source_format.transfer,
+        source_codec: &item_video_codec,
+        bit_depth: source_format.bit_depth,
+        target_codec: file_codec_family,
+        container: planned_ext,
+        compatibility: settings.compatibility_mode,
+        detected_hdr10plus: queue[idx].probe.has_hdr10plus,
+    }) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            sink.log(&format!("  Unsupported HDR mode: {reason}"));
+            queue[idx].status = QueueItemStatus::Failed;
+            sink.queue_item_updated(idx, "Failed");
+            return EncodeFileResult::Failed;
+        }
+    };
+    let preserve_hdr = hdr_plan.preserve_hdr;
+    if settings.hdr_mode == Some(HdrMode::Auto) && item_is_hdr && !hdr_plan.scan_hdr10plus {
+        sink.log("  Auto HDR: retaining source HDR signaling. HDR10+ full-bitstream preservation is unavailable for this source/encoder; choose HDR10 or SDR explicitly if this is not the desired result.");
+    }
     let file_ext =
         resolve_output_ext(&item_full_path, item_dovi_profile, settings, preserve_hdr).to_string();
     let sw_fallback = software_fallback(file_codec_family).to_string();
@@ -1722,7 +1865,7 @@ async fn encode_single_file(
                 "  Dolby Vision is not retained: encoding the verified HDR10-compatible base layer."
             });
         }
-        if queue[idx].probe.has_hdr10plus && !settings.preserve_hdr10plus {
+        if queue[idx].probe.has_hdr10plus && !hdr_plan.scan_hdr10plus {
             sink.log(if tonemap_filter.is_some() {
                 "  HDR10+ dynamic metadata is discarded during the requested SDR conversion. No metadata extraction passes."
             } else {
@@ -1731,7 +1874,7 @@ async fn encode_single_file(
         }
     }
 
-    if settings.preserve_hdr10plus
+    if hdr_plan.scan_hdr10plus
         && queue[idx].probe.has_hdr10plus
         && !crate::hdr10plus_pipeline::preservation_requested(
             true,
@@ -1749,7 +1892,7 @@ async fn encode_single_file(
         return EncodeFileResult::Failed;
     }
     let metadata = if crate::hdr10plus_pipeline::preservation_requested(
-        settings.preserve_hdr10plus,
+        hdr_plan.scan_hdr10plus,
         &item_video_codec,
         source_format.bit_depth,
     ) {
@@ -1763,7 +1906,7 @@ async fn encode_single_file(
         .await
         {
             Ok(result) => {
-                if queue[idx].probe.has_hdr10plus && result.is_none() {
+                if hdr_plan.require_hdr10plus && result.is_none() {
                     metadata_failure(
                         idx,
                         queue,
@@ -1772,6 +1915,11 @@ async fn encode_single_file(
                         sink,
                     );
                     return EncodeFileResult::Failed;
+                }
+                if result.is_some() {
+                    sink.log("  HDR output: HDR10+ dynamic metadata preservation selected.");
+                } else {
+                    sink.log("  HDR output: HDR10 (full source scan found no HDR10+ metadata).");
                 }
                 result
             }
@@ -4413,6 +4561,98 @@ mod tests {
     }
 
     #[test]
+    fn hdr_mode_auto_scans_compatible_hevc_and_rejects_incompatible_hdr10plus() {
+        let source = HdrPlanInput {
+            mode: Some(HdrMode::Auto),
+            legacy_hdr: true,
+            legacy_hdr10plus: false,
+            is_hdr: true,
+            transfer: "smpte2084",
+            source_codec: "hevc",
+            bit_depth: 10,
+            target_codec: "hevc",
+            container: "mkv",
+            compatibility: false,
+            detected_hdr10plus: false,
+        };
+        let plan = hdr_plan(source).unwrap();
+        assert!(plan.preserve_hdr && plan.scan_hdr10plus && !plan.require_hdr10plus);
+        let known = hdr_plan(HdrPlanInput {
+            detected_hdr10plus: true,
+            ..source
+        })
+        .unwrap();
+        assert!(known.require_hdr10plus);
+        let legacy = hdr_plan(HdrPlanInput {
+            mode: None,
+            legacy_hdr10plus: true,
+            detected_hdr10plus: true,
+            ..source
+        })
+        .unwrap();
+        assert!(legacy.require_hdr10plus);
+        let error = hdr_plan(HdrPlanInput {
+            target_codec: "h264",
+            container: "mp4",
+            compatibility: true,
+            detected_hdr10plus: true,
+            ..source
+        })
+        .unwrap_err();
+        assert!(error.contains("no automatic HDR10+ downgrade"));
+        let untagged = hdr_plan(HdrPlanInput {
+            is_hdr: false,
+            transfer: "",
+            detected_hdr10plus: true,
+            ..source
+        })
+        .unwrap_err();
+        assert!(untagged.contains("rather than silently discarding"));
+    }
+
+    #[test]
+    fn hdr_mode_explicit_choices_are_distinct_and_checked() {
+        let source = HdrPlanInput {
+            mode: Some(HdrMode::Hdr10Plus),
+            legacy_hdr: false,
+            legacy_hdr10plus: false,
+            is_hdr: true,
+            transfer: "smpte2084",
+            source_codec: "hevc",
+            bit_depth: 10,
+            target_codec: "hevc",
+            container: "mkv",
+            compatibility: false,
+            detected_hdr10plus: false,
+        };
+        let sdr = hdr_plan(HdrPlanInput {
+            mode: Some(HdrMode::Sdr),
+            target_codec: "h264",
+            container: "mp4",
+            compatibility: true,
+            ..source
+        })
+        .unwrap();
+        assert!(!sdr.preserve_hdr && !sdr.scan_hdr10plus);
+        let hdr10 = hdr_plan(HdrPlanInput {
+            mode: Some(HdrMode::Hdr10),
+            ..source
+        })
+        .unwrap();
+        assert!(hdr10.preserve_hdr && !hdr10.scan_hdr10plus);
+        let plus = hdr_plan(source).unwrap();
+        assert!(plus.require_hdr10plus && plus.scan_hdr10plus);
+        assert!(hdr_plan(HdrPlanInput {
+            mode: Some(HdrMode::Hdr10),
+            is_hdr: false,
+            transfer: "bt709",
+            bit_depth: 8,
+            ..source
+        })
+        .is_err());
+    }
+
+    #[test]
     fn metadata_preparation_failure_does_not_remove_existing_destination() {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("existing.mkv");
@@ -4434,6 +4674,50 @@ mod tests {
             b"previous successful output"
         );
         assert_eq!(queue[0].status, QueueItemStatus::Failed);
+    }
+
+    #[test]
+    fn cancelling_metadata_reinsertion_removes_partial_output_without_recovery_file() {
+        struct CancelSink;
+        impl EventSink for CancelSink {
+            fn cancellation_requested(&self) -> bool {
+                true
+            }
+            fn log(&self, _: &str) {}
+            fn file_progress(&self, _: f64, _: f64, _: f64, _: Option<(u8, u8)>) {}
+            fn batch_progress(&self, _: u32, _: usize) {}
+            fn batch_status(&self, _: &str) {}
+            fn queue_item_updated(&self, _: usize, _: &str) {}
+            fn queue_item_probed(&self, _: usize, _: &QueueItem) {}
+            fn batch_started(&self) {}
+            fn batch_finished(&self, _: u32, _: u32, _: u32, _: &str) {}
+            fn ffmpeg_stderr(&self, _: &str) {}
+            fn batch_command(&self, _: &str) {}
+            fn ffmpeg_download_progress(&self, _: &str) {}
+            fn toast(&self, _: &str) {}
+            fn post_batch(&self, _: &str, _: u32) {}
+        }
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.mkv");
+        let partial = root.path().join("output.mkv");
+        std::fs::write(&source, b"source intact").unwrap();
+        std::fs::write(&partial, b"partial encode").unwrap();
+        let mut queue = vec![crate::test_helpers::make_queue_item(
+            source.to_str().unwrap(),
+            QueueItemStatus::Encoding,
+            crate::test_helpers::synthetic_probe("hevc", 8.0, 60.0, true),
+        )];
+        assert!(!metadata_failure(
+            0,
+            &mut queue,
+            Some(&partial),
+            "cancelled",
+            &CancelSink
+        ));
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source intact");
+        assert_eq!(queue[0].status, QueueItemStatus::Encoding);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]

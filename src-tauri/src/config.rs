@@ -38,6 +38,8 @@ pub struct AppConfig {
     pub precision_mode: bool,
     pub hardware_decoding: bool,
     pub preserve_hdr10plus: bool,
+    /// New single HDR selector. None migrates the legacy checkboxes.
+    pub hdr_mode: Option<crate::encoder::HdrMode>,
     #[serde(default)]
     pub compatibility_mode: bool,
     #[serde(default)]
@@ -77,6 +79,7 @@ impl Default for AppConfig {
             precision_mode: false,
             hardware_decoding: false,
             preserve_hdr10plus: false,
+            hdr_mode: None,
             compatibility_mode: false,
             preserve_av1: false,
             force_local: false,
@@ -184,6 +187,17 @@ mod tests {
         let restored: AppConfig =
             serde_json::from_value(serde_json::to_value(selected).unwrap()).unwrap();
         assert_eq!(restored.preserve_hdr, Some(false));
+    }
+
+    #[test]
+    fn single_hdr_mode_round_trips_without_changing_legacy_fields() {
+        let mut config: AppConfig = serde_json::from_str(r#"{"preserveHdr":false}"#).unwrap();
+        config.hdr_mode = Some(crate::encoder::HdrMode::Auto);
+        let saved = serde_json::to_value(&config).unwrap();
+        assert_eq!(saved["hdrMode"], "auto");
+        assert_eq!(saved["preserveHdr"], false);
+        let restored: AppConfig = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.hdr_mode, Some(crate::encoder::HdrMode::Auto));
     }
 
     #[test]

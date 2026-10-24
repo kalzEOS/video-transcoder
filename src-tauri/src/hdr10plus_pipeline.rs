@@ -346,7 +346,7 @@ fn mp4box_path() -> Result<std::path::PathBuf, String> {
         candidates.extend(std::env::split_paths(&path).map(|p| p.join(name)));
     }
     candidates.into_iter().find(|p| p.is_file())
-        .ok_or_else(|| "HDR10+ preservation needs MP4Box (included in the AppImage). Disable Preserve HDR10+ metadata for fast HDR10 output.".into())
+        .ok_or_else(|| "HDR10+ preservation needs MP4Box (included in the AppImage). Choose HDR10 in HDR Preservation for fast HDR10 output.".into())
 }
 
 fn mp4box_command() -> Result<tokio::process::Command, String> {
@@ -369,7 +369,7 @@ pub async fn prepare(
     // A missing packager should fail immediately, not after an expensive
     // HEVC extraction and HDR10+ metadata scan.
     if codec != "hevc" {
-        return Err("Preserving HDR10+ requires HEVC output. Select HEVC or disable Preserve HDR10+ metadata.".into());
+        return Err("Preserving HDR10+ requires HEVC output. Select HEVC or choose HDR10 in HDR Preservation.".into());
     }
     let child = mp4box_command()?
         .arg("-version")

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Honey, I Shrunk The Vids v2.7.0</title>
+  <title>Honey, I Shrunk The Vids v2.7.1</title>
   <link rel="stylesheet" href="css/app.css" />
 </head>
 <body>
@@ -29,7 +29,7 @@
                 <th class="col-check"><input type="checkbox" id="select-all" title="Select / deselect all"></th>
                 <th>Filename</th>
                 <th>From</th>
-                <th class="has-tooltip">To (est.)<span class="tooltip-icon">?</span><span class="tooltip-text">Estimated output size for the chosen quality. Tilde (~) means the exact size can't be predicted for quality-based encoding.</span></th>
+                <th class="has-tooltip">To (est.)<span class="tooltip-icon">?</span><span class="tooltip-text">For VBR, “@ target” shows the size if the video averages the requested bitrate, plus known copied audio. Hardware encoders may use much less bitrate, so the actual movie can be substantially smaller. Other quality-based sizes are approximate.</span></th>
                 <th>Resolution</th>
                 <th>HDR</th>
                 <th>From B/R</th>
@@ -173,18 +173,17 @@
 
             <div class="section-header">Behaviour</div>
 
-            <div class="checkbox-row has-tooltip">
-              <input type="checkbox" id="chk-hdr" checked />
-              <label for="chk-hdr">Preserve HDR (HDR10)</label>
-              <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">On: keep HDR10 color, source bit depth and supported static metadata. Off: convert HDR and HLG sources to 8-bit SDR BT.709 with tone mapping; SDR sources keep their bit depth. Dolby Vision and HDR10+ dynamic metadata are not retained in SDR. Compatible Dolby Vision Profile 8.1 can use its HDR10 base layer; unsafe fallback remains blocked.</span>
-            </div>
-
-            <div class="checkbox-row has-tooltip">
-              <input type="checkbox" id="chk-preserve-hdr10plus" />
-              <label for="chk-preserve-hdr10plus">Preserve HDR10+ (includes HDR10; slower)</label>
-              <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">Keeps the HDR10 base and original HDR10+ dynamic metadata. Adds full-video extraction, alignment, reinsertion and verification, using temporary disk space. Supports 10-bit HEVC with constant frame timing. Selecting this turns off the separate Preserve HDR choice; only one HDR mode is selected at a time. Dolby Vision is not restored. Failure retains the source.</span>
+            <div class="form-row hdr-mode-row">
+              <div class="hdr-mode-heading">
+                <label for="sel-hdr-mode">HDR Preservation</label>
+                <button type="button" class="hdr-help-button" id="btn-hdr-help" aria-label="About HDR preservation" title="Explain HDR modes">?</button>
+              </div>
+              <select id="sel-hdr-mode" aria-describedby="hdr-mode-note">
+                <option value="auto">Auto</option>
+                <option value="sdr">SDR</option>
+                <option value="hdr10">HDR10</option>
+                <option value="hdr10plus">HDR10+</option>
+              </select>
             </div>
             <div class="hdr-mode-note" id="hdr-mode-note" aria-live="polite"></div>
 
@@ -392,6 +391,33 @@
         <div class="modal-buttons">
           <button class="btn btn-primary" id="fb-yes">Yes</button>
           <button class="btn" id="fb-no">No</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ Modal: HDR preservation help ═══ -->
+    <div class="modal-overlay" id="modal-hdr-help" role="dialog" aria-modal="true" aria-labelledby="modal-hdr-help-title">
+      <div class="modal-box">
+        <div class="modal-title" id="modal-hdr-help-title">HDR Preservation</div>
+        <div class="modal-body hdr-help-body">
+          <p><strong>Auto:</strong> Keep the source format. Compatible 10-bit HEVC HDR video is scanned for HDR10+ metadata before encoding.</p>
+          <p><strong>SDR:</strong> Tone-map HDR or HLG to 8-bit BT.709. SDR sources keep their original bit depth.</p>
+          <p><strong>HDR10:</strong> Keep 10-bit HDR color and supported static metadata. No dynamic-metadata processing is added.</p>
+          <p><strong>HDR10+:</strong> Also preserve and verify dynamic metadata. This takes longer and needs 10-bit HEVC with constant frame timing.</p>
+          <p>Dolby Vision dynamic metadata is not restored when re-encoding. A verified HDR10-compatible base layer can remain.</p>
+        </div>
+        <div class="modal-buttons"><button class="btn btn-primary" id="hdr-help-close">Close</button></div>
+      </div>
+    </div>
+
+    <!-- ═══ Modal: Close during conversion ═══ -->
+    <div class="modal-overlay" id="modal-close-encoding" role="dialog" aria-modal="true" aria-labelledby="modal-close-encoding-title">
+      <div class="modal-box">
+        <div class="modal-title" id="modal-close-encoding-title">Conversion in progress</div>
+        <div class="modal-body" id="close-encoding-body">Closing now will cancel the conversion and remove the partial output. Source files will remain untouched.</div>
+        <div class="modal-buttons">
+          <button class="btn" id="close-encoding-cancel">Keep Encoding</button>
+          <button class="btn btn-primary" id="close-encoding-anyway">Close Anyway</button>
         </div>
       </div>
     </div>

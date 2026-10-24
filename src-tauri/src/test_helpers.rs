@@ -242,6 +242,7 @@ pub fn default_settings() -> BatchSettings {
         hardware_decoding: false,
         preserve_hdr: true,
         preserve_hdr10plus: false,
+        hdr_mode: None,
         compatibility_mode: false,
         preserve_av1: false,
         force_local: false,

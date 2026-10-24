@@ -23,6 +23,7 @@
     let themes = [];                   // Theme[]
     let selectedRows = new Set();      // indices of selected rows
     let batchRunning = false;
+    let batchStarting = false;
     let encoderDetectionDone = false;
     let saveDebounce = null;
     let queueRefreshDebounce = null;   // coalesces rapid queue fetch+render cycles
@@ -48,10 +49,9 @@
     const rowCrf          = $('#row-crf');
     const rowRcMode       = $('#row-rc-mode');
     const rcToggle        = $('#rc-toggle');
-    const chkHdr          = $('#chk-hdr');
+    const selHdrMode      = $('#sel-hdr-mode');
     const chkPrecision    = $('#chk-precision');
     const chkHardwareDecoding = $('#chk-hardware-decoding');
-    const chkPreserveHdr10Plus = $('#chk-preserve-hdr10plus');
     const hdrModeNote = $('#hdr-mode-note');
     const numThreads      = $('#num-threads');
     const chkLowPriority  = $('#chk-low-priority');
@@ -131,6 +131,7 @@
       setupModalButtons();
       setupBottomButtons();
       listenTauriEvents();
+      setupCloseProtection();
 
       // In case encoder detection completed before listeners were ready
       const alreadyDone = await invoke('get_encoder_detection_status');
@@ -186,20 +187,18 @@
         numQpI.value = cfg.qpI ?? 20;
         numQpP.value = cfg.qpP ?? 22;
         numCrf.value = cfg.crf ?? 20;
-        // Older builds ignored cfg.hdr and always preserved HDR. Keep that
-        // behavior until the user explicitly chooses an HDR mode here.
-        chkHdr.checked = cfg.preserveHdr ?? !cfg.preserveHdr10plus;
+        // Preserve the user's previous explicit choice when migrating the
+        // two-checkbox configuration. New installations default to Auto.
+        selHdrMode.value = cfg.hdrMode || (cfg.preserveHdr10plus ? 'hdr10plus'
+          : cfg.preserveHdr === false ? 'sdr' : cfg.preserveHdr === true ? 'hdr10' : 'auto');
         chkPrecision.checked = cfg.precisionMode || false;
         chkHardwareDecoding.checked = cfg.hardwareDecoding || false;
-        chkPreserveHdr10Plus.checked = cfg.preserveHdr10plus || false;
-        if (chkPreserveHdr10Plus.checked) chkHdr.checked = false;
 		chkPreserveAv1.checked = cfg.preserveAv1 || false;
         chkCompat.checked = cfg.compatibilityMode || false;
         // Enforce mutual exclusion on load (compat wins if both are saved)
         if (chkCompat.checked) {
           chkPreserveAv1.checked = false;
-          chkHdr.checked = false;
-          chkPreserveHdr10Plus.checked = false;
+          selHdrMode.value = 'sdr';
         }
         updateHdrModeNote();
         numThreads.value = cfg.threads ?? 0;
@@ -256,11 +255,12 @@
               qpP: parseInt(numQpP.value, 10) || 22,
               crf: parseInt(numCrf.value, 10) || 20,
               rateControlMode: getCurrentRcMode(),
-              hdr: chkHdr.checked,
-              preserveHdr: chkHdr.checked,
+              hdrMode: selHdrMode.value,
+              hdr: selHdrMode.value !== 'sdr',
+              preserveHdr: selHdrMode.value !== 'sdr',
               precisionMode: chkPrecision.checked,
               hardwareDecoding: chkHardwareDecoding.checked,
-              preserveHdr10plus: chkPreserveHdr10Plus.checked,
+              preserveHdr10plus: selHdrMode.value === 'hdr10plus',
 			  compatibilityMode: chkCompat.checked,
               preserveAv1: chkPreserveAv1.checked,
               threads: parseInt(numThreads.value, 10) || 0,
@@ -275,11 +275,26 @@
     }
 
     function updateHdrModeNote() {
-      hdrModeNote.textContent = chkPreserveHdr10Plus.checked
-        ? 'HDR10+ mode: preserve HDR10 and dynamic metadata.'
-        : chkHdr.checked
-          ? 'HDR10 mode: preserve HDR and source bit depth.'
-          : 'SDR mode: tone-map HDR and HLG to 8-bit BT.709.';
+      const candidates = queueData.filter(item => item.videoCodec && ['pending', 'probing'].includes((item.status || 'pending').toLowerCase()));
+      const availability = hdrModeAvailability(queueData, chkCompat.checked);
+      const plusOption = selHdrMode.querySelector('[value="hdr10plus"]');
+      const hdrOption = selHdrMode.querySelector('[value="hdr10"]');
+      plusOption.disabled = Boolean(availability.hdr10plusReason);
+      hdrOption.disabled = Boolean(availability.hdr10Reason);
+      plusOption.title = availability.hdr10plusReason;
+      hdrOption.title = availability.hdr10Reason;
+      const notes = {
+        auto: 'Auto: keep the best supported source HDR format.',
+        sdr: 'SDR: tone-map HDR and HLG to BT.709.',
+        hdr10: 'HDR10: preserve static HDR without extra metadata passes.',
+        hdr10plus: 'HDR10+: preserve dynamic metadata with extra processing.'
+      };
+      hdrModeNote.textContent = notes[selHdrMode.value] || notes.auto;
+      if (selHdrMode.value === 'hdr10plus' && candidates.some(item => !item.hasHdr10plus)) {
+        hdrModeNote.textContent += ' A full scan will confirm metadata missing from the preview.';
+      }
+      if (selHdrMode.value === 'hdr10' && hdrOption.disabled) hdrModeNote.textContent += ` ${availability.hdr10Reason}`;
+      if (selHdrMode.value === 'hdr10plus' && plusOption.disabled) hdrModeNote.textContent += ` ${availability.hdr10plusReason}`;
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -611,6 +626,7 @@
     // Falls back to a full rebuild when the row count changes.
     function renderQueue() {
       const existingRows = queueBody.children;
+      updateHdrModeNote();
 
       // Full rebuild needed if row count changed
       if (existingRows.length !== queueData.length) {
@@ -934,7 +950,8 @@
         crf: parseInt(numCrf.value, 10) || 20,
         rcMode: getCurrentRcMode(),
         targetCodecFamily: chkCompat.checked ? 'h264' : 'hevc',
-        toneMapHdr: !chkHdr.checked && !chkPreserveHdr10Plus.checked,
+        compatibilityMode: chkCompat.checked,
+        toneMapHdr: selHdrMode.value === 'sdr',
       };
     }
 	
@@ -994,8 +1011,8 @@
     }
 
 // ── Estimated output size (§2.4.0 Phase 1) ──
-    // Returns { bytes: number, approx: boolean } or null if not estimable.
-    // approx=true means CQP/CRF: prefix display with "~".
+    // VBR's target is a bitrate budget, not an achieved average. Include
+    // copied audio, and never present the budget as an exact output size.
     function computeEstimatedSize(item, settings) {
       if (!item.sourceBytes || item.sourceBytes <= 0) return null;
 
@@ -1014,8 +1031,16 @@
 
       if (mbps > settings.target * 1.15 || (mbps > settings.target && !isSameCodec)) {
         // VBR decision
-        const estimatedBytes = (settings.target * 1000000 * item.durationSecs) / 8;
-        return { bytes: Math.round(estimatedBytes), approx: false };
+        const audioBps = (item.audioStreams || []).reduce((sum, stream) => {
+          const sourceKbps = Number(stream.bitrateKbps) || 0;
+          const outputKbps = settings.compatibilityMode &&
+            !(stream.codec === 'aac' && sourceKbps <= 640)
+            ? (sourceKbps ? Math.min(sourceKbps, 640) : 640)
+            : sourceKbps;
+          return sum + outputKbps * 1000;
+        }, 0);
+        const budgetBytes = ((settings.target * 1000000 + audioBps) * item.durationSecs) / 8;
+        return { bytes: Math.round(budgetBytes), approx: true, atTarget: true };
       } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
         // CQP/CRF for non-copyable codecs
         return { bytes: item.sourceBytes, approx: true };
@@ -1032,7 +1057,7 @@
       const est = computeEstimatedSize(item, settings);
       if (!est) return '-';
       const formatted = formatBytes(est.bytes);
-      return est.approx ? '~' + formatted : formatted;
+      return est.atTarget ? `${formatted} @ target` : est.approx ? '~' + formatted : formatted;
     }
 
     // ── Update all target bitrate labels (#11: uses .children not querySelectorAll) ──
@@ -1490,6 +1515,8 @@
           chkCompat.checked = false;
         }
         updateEncoderSummary();
+        updateHdrModeNote();
+        updateBatchButtons();
         updateRcModeVisibility();
         scheduleRefreshTargetBitrates();
         scheduleConfigSave();
@@ -1498,10 +1525,10 @@
       chkCompat.addEventListener('change', () => {
         if (chkCompat.checked) {
           chkPreserveAv1.checked = false;
-          chkHdr.checked = false;
-          chkPreserveHdr10Plus.checked = false;
+          selHdrMode.value = 'sdr';
         }
         updateHdrModeNote();
+        updateBatchButtons();
         updateEncoderSummary();
         updateRcModeVisibility();
         scheduleRefreshTargetBitrates();
@@ -1536,21 +1563,11 @@
         scheduleConfigSave();
       });
 
-      chkHdr.addEventListener('change', () => {
-        if (chkHdr.checked) {
-          chkPreserveHdr10Plus.checked = false;
-          chkCompat.checked = false;
-        }
+      selHdrMode.addEventListener('change', () => {
+        if (selHdrMode.value !== 'sdr') chkCompat.checked = false;
         updateHdrModeNote();
-        scheduleRefreshTargetBitrates();
-        scheduleConfigSave();
-      });
-      chkPreserveHdr10Plus.addEventListener('change', () => {
-        if (chkPreserveHdr10Plus.checked) {
-          chkHdr.checked = false;
-          chkCompat.checked = false;
-        }
-        updateHdrModeNote();
+        updateBatchButtons();
+        updateEncoderSummary();
         scheduleRefreshTargetBitrates();
         scheduleConfigSave();
       });
@@ -1712,12 +1729,11 @@
         numQpI.value = p.qpI;
         numQpP.value = p.qpP;
         setPeakMultiplier(p.peak);
-        const hdrMode = profileHdrSelection(chkHdr.checked, chkPreserveHdr10Plus.checked, p.compat);
         chkCompat.checked = p.compat;
         chkPreserveAv1.checked = p.av1;
-        chkHdr.checked = hdrMode.preserveHdr;
-        chkPreserveHdr10Plus.checked = hdrMode.preserveHdr10plus;
+        selHdrMode.value = profileHdrSelection(selHdrMode.value, p.compat);
         updateHdrModeNote();
+        updateBatchButtons();
         chkPrecision.checked = false;
         applying = false;
         updateRcModeVisibility();
@@ -1743,7 +1759,7 @@
       for (const el of [numBitrate, numQpI, numQpP, numCrf, numThreads]) {
         if (el) el.addEventListener('input', markCustom);
       }
-      for (const el of [chkHdr, chkPreserveHdr10Plus, chkPreserveAv1, chkCompat, chkPrecision]) {
+      for (const el of [selHdrMode, chkPreserveAv1, chkCompat, chkPrecision]) {
         if (el) el.addEventListener('change', markCustom);
       }
       for (const btn of rcToggle.querySelectorAll('button')) btn.addEventListener('click', markCustom);
@@ -2275,7 +2291,9 @@
         if (counts.hasOwnProperty(s)) counts[s]++;
       }
 
-      btnStart.disabled = !encoderDetectionDone || batchRunning || !hasPending;
+      const selectedOption = selHdrMode.selectedOptions[0];
+      const hdrIssue = selectedOption?.disabled ? selectedOption.title : '';
+      btnStart.disabled = !encoderDetectionDone || batchRunning || batchStarting || !hasPending || Boolean(hdrIssue);
       btnCancelCur.disabled = !batchRunning;
       btnCancelAll.disabled = !batchRunning;
       btnPause.disabled = !batchRunning;
@@ -2286,8 +2304,12 @@
           startTooltip.textContent = 'Waiting for encoder detection…';
         } else if (batchRunning) {
           startTooltip.textContent = 'Batch already running';
+        } else if (batchStarting) {
+          startTooltip.textContent = 'Starting batch…';
         } else if (!hasPending) {
           startTooltip.textContent = 'No pending items in the queue';
+        } else if (hdrIssue) {
+          startTooltip.textContent = hdrIssue;
         } else {
           startTooltip.textContent = '';
         }
@@ -2361,6 +2383,8 @@
     }
 
     async function doStartBatch() {
+      batchStarting = true;
+      updateBatchButtons();
       try {
         await invoke('start_batch', {
           settings: {
@@ -2373,11 +2397,12 @@
             qpP: parseInt(numQpP.value, 10) || 22,
             crf: parseInt(numCrf.value, 10) || 20,
             rateControlMode: getCurrentRcMode(),
-            pixFmt: chkHdr.checked || chkPreserveHdr10Plus.checked ? 'p010le' : 'yuv420p',
-            preserveHdr: chkHdr.checked,
+            pixFmt: selHdrMode.value === 'sdr' ? 'yuv420p' : 'p010le',
+            hdrMode: selHdrMode.value,
+            preserveHdr: selHdrMode.value !== 'sdr',
             precisionMode: chkPrecision.checked,
               hardwareDecoding: chkHardwareDecoding.checked,
-              preserveHdr10plus: chkPreserveHdr10Plus.checked,
+              preserveHdr10plus: selHdrMode.value === 'hdr10plus',
             compatibilityMode: chkCompat.checked,
             preserveAv1: chkPreserveAv1.checked,
             threads: parseInt(numThreads.value, 10) || 0,
@@ -2395,6 +2420,9 @@
         const errMsg = typeof e === 'string' ? e : (e.message || JSON.stringify(e));
         appendLog('ERROR: ' + errMsg);
         jobStatus.textContent = 'Error: ' + errMsg;
+      } finally {
+        batchStarting = false;
+        updateBatchButtons();
       }
     }
 
@@ -2456,6 +2484,16 @@
     //  MODAL DIALOGS
     // ═══════════════════════════════════════════════════════════════
     function setupModalButtons() {
+      const hdrHelpModal = $('#modal-hdr-help');
+      $('#btn-hdr-help').addEventListener('click', () => {
+        hdrHelpModal.classList.add('visible');
+        trapFocusInModal(hdrHelpModal);
+      });
+      $('#hdr-help-close').addEventListener('click', () => {
+        releaseFocusTrap(hdrHelpModal);
+        hdrHelpModal.classList.remove('visible');
+      });
+
       // Overwrite prompt (§7.3)
       $('#ow-yes').addEventListener('click', () => {
         invoke('respond_overwrite', { response: 'yes' });
@@ -2688,13 +2726,66 @@
     //  TAURI EVENT LISTENERS
     // ═══════════════════════════════════════════════════════════════
 
-    // Window close protection during batch (§16.4)
-    window.addEventListener('beforeunload', (e) => {
-      if (batchRunning) {
-        e.preventDefault();
-        e.returnValue = '';
+    // Tauri close requests can be cancelled synchronously so we can show a
+    // normal in-app dialog, then wait for the backend's cancellation cleanup.
+    function setupCloseProtection() {
+      const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+      if (!appWindow?.onCloseRequested) {
+        window.addEventListener('beforeunload', (event) => {
+          if (batchRunning || batchStarting) { event.preventDefault(); event.returnValue = ''; }
+        });
+        return;
       }
-    });
+      let closing = false;
+      const modal = $('#modal-close-encoding');
+      const hide = () => { releaseFocusTrap(modal); modal.classList.remove('visible'); };
+      $('#close-encoding-cancel').addEventListener('click', hide);
+      $('#close-encoding-anyway').addEventListener('click', async () => {
+        if (closing) return;
+        closing = true;
+        batchWasCancelled = true;
+        $('#close-encoding-body').textContent = 'Cancelling and cleaning up partial output before closing…';
+        $('#close-encoding-anyway').disabled = true;
+        try {
+          // A start request may still be setting up the backend batch state.
+          // Wait for it so cancel_all cannot be reset by start_batch afterward.
+          while (batchStarting) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+          await invoke('cancel_all');
+          // A pending prompt can otherwise hold the encode task open.
+          await Promise.allSettled([
+            invoke('respond_overwrite', { response: 'cancel' }),
+            invoke('respond_fallback', { response: 'no' })
+          ]);
+          while (await invoke('is_batch_running')) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+          }
+          await appWindow.destroy();
+        } catch (error) {
+          closing = false;
+          $('#close-encoding-anyway').disabled = false;
+          $('#close-encoding-body').textContent = `Could not safely finish cancellation: ${error}`;
+        }
+      });
+      appWindow.onCloseRequested(event => {
+        if (!batchRunning && !batchStarting) {
+          // Tauri closes the window after this callback returns. That path
+          // uses the destroy permission even for an ordinary titlebar X.
+          return;
+        }
+        event.preventDefault();
+        if (!modal.classList.contains('visible')) {
+          modal.classList.add('visible');
+          trapFocusInModal(modal);
+        }
+      }).catch(error => {
+        console.warn('Close warning unavailable:', error);
+        window.addEventListener('beforeunload', event => {
+          if (batchRunning || batchStarting) { event.preventDefault(); event.returnValue = ''; }
+        });
+      });
+    }
 
     function listenTauriEvents() {
       // Encoder detection complete

@@ -31,6 +31,7 @@ fn base_settings() -> BatchSettings {
         hardware_decoding: false,
         preserve_hdr: true,
         preserve_hdr10plus: false,
+        hdr_mode: None,
         output_folder: String::new(),
         output_mode: String::new(),
         threshold: 4.0,
