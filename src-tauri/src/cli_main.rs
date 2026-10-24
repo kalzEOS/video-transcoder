@@ -53,12 +53,6 @@ fn main() {
         }
     }
 
-    if args.no_hdr {
-        eprintln!(
-            "ERROR: --no-hdr conflicts with source preservation. HDR-to-SDR conversion is blocked."
-        );
-        std::process::exit(4);
-    }
     // Create the CLI event sink (Arc-wrapped for sharing across probe tasks)
     let sink = Arc::new(cli_sink::CliSink::new(args.log_level.clone()));
 
@@ -381,6 +375,7 @@ fn compute_decisions(
                     preserve_av1: args.preserve_av1,
                     precision_mode: args.precision_mode,
                     hardware_decoding: args.hardware_decoding,
+                    preserve_hdr: !args.no_hdr,
                     preserve_hdr10plus: args.preserve_hdr10plus,
                     output_folder: String::new(),
                     output_mode: String::new(),
@@ -862,6 +857,7 @@ fn run_batch(
         low_priority: args.low_priority,
         precision_mode: args.precision_mode,
         hardware_decoding: args.hardware_decoding,
+        preserve_hdr: !args.no_hdr,
         preserve_hdr10plus: args.preserve_hdr10plus,
         compatibility_mode: args.compat,
         preserve_av1: args.preserve_av1,

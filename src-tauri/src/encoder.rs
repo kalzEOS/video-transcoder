@@ -68,9 +68,12 @@ const AUDIO_ENCODERS: &[&str] = &["ac3", "eac3", "aac"];
 
 /// Fixed tonemap filter chain for HDR→SDR conversion (#1).
 /// Defined as a static str to avoid per-file heap allocation.
-#[cfg(test)]
-const TONEMAP_HABLE: &str =
-    "zscale=t=linear,tonemap=hable:desat=0,zscale=t=bt709:p=bt709:m=bt709:r=tv,format=yuv420p";
+const TONEMAP_HABLE: &str = concat!(
+    "zscale=t=linear,tonemap=hable:desat=0,zscale=t=bt709:p=bt709:m=bt709:r=tv,format=yuv420p",
+    ",sidedata=mode=delete:type=MASTERING_DISPLAY_METADATA",
+    ",sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL",
+    ",sidedata=mode=delete:type=DYNAMIC_HDR_PLUS"
+);
 
 /// Files within this fraction above the threshold that are already in the
 /// target codec are stream-copied rather than re-encoded. Avoids wasting
@@ -893,6 +896,8 @@ pub struct BatchRequest {
     pub precision_mode: bool,
     #[serde(default)]
     pub hardware_decoding: bool,
+    #[serde(default = "batch_req_default_preserve_hdr")]
+    pub preserve_hdr: bool,
     #[serde(default)]
     pub preserve_hdr10plus: bool,
     #[serde(default)]
@@ -936,6 +941,9 @@ fn batch_req_default_rate_control_mode() -> String {
 fn batch_req_default_pix_fmt() -> String {
     "yuv420p".to_string()
 }
+fn batch_req_default_preserve_hdr() -> bool {
+    true
+}
 fn batch_req_default_peak_multiplier() -> f64 {
     1.5
 }
@@ -971,6 +979,7 @@ impl BatchRequest {
             low_priority: self.low_priority,
             precision_mode: self.precision_mode,
             hardware_decoding: self.hardware_decoding,
+            preserve_hdr: self.preserve_hdr,
             preserve_hdr10plus: self.preserve_hdr10plus,
             compatibility_mode: self.compatibility_mode,
             preserve_av1: self.preserve_av1,
@@ -998,6 +1007,7 @@ pub struct BatchSettings {
     pub low_priority: bool,
     pub precision_mode: bool,
     pub hardware_decoding: bool,
+    pub preserve_hdr: bool,
     pub preserve_hdr10plus: bool,
     pub compatibility_mode: bool,
     pub preserve_av1: bool,
@@ -1115,6 +1125,7 @@ async fn handle_post_encode(
     item_full_path: &str,
     is_image_source: bool,
     is_replace_mode: bool,
+    tone_mapped: bool,
     item_duration_secs: f64,
     final_frame_count: Option<u64>,
     metadata: &Option<crate::hdr10plus_pipeline::ExtractedHdr10Plus>,
@@ -1161,7 +1172,12 @@ async fn handle_post_encode(
         let audio_overhead = item_duration_secs * 500.0 * num_audio;
         let deadband = ((video_overhead + audio_overhead + 10_240.0) * 1.2) as u64;
 
-        if dst_size > src_size + deadband && src_size > 0 && !is_image_source && !is_copy {
+        if dst_size > src_size + deadband
+            && src_size > 0
+            && !is_image_source
+            && !is_copy
+            && !tone_mapped
+        {
             sink.log(&format!(
                 "  WARNING: Output ({:.1}MB) larger than source ({:.1}MB) - remuxing source instead",
                 dst_size as f64 / 1_000_000.0, src_size as f64 / 1_000_000.0,
@@ -1319,7 +1335,6 @@ async fn handle_post_encode(
         }
 
         if !is_image_source {
-            let tone_mapped = false;
             let validation =
                 validate_encoded_output(&queue[idx].probe, output_str, tone_mapped, sink).await;
             if let Err(reason) = validation {
@@ -1481,12 +1496,21 @@ async fn encode_single_file(
     let is_sw = file_encoder.starts_with("lib");
     let target_codec = file_codec_family.as_str();
 
-    // Preserve source precision independently of the legacy HDR checkbox.
-    let tonemap_filter: Option<&'static str> = None;
-    let file_pix_fmt = match source_format.bit_depth {
-        10 => "p010le",
-        12 => "yuv420p12le",
-        _ => "yuv420p",
+    // SDR sources keep their precision. An explicit HDR opt-out converts HDR
+    // to 8-bit BT.709; HDR10+ selection includes its required HDR10 base.
+    let tonemap_filter = if item_is_hdr && !preserve_hdr {
+        Some(TONEMAP_HABLE)
+    } else {
+        None
+    };
+    let file_pix_fmt = if tonemap_filter.is_some() {
+        "yuv420p"
+    } else {
+        match source_format.bit_depth {
+            10 => "p010le",
+            12 => "yuv420p12le",
+            _ => "yuv420p",
+        }
     };
 
     let software_pixel_format = source_format
@@ -1665,7 +1689,7 @@ async fn encode_single_file(
     if !matches!(decision, EncodeDecision::Copy) && !is_image_source {
         let invalid = source_format.preservation_error(
             target_codec,
-            settings.compatibility_mode,
+            settings.compatibility_mode && tonemap_filter.is_none(),
             item_is_hdr,
             item_dovi_profile,
             queue[idx].probe.dovi_bl_compat_id,
@@ -1680,10 +1704,18 @@ async fn encode_single_file(
 
     if !matches!(decision, EncodeDecision::Copy) {
         if item_dovi_profile.is_some() {
-            sink.log("  Dolby Vision is not retained: encoding the verified HDR10-compatible base layer.");
+            sink.log(if tonemap_filter.is_some() {
+                "  Dolby Vision is not retained: converting the verified HDR10-compatible base layer to SDR."
+            } else {
+                "  Dolby Vision is not retained: encoding the verified HDR10-compatible base layer."
+            });
         }
         if queue[idx].probe.has_hdr10plus && !settings.preserve_hdr10plus {
-            sink.log("  HDR10+ dynamic metadata is intentionally discarded; standard HDR10 is preserved. No metadata extraction passes.");
+            sink.log(if tonemap_filter.is_some() {
+                "  HDR10+ dynamic metadata is discarded during the requested SDR conversion. No metadata extraction passes."
+            } else {
+                "  HDR10+ dynamic metadata is intentionally discarded; standard HDR10 is preserved. No metadata extraction passes."
+            });
         }
     }
 
@@ -2052,7 +2084,7 @@ async fn encode_single_file(
             render_device: encoder_render_device(detected_encoders, file_encoder),
             hardware_decode: false,
             source_format: Some(source_format),
-            pix_fmt: if file_encoder.starts_with("lib") {
+            pix_fmt: if file_encoder.starts_with("lib") && tonemap_filter.is_none() {
                 &software_pixel_format
             } else {
                 file_pix_fmt
@@ -2422,6 +2454,7 @@ async fn encode_single_file(
         &item_full_path,
         is_image_source,
         is_replace_mode,
+        tonemap_filter.is_some(),
         item_duration_secs,
         final_frame_count,
         &metadata,
@@ -2468,7 +2501,7 @@ pub async fn run_encode_loop(
     let crf_str = settings.crf_val.to_string();
 
     // ── Pre-loop invariant computation (#2, #3, #4) ──
-    let preserve_hdr = true;
+    let preserve_hdr = settings.preserve_hdr || settings.preserve_hdr10plus;
     let cached_ram_gb = get_system_ram_gb();
 
     // Collect pending indices
@@ -3005,7 +3038,11 @@ async fn validate_encoded_output(
     sink: &dyn EventSink,
 ) -> Result<(), String> {
     let output = crate::probe::probe_file_for_validation(path, sink).await?;
-    if !tone_mapped && source.is_hdr != output.is_hdr {
+    if tone_mapped {
+        if output.is_hdr {
+            return Err("HDR-to-SDR conversion still advertises HDR; output rejected".into());
+        }
+    } else if source.is_hdr != output.is_hdr {
         return Err("HDR/SDR classification changed; conversion rejected".into());
     }
     let tolerance = (2.0 / source.video_fps.max(1.0)).max(0.1);
@@ -4344,11 +4381,23 @@ mod tests {
     #[test]
     fn batch_request_hdr10plus_defaults_off_and_keeps_explicit_selection() {
         let request: BatchRequest = serde_json::from_str("{}").unwrap();
-        assert!(!request.into_batch_settings().preserve_hdr10plus);
+        let settings = request.into_batch_settings();
+        assert!(settings.preserve_hdr); // Old GUI requests keep the prior HDR behavior.
+        assert!(!settings.preserve_hdr10plus);
         let request: BatchRequest = serde_json::from_str(r#"{"preserveHdr10plus":true}"#).unwrap();
         let settings = request.into_batch_settings();
         assert!(settings.preserve_hdr10plus);
         assert!(!settings.hardware_decoding);
+        let sdr: BatchRequest = serde_json::from_str(r#"{"preserveHdr":false}"#).unwrap();
+        let settings = sdr.into_batch_settings();
+        assert!(!settings.preserve_hdr);
+        assert!(!settings.preserve_hdr10plus);
+        let dynamic: BatchRequest =
+            serde_json::from_str(r#"{"preserveHdr":false,"preserveHdr10plus":true}"#).unwrap();
+        let settings = dynamic.into_batch_settings();
+        assert!(!settings.preserve_hdr);
+        assert!(settings.preserve_hdr10plus);
+        assert!(settings.preserve_hdr || settings.preserve_hdr10plus);
     }
 
     #[test]

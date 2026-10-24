@@ -174,24 +174,25 @@
             <div class="section-header">Behaviour</div>
 
             <div class="checkbox-row has-tooltip">
-              <input type="checkbox" id="chk-hdr" checked disabled />
-              <label for="chk-hdr">Preserve HDR10 and source bit depth</label>
+              <input type="checkbox" id="chk-hdr" checked />
+              <label for="chk-hdr">Preserve HDR (HDR10)</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">8-bit stays 8-bit; 10-bit stays 10-bit. HDR10 color and supported static metadata are verified. Re-encoding discards Dolby Vision. HDR10+ dynamic metadata is discarded unless the optional preservation checkbox is enabled. Compatible Dolby Vision Profile 8.1 uses its HDR10 base layer; unsafe fallback is blocked. SDR and HLG remain SDR and HLG.</span>
+              <span class="tooltip-text">On: keep HDR10 color, source bit depth and supported static metadata. Off: convert HDR and HLG sources to 8-bit SDR BT.709 with tone mapping; SDR sources keep their bit depth. Dolby Vision and HDR10+ dynamic metadata are not retained in SDR. Compatible Dolby Vision Profile 8.1 can use its HDR10 base layer; unsafe fallback remains blocked.</span>
             </div>
 
             <div class="checkbox-row has-tooltip">
               <input type="checkbox" id="chk-preserve-hdr10plus" />
-              <label for="chk-preserve-hdr10plus">Preserve HDR10+ metadata (slower)</label>
+              <label for="chk-preserve-hdr10plus">Preserve HDR10+ (includes HDR10; slower)</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">Optional; off by default for the fast HDR10 path. On adds full-video extraction, metadata alignment, reinsertion and verification, using temporary disk space. Supports 10-bit HEVC with constant frame timing and preserves your selected container. Failure stops the file and retains the source. Dolby Vision is not restored. GPU decoding and encoding settings remain independent.</span>
+              <span class="tooltip-text">Keeps the HDR10 base and original HDR10+ dynamic metadata. Adds full-video extraction, alignment, reinsertion and verification, using temporary disk space. Supports 10-bit HEVC with constant frame timing. Selecting this turns off the separate Preserve HDR choice; only one HDR mode is selected at a time. Dolby Vision is not restored. Failure retains the source.</span>
             </div>
+            <div class="hdr-mode-note" id="hdr-mode-note" aria-live="polite"></div>
 
             <div class="checkbox-row has-tooltip">
               <input type="checkbox" id="chk-hardware-decoding" />
               <label for="chk-hardware-decoding">Hardware Decoding (GPU)</label>
               <span class="tooltip-icon">?</span>
-              <span class="tooltip-text">Enable to try GPU decoding and encoding on the same verified device. Unsupported formats or failed GPU decoding automatically use CPU decoding while keeping the GPU encoder when compatible. Source bit depth and HDR10 colors are preserved.</span>
+              <span class="tooltip-text">Enable to try GPU decoding and encoding on the same verified device. Unsupported formats or failed GPU decoding automatically use CPU decoding while keeping the GPU encoder when compatible. HDR output follows the selected HDR mode.</span>
             </div>
 
             <div class="checkbox-row has-tooltip">

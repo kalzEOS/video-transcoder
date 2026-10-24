@@ -29,8 +29,8 @@ pub fn pixel_depth(format: &str) -> u8 {
 }
 
 impl VideoFormat {
-    /// Preservation is automatic; legacy HDR/compatibility settings must not
-    /// silently request tone mapping, bit-depth reduction or unsupported codecs.
+    /// Reject unsupported preservation paths. Deliberate HDR-to-SDR conversion
+    /// is selected by the caller and verified separately.
     pub fn hdr10_fallback_error(&self, dv: Option<u8>, compat: Option<u8>) -> Option<String> {
         dv?;
         if dv != Some(8)
@@ -242,6 +242,20 @@ impl VideoFormat {
                 output.bit_depth
             ));
         }
+        if tone_mapped {
+            for (name, value) in [
+                ("primaries", &output.primaries),
+                ("transfer", &output.transfer),
+                ("matrix", &output.matrix),
+            ] {
+                if value != "bt709" {
+                    return Err(format!("SDR {name} was not BT.709: {value}"));
+                }
+            }
+            if !output.static_hdr.is_empty() {
+                return Err("SDR output still carries static HDR metadata".into());
+            }
+        }
         if !tone_mapped {
             let chroma = |pixel: &str| {
                 if pixel.contains("422") {
@@ -418,6 +432,29 @@ mod tests {
             assert!(!f.gpu_decode_eligible("hevc", "hevc_vaapi", true, true, false)); // CPU filters
             assert!(!f.gpu_decode_eligible("hevc", "hevc_vaapi", false, false, false));
         }
+    }
+    #[test]
+    fn deliberate_tonemap_requires_eight_bit_sdr_without_hdr_metadata() {
+        let source = VideoFormat::from_stream(&json!({
+            "pix_fmt":"yuv420p10le", "color_primaries":"bt2020",
+            "color_transfer":"smpte2084", "color_space":"bt2020nc"
+        }));
+        let sdr = VideoFormat::from_stream(&json!({
+            "pix_fmt":"yuv420p", "color_primaries":"bt709",
+            "color_transfer":"bt709", "color_space":"bt709"
+        }));
+        assert!(source.verify(&sdr, true).is_ok());
+        assert!(source.verify(&sdr, false).is_err());
+        let mut bad = sdr.clone();
+        bad.transfer = "smpte2084".into();
+        assert!(source.verify(&bad, true).is_err());
+        bad = sdr.clone();
+        bad.bit_depth = 10;
+        assert!(source.verify(&bad, true).is_err());
+        bad = sdr;
+        bad.static_hdr
+            .push(json!({"side_data_type":"Content light level metadata"}));
+        assert!(source.verify(&bad, true).is_err());
     }
     #[tokio::test]
     async fn failure_retries_once_and_cancellation_never_retries() {

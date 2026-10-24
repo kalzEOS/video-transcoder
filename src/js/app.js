@@ -52,6 +52,7 @@
     const chkPrecision    = $('#chk-precision');
     const chkHardwareDecoding = $('#chk-hardware-decoding');
     const chkPreserveHdr10Plus = $('#chk-preserve-hdr10plus');
+    const hdrModeNote = $('#hdr-mode-note');
     const numThreads      = $('#num-threads');
     const chkLowPriority  = $('#chk-low-priority');
     const selTheme        = $('#sel-theme');
@@ -112,6 +113,7 @@
     // ═══════════════════════════════════════════════════════════════
     document.addEventListener('DOMContentLoaded', async () => {
       const savedConfig = await loadConfig();
+      updateHdrModeNote();
       await loadThemes(savedConfig);
       setupSplitter();
       setupQueueButtons();
@@ -184,16 +186,22 @@
         numQpI.value = cfg.qpI ?? 20;
         numQpP.value = cfg.qpP ?? 22;
         numCrf.value = cfg.crf ?? 20;
-        chkHdr.checked = true;
+        // Older builds ignored cfg.hdr and always preserved HDR. Keep that
+        // behavior until the user explicitly chooses an HDR mode here.
+        chkHdr.checked = cfg.preserveHdr ?? !cfg.preserveHdr10plus;
         chkPrecision.checked = cfg.precisionMode || false;
         chkHardwareDecoding.checked = cfg.hardwareDecoding || false;
         chkPreserveHdr10Plus.checked = cfg.preserveHdr10plus || false;
+        if (chkPreserveHdr10Plus.checked) chkHdr.checked = false;
 		chkPreserveAv1.checked = cfg.preserveAv1 || false;
         chkCompat.checked = cfg.compatibilityMode || false;
         // Enforce mutual exclusion on load (compat wins if both are saved)
         if (chkCompat.checked) {
           chkPreserveAv1.checked = false;
+          chkHdr.checked = false;
+          chkPreserveHdr10Plus.checked = false;
         }
+        updateHdrModeNote();
         numThreads.value = cfg.threads ?? 0;
         chkLowPriority.checked = cfg.lowPriority || false;
         txtOutputFolder.value = cfg.outputFolder || 'output';
@@ -249,6 +257,7 @@
               crf: parseInt(numCrf.value, 10) || 20,
               rateControlMode: getCurrentRcMode(),
               hdr: chkHdr.checked,
+              preserveHdr: chkHdr.checked,
               precisionMode: chkPrecision.checked,
               hardwareDecoding: chkHardwareDecoding.checked,
               preserveHdr10plus: chkPreserveHdr10Plus.checked,
@@ -263,6 +272,14 @@
           console.warn('Config save failed:', e);
         }
       }, 600);
+    }
+
+    function updateHdrModeNote() {
+      hdrModeNote.textContent = chkPreserveHdr10Plus.checked
+        ? 'HDR10+ mode: preserve HDR10 and dynamic metadata.'
+        : chkHdr.checked
+          ? 'HDR10 mode: preserve HDR and source bit depth.'
+          : 'SDR mode: tone-map HDR and HLG to 8-bit BT.709.';
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1055,7 +1072,6 @@
       queueRefreshDebounce = setTimeout(async () => {
         await fetchQueue();
         renderQueue();
-        checkHdrAuto();
 		checkAv1Auto();
       }, 80);
 	}
@@ -1071,7 +1087,6 @@
       if (queueRenderDebounce) clearTimeout(queueRenderDebounce);
       queueRenderDebounce = setTimeout(() => {
         renderQueue();
-        checkHdrAuto();
         checkAv1Auto();
       }, 80);
     }
@@ -1122,15 +1137,6 @@
       }
     }
 
-    // ── Auto-check HDR if any file is HDR (§6.1) ──
-    function checkHdrAuto() {
-      const anyHdr = queueData.some(item => item.isHdr);
-      if (anyHdr && !chkHdr.checked) {
-        chkHdr.checked = true;
-        scheduleConfigSave();
-      }
-    }
-	
 	// ── Auto-check Preserve AV1 if any file is AV1 ──
     function checkAv1Auto() {
       const anyAv1 = queueData.some(item => (item.videoCodec || '').toLowerCase() === 'av1');
@@ -1491,7 +1497,10 @@
       chkCompat.addEventListener('change', () => {
         if (chkCompat.checked) {
           chkPreserveAv1.checked = false;
+          chkHdr.checked = false;
+          chkPreserveHdr10Plus.checked = false;
         }
+        updateHdrModeNote();
         updateEncoderSummary();
         updateRcModeVisibility();
         scheduleRefreshTargetBitrates();
@@ -1527,6 +1536,19 @@
       });
 
       chkHdr.addEventListener('change', () => {
+        if (chkHdr.checked) {
+          chkPreserveHdr10Plus.checked = false;
+          chkCompat.checked = false;
+        }
+        updateHdrModeNote();
+        scheduleConfigSave();
+      });
+      chkPreserveHdr10Plus.addEventListener('change', () => {
+        if (chkPreserveHdr10Plus.checked) {
+          chkHdr.checked = false;
+          chkCompat.checked = false;
+        }
+        updateHdrModeNote();
         scheduleConfigSave();
       });
 
@@ -1553,7 +1575,7 @@
       const simpleSaveControls = [
         txtOutputFolder,
         chkOverwrite, chkDeleteSource, chkSaveLog, chkToast, chkAutoClear,
-        chkPrecision, chkHardwareDecoding, chkPreserveHdr10Plus, numThreads, chkLowPriority, selPostAction, txtCustomCmd, numCountdown
+        chkPrecision, chkHardwareDecoding, numThreads, chkLowPriority, selPostAction, txtCustomCmd, numCountdown
       ];
       for (const el of simpleSaveControls) {
         el.addEventListener('change', scheduleConfigSave);
@@ -1689,7 +1711,9 @@
         setPeakMultiplier(p.peak);
         chkCompat.checked = p.compat;
         chkPreserveAv1.checked = p.av1;
-        chkHdr.checked = true;
+        chkHdr.checked = p.hdr;
+        chkPreserveHdr10Plus.checked = false;
+        updateHdrModeNote();
         chkPrecision.checked = false;
         applying = false;
         updateRcModeVisibility();
@@ -1715,7 +1739,7 @@
       for (const el of [numBitrate, numQpI, numQpP, numCrf, numThreads]) {
         if (el) el.addEventListener('input', markCustom);
       }
-      for (const el of [chkHdr, chkPreserveAv1, chkCompat, chkPrecision]) {
+      for (const el of [chkHdr, chkPreserveHdr10Plus, chkPreserveAv1, chkCompat, chkPrecision]) {
         if (el) el.addEventListener('change', markCustom);
       }
       for (const btn of rcToggle.querySelectorAll('button')) btn.addEventListener('click', markCustom);
@@ -2345,7 +2369,8 @@
             qpP: parseInt(numQpP.value, 10) || 22,
             crf: parseInt(numCrf.value, 10) || 20,
             rateControlMode: getCurrentRcMode(),
-            pixFmt: 'p010le', // Legacy field; backend derives precision per source.
+            pixFmt: chkHdr.checked || chkPreserveHdr10Plus.checked ? 'p010le' : 'yuv420p',
+            preserveHdr: chkHdr.checked,
             precisionMode: chkPrecision.checked,
               hardwareDecoding: chkHardwareDecoding.checked,
               preserveHdr10plus: chkPreserveHdr10Plus.checked,
