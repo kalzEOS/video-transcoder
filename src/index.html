@@ -248,6 +248,22 @@
 
             <div class="section-header">Performance</div>
 
+            <div class="form-row has-tooltip">
+              <label for="sel-temp-location">Temporary Files Location
+                <span class="tooltip-icon">?</span>
+                <span class="tooltip-text">Automatic uses the output drive. Custom keeps large HDR10+ intermediates in the folder you choose; it never silently falls back to system temporary storage.</span>
+              </label>
+              <select id="sel-temp-location">
+                <option value="automatic">Automatic (Recommended)</option>
+                <option value="custom">Custom</option>
+              </select>
+            </div>
+            <div class="form-row" id="row-custom-temp" hidden>
+              <label for="txt-custom-temp">Custom folder</label>
+              <input type="text" id="txt-custom-temp" placeholder="/path/to/temporary/folder" />
+              <button type="button" id="btn-custom-temp">Browse</button>
+            </div>
+
             <div class="form-row">
               <label for="num-threads" class="has-tooltip">Threads
                 <span class="tooltip-icon">?</span>

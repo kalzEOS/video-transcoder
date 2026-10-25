@@ -64,6 +64,10 @@
     const chkToast        = $('#chk-toast');
     const chkAutoClear    = $('#chk-auto-clear');
     const chkForceLocal   = $('#chk-force-local');
+    const selTempLocation = $('#sel-temp-location');
+    const txtCustomTemp = $('#txt-custom-temp');
+    const rowCustomTemp = $('#row-custom-temp');
+    const btnCustomTemp = $('#btn-custom-temp');
     const selPostAction   = $('#sel-post-action');
     const txtCustomCmd    = $('#txt-custom-command');
     const numCountdown    = $('#num-countdown');
@@ -211,6 +215,9 @@
         chkToast.checked = cfg.showToast || false;
         chkAutoClear.checked = cfg.autoClearCompleted || false;
         chkForceLocal.checked = cfg.forceLocal || false;
+        selTempLocation.value = cfg.tempFilesLocation || 'automatic';
+        txtCustomTemp.value = cfg.customTempDirectory || '';
+        rowCustomTemp.hidden = selTempLocation.value !== 'custom';
         selPostAction.value = cfg.postAction || 'None';
         toggleCustomCommand();
         txtCustomCmd.value = cfg.customCommand || '';
@@ -246,6 +253,8 @@
               showToast: chkToast.checked,
               autoClearCompleted: chkAutoClear.checked,
               forceLocal: chkForceLocal.checked,
+              tempFilesLocation: selTempLocation.value,
+              customTempDirectory: txtCustomTemp.value,
               postAction: selPostAction.value,
               postCountdown: parseInt(numCountdown.value, 10) || 0,
               customCommand: txtCustomCmd.value,
@@ -1565,7 +1574,8 @@
       const simpleSaveControls = [
         txtOutputFolder,
         chkOverwrite, chkDeleteSource, chkSaveLog, chkToast, chkAutoClear,
-        chkPrecision, chkHardwareDecoding, numThreads, chkLowPriority, selPostAction, txtCustomCmd, numCountdown
+        chkPrecision, chkHardwareDecoding, numThreads, chkLowPriority, selPostAction, txtCustomCmd, numCountdown,
+        selTempLocation, txtCustomTemp
       ];
       for (const el of simpleSaveControls) {
         el.addEventListener('change', scheduleConfigSave);
@@ -1573,6 +1583,17 @@
 
       // Post-action: show/hide custom command row
       selPostAction.addEventListener('change', toggleCustomCommand);
+      selTempLocation.addEventListener('change', () => {
+        rowCustomTemp.hidden = selTempLocation.value !== 'custom';
+        scheduleConfigSave();
+      });
+      btnCustomTemp.addEventListener('click', async () => {
+        const selected = await dialogOpen({ directory: true, multiple: false, title: 'Choose temporary files folder' });
+        if (typeof selected === 'string' && selected) {
+          txtCustomTemp.value = selected;
+          scheduleConfigSave();
+        }
+      });
     }
 
     function toggleCustomCommand() {
@@ -2384,6 +2405,8 @@
             postAction: selPostAction.value,
             postCountdown: parseInt(numCountdown.value, 10) || 0,
             forceLocal: chkForceLocal.checked,
+            tempFilesLocation: selTempLocation.value,
+            customTempDirectory: txtCustomTemp.value,
           }
         });
       } catch (e) {

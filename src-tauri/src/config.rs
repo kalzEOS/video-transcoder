@@ -46,6 +46,8 @@ pub struct AppConfig {
     pub preserve_av1: bool,
     #[serde(default)]
     pub force_local: bool,
+    pub temp_files_location: String,
+    pub custom_temp_directory: String,
 }
 
 impl Default for AppConfig {
@@ -83,6 +85,8 @@ impl Default for AppConfig {
             compatibility_mode: false,
             preserve_av1: false,
             force_local: false,
+            temp_files_location: "automatic".to_string(),
+            custom_temp_directory: String::new(),
         }
     }
 }

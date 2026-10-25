@@ -11,6 +11,7 @@ pub mod probe;
 pub mod queue;
 pub mod remote;
 pub mod staging;
+pub mod temp_workspace;
 pub mod video_format;
 pub mod webp_decode;
 
@@ -602,6 +603,17 @@ mod gui_commands {
         if batch_settings.output_mode == "folder" {
             let out_path = std::path::Path::new(&batch_settings.output_folder);
             encoder::validate_output_folder(out_path)?;
+        }
+        let temp_parent = if batch_settings
+            .temp_files_location
+            .eq_ignore_ascii_case("custom")
+        {
+            std::path::PathBuf::from(&batch_settings.custom_temp_directory)
+        } else {
+            std::path::PathBuf::from(&batch_settings.output_folder)
+        };
+        if temp_parent.is_dir() {
+            let _ = crate::temp_workspace::cleanup_abandoned(&temp_parent);
         }
 
         // Reset batch state and set running

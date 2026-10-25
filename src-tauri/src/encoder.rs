@@ -1038,6 +1038,10 @@ pub struct BatchRequest {
     pub preserve_av1: bool,
     #[serde(default)]
     pub force_local: bool,
+    #[serde(default = "batch_req_default_temp_location")]
+    pub temp_files_location: String,
+    #[serde(default)]
+    pub custom_temp_directory: String,
     // GUI-only post-batch fields (not part of BatchSettings)
     #[serde(default)]
     pub show_toast: bool,
@@ -1082,6 +1086,9 @@ fn batch_req_default_peak_multiplier() -> f64 {
 fn batch_req_default_post_action() -> String {
     "None".to_string()
 }
+fn batch_req_default_temp_location() -> String {
+    "automatic".to_string()
+}
 
 impl BatchRequest {
     /// Convert the validated frontend request into the internal `BatchSettings`
@@ -1117,6 +1124,8 @@ impl BatchRequest {
             compatibility_mode: self.compatibility_mode,
             preserve_av1: self.preserve_av1,
             force_local: self.force_local,
+            temp_files_location: self.temp_files_location,
+            custom_temp_directory: self.custom_temp_directory,
         }
     }
 }
@@ -1146,6 +1155,8 @@ pub struct BatchSettings {
     pub compatibility_mode: bool,
     pub preserve_av1: bool,
     pub force_local: bool,
+    pub temp_files_location: String,
+    pub custom_temp_directory: String,
     pub video_encoder: String,
     pub codec_family: String,
     pub audio_encoder: String,
@@ -1269,6 +1280,7 @@ async fn handle_post_encode(
     item_duration_secs: f64,
     final_frame_count: Option<u64>,
     metadata: &Option<crate::hdr10plus_pipeline::ExtractedHdr10Plus>,
+    temp_parent: &std::path::Path,
     settings: &BatchSettings,
     audio_strategy: &AudioStrategy,
     log_writer: &mut Option<std::io::BufWriter<std::fs::File>>,
@@ -1280,8 +1292,13 @@ async fn handle_post_encode(
     }
     if let Some(metadata) = metadata {
         if !matches!(decision, EncodeDecision::Copy) {
-            if let Err(reason) =
-                crate::hdr10plus_pipeline::inject_pending(temp_output_file, metadata, sink).await
+            if let Err(reason) = crate::hdr10plus_pipeline::inject_pending(
+                temp_output_file,
+                metadata,
+                temp_parent,
+                sink,
+            )
+            .await
             {
                 return metadata_failure(idx, queue, Some(temp_output_file), &reason, sink);
             }
@@ -1467,8 +1484,13 @@ async fn handle_post_encode(
         }
 
         if let Some(metadata) = metadata {
-            if let Err(reason) =
-                crate::hdr10plus_pipeline::verify_output(temp_output_file, metadata, sink).await
+            if let Err(reason) = crate::hdr10plus_pipeline::verify_output(
+                temp_output_file,
+                metadata,
+                temp_parent,
+                sink,
+            )
+            .await
             {
                 return metadata_failure(idx, queue, Some(temp_output_file), &reason, sink);
             }
@@ -1738,6 +1760,45 @@ async fn encode_single_file(
             (out.clone(), out)
         }
     };
+
+    // Keep all per-job metadata work on the selected disk-backed filesystem.
+    // The workspace is unique and remains alive until this encode finishes.
+    let output_parent = output_file
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let temp_parent = match crate::temp_workspace::resolve_parent(
+        &settings.temp_files_location,
+        &settings.custom_temp_directory,
+        output_parent,
+    ) {
+        Ok(parent) => parent,
+        Err(reason) => {
+            sink.log(&format!("  ERROR: {reason}"));
+            queue[idx].status = QueueItemStatus::Failed;
+            sink.queue_item_updated(idx, "Failed");
+            return EncodeFileResult::Failed;
+        }
+    };
+    let temp_workspace = if hdr_plan.scan_hdr10plus {
+        let source_bytes = std::fs::metadata(&item_full_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        match crate::temp_workspace::create_job_workspace(&temp_parent, source_bytes) {
+            Ok(workspace) => Some(workspace),
+            Err(reason) => {
+                sink.log(&format!("  ERROR: {reason}"));
+                queue[idx].status = QueueItemStatus::Failed;
+                sink.queue_item_updated(idx, "Failed");
+                return EncodeFileResult::Failed;
+            }
+        }
+    } else {
+        None
+    };
+    let metadata_temp_parent = temp_workspace
+        .as_ref()
+        .map(|workspace| workspace.path())
+        .unwrap_or(temp_parent.as_path());
     // On Windows, prepend the extended-length path prefix when the path
     // exceeds 240 characters to avoid MAX_PATH (260) failures.
     #[cfg(target_os = "windows")]
@@ -1899,7 +1960,7 @@ async fn encode_single_file(
         sink.log("  HDR10+ preservation enabled: extra extraction, alignment, reinsertion and full metadata verification passes. Dolby Vision restoration remains disabled.");
         match crate::hdr10plus_pipeline::prepare(
             std::path::Path::new(&item_full_path),
-            temp_output_file.parent(),
+            Some(metadata_temp_parent),
             target_codec,
             sink,
         )
@@ -2267,6 +2328,7 @@ async fn encode_single_file(
         // Shared context for run_ffmpeg_with_progress calls within this file.
         let ffmpeg_ctx = FfmpegRunContext {
             low_priority: settings.low_priority,
+            temp_dir: Some(metadata_temp_parent),
             stderr_log: batch_stderr_log.clone(),
             stderr_label: &item_file_name,
             sink,
@@ -2618,6 +2680,7 @@ async fn encode_single_file(
         item_duration_secs,
         final_frame_count,
         &metadata,
+        metadata_temp_parent,
         settings,
         &resolved.audio_strategy,
         log_writer,
@@ -2783,7 +2846,13 @@ pub async fn run_encode_loop(
                     wave_num += 1;
                     WaveWork {
                         indices,
-                        staging_dir: Some(crate::staging::resolve_staging_dir(None)),
+                        staging_dir: Some(crate::staging::resolve_staging_dir(Some(
+                            if settings.temp_files_location.eq_ignore_ascii_case("custom") {
+                                std::path::Path::new(&settings.custom_temp_directory)
+                            } else {
+                                std::path::Path::new(&settings.output_folder)
+                            },
+                        ))),
                         total_stage_bytes,
                         wave_number: wave_num,
                         total_waves,
@@ -3341,6 +3410,7 @@ fn build_two_pass_args(
 /// the fields that stay constant across passes within one file.
 struct FfmpegRunContext<'a> {
     low_priority: bool,
+    temp_dir: Option<&'a std::path::Path>,
     stderr_log: Option<SharedStderrLog>,
     stderr_label: &'a str,
     sink: &'a dyn EventSink,
@@ -3362,6 +3432,11 @@ async fn run_ffmpeg_with_progress(
 ) -> Result<FfmpegRunResult, String> {
     let phase_start = std::time::Instant::now();
     let mut cmd = ffbin::ffmpeg_command();
+    if let Some(temp_dir) = ctx.temp_dir {
+        cmd.env("TMPDIR", temp_dir)
+            .env("TMP", temp_dir)
+            .env("TEMP", temp_dir);
+    }
     cmd.args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -3657,6 +3732,7 @@ pub async fn probe_crf_viability(
         let probe_label = format!("probe_{}", sample_num);
         let probe_ctx = FfmpegRunContext {
             low_priority: config.low_priority,
+            temp_dir: None,
             stderr_log: config.stderr_log.clone(),
             stderr_label: &probe_label,
             sink,

@@ -393,6 +393,8 @@ fn compute_decisions(
                     threads: 0,
                     low_priority: false,
                     force_local: false,
+                    temp_files_location: "automatic".into(),
+                    custom_temp_directory: String::new(),
                     video_encoder: args.encoder.clone().unwrap_or_else(|| "auto".to_string()),
                     codec_family: args.codec.to_string(),
                     audio_encoder: args.audio.to_string(),
@@ -866,6 +868,8 @@ fn run_batch(
         compatibility_mode: args.compat,
         preserve_av1: args.preserve_av1,
         force_local: false,
+        temp_files_location: "automatic".into(),
+        custom_temp_directory: String::new(),
     };
 
     // ── Wave-based remote staging + encoding loop ─────────────

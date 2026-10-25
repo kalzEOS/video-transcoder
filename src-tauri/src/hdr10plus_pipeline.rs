@@ -142,9 +142,10 @@ pub async fn inject_hdr10plus(
     encoded_path: &Path,
     output_path: &Path,
     metadata: &ExtractedHdr10Plus,
+    temp_parent: &Path,
     sink: &dyn EventSink,
 ) -> Result<Hdr10PlusPipelineResult, String> {
-    let temp_dir = hevc_utils::make_tempdir(".histv-hdr10plus-inject-", output_path.parent())?;
+    let temp_dir = hevc_utils::make_tempdir(".histv-hdr10plus-inject-", Some(temp_parent))?;
 
     // Step 1: Demux encoded output to raw HEVC
     let encoded_hevc = temp_dir.path().join("encoded.h265");
@@ -264,12 +265,8 @@ pub async fn inject_hdr10plus(
         .map_err(|e| e.to_string())?;
     let packaged = crate::pipeline_progress::wait_output(child, sink).await?;
     if !packaged.status.success() {
-        // Preserve the already-injected bitstream on disk for a packaging-only
-        // retry. Losing this file forces another full metadata injection.
-        let workspace = temp_dir.keep();
         return Err(format!(
-            "HDR10+ video packaging failed. Injected HEVC preserved at {} for recovery. GPAC stderr: {}",
-            workspace.join("injected.h265").display(),
+            "HDR10+ video packaging failed; temporary files were cleaned up. GPAC stderr: {}",
             String::from_utf8_lossy(&packaged.stderr)
         ));
     }
@@ -417,17 +414,23 @@ pub async fn prepare(
 pub async fn inject_pending(
     encoded: &Path,
     metadata: &ExtractedHdr10Plus,
+    temp_parent: &Path,
     sink: &dyn EventSink,
 ) -> Result<(), String> {
-    let staging = hevc_utils::make_tempdir(".histv-hdr10plus-output-", encoded.parent())?;
+    let staging = hevc_utils::make_tempdir(".histv-hdr10plus-output-", Some(temp_parent))?;
     let ext = encoded
         .extension()
         .and_then(|v| v.to_str())
         .unwrap_or("mkv");
     let output = staging.path().join(format!("preserved.{ext}"));
-    let result =
-        crate::pipeline_progress::metadata_work(inject_hdr10plus(encoded, &output, metadata, sink))
-            .await?;
+    let result = crate::pipeline_progress::metadata_work(inject_hdr10plus(
+        encoded,
+        &output,
+        metadata,
+        staging.path(),
+        sink,
+    ))
+    .await?;
     if !result.success {
         return Err(result.message);
     }
@@ -446,13 +449,14 @@ pub async fn inject_pending(
 pub async fn verify_output(
     output: &Path,
     expected: &ExtractedHdr10Plus,
+    temp_parent: &Path,
     sink: &dyn EventSink,
 ) -> Result<(), String> {
     let actual = crate::pipeline_progress::metadata_work(extract_hdr10plus_in(
         output,
         sink,
         "finalizing",
-        output.parent(),
+        Some(temp_parent),
     ))
     .await?
     .ok_or("Required HDR10+ metadata was lost")?;
@@ -543,8 +547,12 @@ mod tests {
         let expected = ExtractedHdr10Plus {
             frames: vec![vec![]],
         };
-        assert!(inject_pending(&source, &expected, &sink).await.is_err());
-        assert!(verify_output(&source, &expected, &sink).await.is_err());
+        assert!(inject_pending(&source, &expected, root.path(), &sink)
+            .await
+            .is_err());
+        assert!(verify_output(&source, &expected, root.path(), &sink)
+            .await
+            .is_err());
         assert_eq!(std::fs::read(&source).unwrap(), b"original source");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
