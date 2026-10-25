@@ -1,7 +1,7 @@
 [package]
 name = "histv"
 version = "2.7.1"
-description = "Honey, I Shrunk The Vids - batch video encoder"
+description = "Video Transcoder - batch video encoder"
 authors = ["claude.ai", "obelisk-complex"]
 license = "GPL-3.0-or-later"
 edition = "2021"
