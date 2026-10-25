@@ -76,7 +76,7 @@ fn real_sources_keep_hdr10_pixels_tracks_and_container_without_metadata_passes()
             let dest = root
                 .path()
                 .join(format!("{}-{gpu}", case["name"].as_str().unwrap()));
-            let mut command = Command::new(env!("CARGO_BIN_EXE_histv-cli"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_video-transcoder-cli"));
             command
                 .args([
                     "--codec",
