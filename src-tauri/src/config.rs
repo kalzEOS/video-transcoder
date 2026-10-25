@@ -113,24 +113,28 @@ fn config_path(app: &AppHandle) -> PathBuf {
     config_dir(app).join("config.json")
 }
 
+// Preserve settings across the app identifier change. This is deliberately
+// copy-only: the older app and its configuration must remain usable.
+fn migrate_legacy_app_data_config(path: &std::path::Path) {
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent().and_then(|p| p.parent()) {
+        let legacy = parent.join("com.histv.encoder").join("config.json");
+        if legacy.is_file() && legacy != path {
+            if let Err(error) = fs::copy(&legacy, path) {
+                eprintln!("Could not migrate legacy settings from {}: {error}", legacy.display());
+            }
+        }
+    }
+}
+
 pub fn load_config(app: &AppHandle) -> AppConfig {
     let path = config_path(app);
 
     // Migrate: if the new location is empty but the old exe-relative config
     // exists, copy it over so users don't lose settings on upgrade.
-    if !path.exists() {
-        // Renaming the Tauri application ID changes the app-data directory.
-        // Import the existing HISTV settings only when the new config is absent.
-        // Never overwrite either file, and leave the legacy installation intact.
-        if let Some(parent) = path.parent().and_then(|p| p.parent()) {
-            let legacy = parent.join("com.histv.encoder").join("config.json");
-            if legacy.is_file() && legacy != path {
-                if let Err(error) = fs::copy(&legacy, &path) {
-                    eprintln!("Could not migrate legacy settings from {}: {error}", legacy.display());
-                }
-            }
-        }
-    }
+    migrate_legacy_app_data_config(&path);
     if !path.exists() {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(exe_dir) = exe.parent() {
@@ -177,6 +181,24 @@ pub fn save_config(app: &AppHandle, config: &AppConfig) -> Result<(), Box<dyn st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebrand_copies_old_config_without_overwriting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let old_dir = root.path().join("com.histv.encoder");
+        let new_dir = root.path().join("com.kalzi.videotranscoder");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&new_dir).unwrap();
+        let old_path = old_dir.join("config.json");
+        let new_path = new_dir.join("config.json");
+        fs::write(&old_path, r#"{"target_bitrate":8}"#).unwrap();
+        migrate_legacy_app_data_config(&new_path);
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), fs::read_to_string(&old_path).unwrap());
+        fs::write(&new_path, "keep-new-settings").unwrap();
+        migrate_legacy_app_data_config(&new_path);
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "keep-new-settings");
+        assert_eq!(fs::read_to_string(&old_path).unwrap(), r#"{"target_bitrate":8}"#);
+    }
 
     #[test]
     fn hdr10plus_is_opt_in_and_saved_independently_of_gpu_decoding() {
