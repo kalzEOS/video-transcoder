@@ -1024,7 +1024,7 @@
       if (!mbps || mbps <= 0) {
         if (!item.videoCodec) return null;
         // Probed but zero bitrate (image sequence) - quality-based encode
-        return { bytes: item.sourceBytes, approx: true };
+        return { variable: true };
       }
 
       const isSameCodec = sourceCodec === settings.targetCodecFamily;
@@ -1040,6 +1040,7 @@
           return sum + outputKbps * 1000;
         }, 0);
         const budgetBytes = ((settings.target * 1000000 + audioBps) * item.durationSecs) / 8;
+        if (!Number.isFinite(budgetBytes) || budgetBytes <= 0) return null;
         return { bytes: Math.round(budgetBytes), approx: true, atTarget: true };
       } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
         // CQP/CRF for non-copyable codecs
@@ -1056,8 +1057,9 @@
     function formatEstimatedSize(item, settings) {
       const est = computeEstimatedSize(item, settings);
       if (!est) return '-';
+      if (est.variable) return 'Variable (quality-based)';
       const formatted = formatBytes(est.bytes);
-      return est.atTarget ? `${formatted} @ target` : est.approx ? '~' + formatted : formatted;
+      return est.atTarget ? `${formatted} target budget` : est.approx ? '~' + formatted : formatted;
     }
 
     // ── Update all target bitrate labels (#11: uses .children not querySelectorAll) ──
