@@ -119,6 +119,19 @@ pub fn load_config(app: &AppHandle) -> AppConfig {
     // Migrate: if the new location is empty but the old exe-relative config
     // exists, copy it over so users don't lose settings on upgrade.
     if !path.exists() {
+        // Renaming the Tauri application ID changes the app-data directory.
+        // Import the existing HISTV settings only when the new config is absent.
+        // Never overwrite either file, and leave the legacy installation intact.
+        if let Some(parent) = path.parent().and_then(|p| p.parent()) {
+            let legacy = parent.join("com.histv.encoder").join("config.json");
+            if legacy.is_file() && legacy != path {
+                if let Err(error) = fs::copy(&legacy, &path) {
+                    eprintln!("Could not migrate legacy settings from {}: {error}", legacy.display());
+                }
+            }
+        }
+    }
+    if !path.exists() {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(exe_dir) = exe.parent() {
                 let legacy = exe_dir.join("config.json");
