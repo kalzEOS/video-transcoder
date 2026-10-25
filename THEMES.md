@@ -1,6 +1,6 @@
 # Creating Themes
 
-Honey, I Shrunk The Vids supports custom themes via simple JSON files. You pick 6 colours and the app derives everything else - borders, row tints, icon colours, progress bars - automatically.
+Video Transcoder supports custom themes via simple JSON files. You pick 6 colours and the app derives everything else - borders, row tints, icon colours, progress bars - automatically.
 
 ## Where to put themes
 
