@@ -187,14 +187,26 @@ describe('computeEstimatedSize', () => {
     const est = computeEstimatedSize(item, baseSettings);
     // 4Mbps * 100s / 8 = 50MB
     assert.equal(est.bytes, 50000000);
-    assert.equal(est.approx, false);
+    assert.equal(est.approx, true);
+    assert.equal(est.atTarget, true);
+  });
+
+  it('includes copied audio in the VBR target budget', () => {
+    const item = {
+      sourceBytes: 200000000, videoBitrateMbps: 10.0, videoCodec: 'hevc',
+      durationSecs: 100, audioStreams: [{ codec: 'eac3', bitrateKbps: 640 }],
+    };
+    const est = computeEstimatedSize(item, baseSettings);
+    assert.equal(est.bytes, 58000000);
+    assert.equal(est.atTarget, true);
+    assert.match(formatEstimatedSize(item, baseSettings), /target budget/);
   });
 
   it('returns approximate for quality mode', () => {
     const item = { sourceBytes: 50000000, videoBitrateMbps: 0, videoCodec: 'hevc', durationSecs: 60 };
     const est = computeEstimatedSize(item, baseSettings);
-    assert.equal(est.bytes, 50000000);
-    assert.equal(est.approx, true);
+    assert.equal(est.variable, true);
+    assert.equal(formatEstimatedSize(item, baseSettings), 'Variable (quality-based)');
   });
 });
 
