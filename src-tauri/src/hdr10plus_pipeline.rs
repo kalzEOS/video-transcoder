@@ -235,9 +235,14 @@ pub async fn inject_hdr10plus(
         return Err("HDR10+ timing preservation requires a working MP4Box; source retained".into());
     }
     let video_mp4 = temp_dir.path().join("hdr10plus-video.mp4");
-    // GPAC may create additional temporary files while packaging. Keep them
-    // on the same disk-backed filesystem as the HDR10+ workspace instead of
-    // falling back to a potentially small RAM-backed /tmp.
+    // GPAC's -newfs writes the newly created MP4 without an intermediate
+    // temporary MP4. Explicit -tmp is also important: GPAC does not
+    // necessarily honor TMPDIR when it needs working files.
+    // Keep every file on the output filesystem, never a RAM-backed /tmp.
+    sink.log(&format!(
+        "  HDR10+: GPAC disk workspace: {}",
+        temp_dir.path().display()
+    ));
     let mut packager = mp4box_command()?;
     packager
         .env("TMPDIR", temp_dir.path())
@@ -246,9 +251,11 @@ pub async fn inject_hdr10plus(
     let child = packager
         .kill_on_drop(true)
         .args([
+            "-tmp",
+            &temp_dir.path().to_string_lossy(),
             "-add",
             &format!("{}#video:fps={fps}", injected_hevc.display()),
-            "-new",
+            "-newfs",
             &video_mp4.to_string_lossy(),
         ])
         .stdout(std::process::Stdio::null())
@@ -257,8 +264,12 @@ pub async fn inject_hdr10plus(
         .map_err(|e| e.to_string())?;
     let packaged = crate::pipeline_progress::wait_output(child, sink).await?;
     if !packaged.status.success() {
+        // Preserve the already-injected bitstream on disk for a packaging-only
+        // retry. Losing this file forces another full metadata injection.
+        let workspace = temp_dir.keep();
         return Err(format!(
-            "HDR10+ video packaging failed: {}",
+            "HDR10+ video packaging failed. Injected HEVC preserved at {} for recovery. GPAC stderr: {}",
+            workspace.join("injected.h265").display(),
             String::from_utf8_lossy(&packaged.stderr)
         ));
     }
