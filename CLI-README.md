@@ -1,6 +1,6 @@
 # histv-cli
 
-Command-line batch video encoder - the headless companion to [Honey, I Shrunk The Vids](https://github.com/obelisk-complex/histv-universal).
+Command-line batch video encoder - the headless companion to [Video Transcoder](https://github.com/obelisk-complex/histv-universal).
 
 Same encoding engine as the desktop app: figures out what each file needs, picks the right codec and container per-file, preserves Dolby Vision and HDR10+ dynamic metadata, uses your GPU if available, handles audio tracks individually, stages remote files in waves before encoding, watches disk space, and checks output sizes. Built for servers and automation.
 
