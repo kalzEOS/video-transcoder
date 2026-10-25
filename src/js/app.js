@@ -1043,8 +1043,8 @@
         if (!Number.isFinite(budgetBytes) || budgetBytes <= 0) return null;
         return { bytes: Math.round(budgetBytes), approx: true, atTarget: true };
       } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
-        // CQP/CRF for non-copyable codecs
-        return { bytes: item.sourceBytes, approx: true };
+        // Output size cannot be inferred from input size in quality-based mode.
+        return { variable: true };
       } else if (mbps > 0) {
         // Copy decision
         return { bytes: item.sourceBytes, approx: false };
