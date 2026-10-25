@@ -463,7 +463,8 @@ fn print_dry_run_plan(
         .collect();
 
     // ── Disk-space estimate ───────────────────────────────────
-    let batch_estimate = video_transcoder_lib::disk_monitor::estimate_batch(&probed_items, &decisions);
+    let batch_estimate =
+        video_transcoder_lib::disk_monitor::estimate_batch(&probed_items, &decisions);
 
     // ── Encoder label ─────────────────────────────────────────
     let encoder_label = if is_hw_encoder {
@@ -674,9 +675,10 @@ fn print_dry_run_plan(
         let dry_plan = if matches!(args.remote, cli::RemotePolicy::Always) {
             // All files as one big set of waves
             use video_transcoder_lib::staging::WaveItem;
-            let budget: u64 = video_transcoder_lib::disk_monitor::partition_free_space(&staging_dir)
-                .map(|(_, free)| (free as f64 * 0.9) as u64)
-                .unwrap_or(u64::MAX);
+            let budget: u64 =
+                video_transcoder_lib::disk_monitor::partition_free_space(&staging_dir)
+                    .map(|(_, free)| (free as f64 * 0.9) as u64)
+                    .unwrap_or(u64::MAX);
             let mut plan: Vec<WaveItem> = Vec::new();
             let mut wave_indices: Vec<usize> = Vec::new();
             let mut wave_bytes: u64 = 0;
@@ -959,7 +961,9 @@ fn run_batch(
                 };
                 cli_sink::DisplayItem {
                     file_name: item.file_name.clone(),
-                    source_size: video_transcoder_lib::disk_monitor::format_bytes(item.source_bytes),
+                    source_size: video_transcoder_lib::disk_monitor::format_bytes(
+                        item.source_bytes,
+                    ),
                     estimated_size: format_estimated_size(item, decision),
                     resolution: format!("{}x{}", item.probe.video_width, item.probe.video_height),
                     hdr_label: hdr_type_label(item),
@@ -1235,7 +1239,10 @@ fn estimate_output_size(item: &QueueItem, decision: &EncodeDecision) -> Option<(
 /// Format estimated output size for display, matching the GUI's To Size column.
 fn format_estimated_size(item: &QueueItem, decision: &EncodeDecision) -> String {
     match estimate_output_size(item, decision) {
-        Some((bytes, true)) => format!("~{}", video_transcoder_lib::disk_monitor::format_bytes(bytes)),
+        Some((bytes, true)) => format!(
+            "~{}",
+            video_transcoder_lib::disk_monitor::format_bytes(bytes)
+        ),
         Some((bytes, false)) => video_transcoder_lib::disk_monitor::format_bytes(bytes),
         None => "-".to_string(),
     }

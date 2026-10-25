@@ -1,8 +1,8 @@
 //! Short, opt-in physical GPU regression. No existing media are modified.
 use hdr10plus::{hevc::encode_hdr10plus_nal, metadata::Hdr10PlusMetadata};
-use video_transcoder_lib::{hdr10plus_pipeline as hdr, EventSink, QueueItem};
 use sha2::{Digest, Sha256};
 use std::{path::Path, process::Command};
+use video_transcoder_lib::{hdr10plus_pipeline as hdr, EventSink, QueueItem};
 
 struct Sink;
 impl EventSink for Sink {
