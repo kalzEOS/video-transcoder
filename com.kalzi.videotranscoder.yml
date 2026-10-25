@@ -74,7 +74,7 @@ modules:
         cargo build --offline --release
         --manifest-path src-tauri/Cargo.toml
         --no-default-features
-        --features custom-protocol,dovi
+        --features custom-protocol
       - install -Dm755 src-tauri/target/release/video-transcoder /app/bin/video-transcoder
       # Themes (looked up adjacent to binary)
       - install -d /app/bin/themes
