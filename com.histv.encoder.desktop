@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=Honey, I Shrunk The Vids
+Name=Video Transcoder
 Comment=Batch video encoder with smart bitrate decisions
 Exec=histv
 Icon=com.histv.encoder
