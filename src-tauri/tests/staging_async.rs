@@ -1,13 +1,13 @@
 //! Async tests for StagingContext::stage_file().
 
 struct NoopSink;
-impl histv_lib::events::EventSink for NoopSink {
+impl video_transcoder_lib::events::EventSink for NoopSink {
     fn log(&self, _: &str) {}
     fn file_progress(&self, _: f64, _: f64, _: f64, _: Option<(u8, u8)>) {}
     fn batch_progress(&self, _: u32, _: usize) {}
     fn batch_status(&self, _: &str) {}
     fn queue_item_updated(&self, _: usize, _: &str) {}
-    fn queue_item_probed(&self, _: usize, _: &histv_lib::queue::QueueItem) {}
+    fn queue_item_probed(&self, _: usize, _: &video_transcoder_lib::queue::QueueItem) {}
     fn batch_started(&self) {}
     fn batch_finished(&self, _: u32, _: u32, _: u32, _: &str) {}
     fn ffmpeg_stderr(&self, _: &str) {}
@@ -28,7 +28,7 @@ async fn stage_file_copies_and_cleans_up() {
 
     let staging_dir = tmp.path().join("staging");
 
-    let ctx = histv_lib::staging::StagingContext::stage_file(&source, &staging_dir, 0, &sink).await;
+    let ctx = video_transcoder_lib::staging::StagingContext::stage_file(&source, &staging_dir, 0, &sink).await;
 
     assert!(ctx.is_some(), "stage_file should succeed");
     let mut ctx = ctx.unwrap();
@@ -60,7 +60,7 @@ async fn stage_file_nonexistent_source_returns_none() {
     let tmp = tempfile::tempdir().unwrap();
     let staging_dir = tmp.path().join("staging");
 
-    let ctx = histv_lib::staging::StagingContext::stage_file(
+    let ctx = video_transcoder_lib::staging::StagingContext::stage_file(
         std::path::Path::new("/nonexistent/file.mkv"),
         &staging_dir,
         0,
@@ -91,7 +91,7 @@ async fn stage_file_creates_staging_dir() {
     let staging_dir = tmp.path().join("nested").join("staging");
     assert!(!staging_dir.exists());
 
-    let ctx = histv_lib::staging::StagingContext::stage_file(&source, &staging_dir, 5, &sink).await;
+    let ctx = video_transcoder_lib::staging::StagingContext::stage_file(&source, &staging_dir, 5, &sink).await;
 
     assert!(ctx.is_some());
     assert!(staging_dir.exists(), "Staging dir should be created");
@@ -111,7 +111,7 @@ async fn stage_file_drop_cleans_up() {
 
     let staged_path;
     {
-        let ctx = histv_lib::staging::StagingContext::stage_file(&source, &staging_dir, 0, &sink)
+        let ctx = video_transcoder_lib::staging::StagingContext::stage_file(&source, &staging_dir, 0, &sink)
             .await
             .unwrap();
         staged_path = ctx.local_path().to_path_buf();

@@ -88,7 +88,7 @@ fn hdr_and_sdr_choices_preserve_audio_and_never_silently_restore_source_hdr() {
         let destination = root.path().join(if hdr { "hdr" } else { "sdr" });
         // Above-source target would normally select stream copy. SDR mode must
         // still transcode and must never remux the untouched HDR source back.
-        run(Command::new(env!("CARGO_BIN_EXE_histv-cli"))
+        run(Command::new(env!("CARGO_BIN_EXE_video-transcoder-cli"))
             .args([
                 choice,
                 "--encoder",
@@ -151,7 +151,7 @@ fn twelve_bit_hdr_tonemaps_to_eight_bit_compatibility_sdr() {
     assert_eq!(original["frames"][0]["color_transfer"], "smpte2084");
 
     let destination = root.path().join("output");
-    run(Command::new(env!("CARGO_BIN_EXE_histv-cli"))
+    run(Command::new(env!("CARGO_BIN_EXE_video-transcoder-cli"))
         .args([
             "--no-hdr",
             "--compat",

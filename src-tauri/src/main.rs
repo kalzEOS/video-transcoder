@@ -30,5 +30,5 @@ fn main() {
         }
     }
 
-    histv_lib::run()
+    video_transcoder_lib::run()
 }

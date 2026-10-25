@@ -14,13 +14,13 @@ const EXE_EXT: &str = "";
 
 struct NoopSink;
 
-impl histv_lib::events::EventSink for NoopSink {
+impl video_transcoder_lib::events::EventSink for NoopSink {
     fn log(&self, _: &str) {}
     fn file_progress(&self, _: f64, _: f64, _: f64, _: Option<(u8, u8)>) {}
     fn batch_progress(&self, _: u32, _: usize) {}
     fn batch_status(&self, _: &str) {}
     fn queue_item_updated(&self, _: usize, _: &str) {}
-    fn queue_item_probed(&self, _: usize, _: &histv_lib::queue::QueueItem) {}
+    fn queue_item_probed(&self, _: usize, _: &video_transcoder_lib::queue::QueueItem) {}
     fn batch_started(&self) {}
     fn batch_finished(&self, _: u32, _: u32, _: u32, _: &str) {}
     fn ffmpeg_stderr(&self, _: &str) {}
@@ -45,10 +45,10 @@ fn test_init_then_reinit() {
     fs::write(&ffprobe1, b"fake-v1").unwrap();
 
     // init() resolves from the provided resource dir
-    histv_lib::ffmpeg::init(Some(tmp1.path()), None, &sink);
+    video_transcoder_lib::ffmpeg::init(Some(tmp1.path()), None, &sink);
 
     // After init, ffmpeg_command() should work (returns a Command)
-    let cmd = histv_lib::ffmpeg::ffmpeg_command();
+    let cmd = video_transcoder_lib::ffmpeg::ffmpeg_command();
     let program = cmd.as_std().get_program().to_string_lossy();
     assert!(
         program.contains("ffmpeg"),
@@ -63,10 +63,10 @@ fn test_init_then_reinit() {
     fs::write(&ffprobe2, b"fake-v2").unwrap();
 
     // reinit() should override the paths via the RwLock mechanism
-    histv_lib::ffmpeg::reinit(Some(tmp2.path()), &sink);
+    video_transcoder_lib::ffmpeg::reinit(Some(tmp2.path()), &sink);
 
     // After reinit, the command should point to the new location
-    let cmd2 = histv_lib::ffmpeg::ffmpeg_command();
+    let cmd2 = video_transcoder_lib::ffmpeg::ffmpeg_command();
     // Use to_string_lossy (not Debug {:?}) to avoid escaped backslashes on Windows
     let program2 = cmd2.as_std().get_program().to_string_lossy();
     let expected = tmp2.path().to_str().unwrap();
@@ -82,7 +82,7 @@ fn test_init_without_resource_dir() {
     // already set from the other test. That's fine - init() is
     // idempotent (OnceLock::set returns Err on second call).
     let sink = NoopSink;
-    histv_lib::ffmpeg::init(None, None, &sink);
+    video_transcoder_lib::ffmpeg::init(None, None, &sink);
     // Should not panic; ffmpeg_command returns something usable
-    let _cmd = histv_lib::ffmpeg::ffmpeg_command();
+    let _cmd = video_transcoder_lib::ffmpeg::ffmpeg_command();
 }

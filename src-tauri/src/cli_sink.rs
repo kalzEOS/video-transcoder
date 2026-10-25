@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use histv_lib::events::EventSink;
+use video_transcoder_lib::events::EventSink;
 
 use crate::cli::LogLevel;
 

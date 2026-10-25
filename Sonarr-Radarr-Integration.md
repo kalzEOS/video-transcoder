@@ -1,6 +1,6 @@
 # Automatically Shrink Your Media Library with HISTV and Sonarr/Radarr
 
-This guide explains how to set up [Honey, I Shrunk The Vids](https://github.com/obelisk-complex/histv-universal) (HISTV) so that every time Sonarr or Radarr downloads a new TV episode or movie, HISTV automatically re-encodes it to save disk space - without you having to lift a finger.
+This guide explains how to set up [Video Transcoder](https://github.com/obelisk-complex/histv-universal) (HISTV) so that every time Sonarr or Radarr downloads a new TV episode or movie, HISTV automatically re-encodes it to save disk space - without you having to lift a finger.
 
 ## What this does (and doesn't do)
 

@@ -5,10 +5,10 @@
 # is pushed, and on demand via the Actions tab. It reuses the same
 # `build-platform.yml` the real release uses, so what you download here is
 # built exactly like a shipped Windows build:
-#   - histv-windows.exe        portable GUI
-#   - histv-windows-full.zip   GUI + bundled ffmpeg/ffprobe (run without install)
-#   - histv-cli-windows.exe    headless CLI
-#   - histv-cli-windows-full.zip
+#   - video-transcoder-windows.exe        portable GUI
+#   - video-transcoder-windows-full.zip   GUI + bundled ffmpeg/ffprobe (run without install)
+#   - video-transcoder-cli-windows.exe    headless CLI
+#   - video-transcoder-cli-windows-full.zip
 #
 # The Linux Flatpak preview is produced separately by dispatching the existing
 # `build-flatpak.yml` against the same ref (it already supports workflow_dispatch

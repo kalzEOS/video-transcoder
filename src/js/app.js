@@ -3093,7 +3093,7 @@
             await invoke('plugin:notification|request_permission');
           }
           await invoke('plugin:notification|notify', {
-            title: 'Honey, I Shrunk The Vids',
+            title: 'Video Transcoder',
             body: event.payload,
           });
         } catch (e) {

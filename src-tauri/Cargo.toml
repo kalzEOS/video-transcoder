@@ -1,17 +1,17 @@
 [package]
-name = "histv"
+name = "video-transcoder"
 version = "2.7.1"
-description = "Honey, I Shrunk The Vids - batch video encoder"
+description = "Video Transcoder - batch video encoder"
 authors = ["claude.ai", "obelisk-complex"]
 license = "GPL-3.0-or-later"
 edition = "2021"
 
 [lib]
-name = "histv_lib"
+name = "video_transcoder_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [[bin]]
-name = "histv-cli"
+name = "video-transcoder-cli"
 path = "src/cli_main.rs"
 required-features = ["cli"]
 

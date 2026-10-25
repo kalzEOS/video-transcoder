@@ -4,7 +4,7 @@
 //! resolve_file_settings() and decide_encode_strategy() without
 //! needing ffmpeg installed.
 
-use histv_lib::encoder::{self, BatchSettings, EncodeDecision, EncoderInfo, RateControlParams};
+use video_transcoder_lib::encoder::{self, BatchSettings, EncodeDecision, EncoderInfo, RateControlParams};
 
 fn sw_encoders() -> Vec<EncoderInfo> {
     vec![

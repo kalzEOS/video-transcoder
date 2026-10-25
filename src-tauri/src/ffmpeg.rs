@@ -66,37 +66,35 @@ pub fn hide_window(_cmd: &mut Command) {}
 #[cfg(not(target_os = "windows"))]
 pub fn hide_window_std(_cmd: &mut std::process::Command) {}
 
-/// Return the app-data binary directory for storing downloaded ffmpeg/ffprobe.
-/// - Windows: %APPDATA%\com.histv.encoder\bin
-/// - macOS:   ~/Library/Application Support/com.histv.encoder/bin
-/// - Linux:   ~/.local/share/com.histv.encoder/bin
+/// Directory for downloaded ffmpeg/ffprobe tools.
+/// If a previous HISTV installation already has downloaded binaries, use
+/// those in place. Do not duplicate or delete gigabytes of existing tools.
 pub fn app_data_bin_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
-    {
-        std::env::var("APPDATA")
-            .ok()
-            .map(|d| PathBuf::from(d).join("com.histv.encoder").join("bin"))
-    }
+    let parent = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(target_os = "macos")]
-    {
-        dirs_next().map(|d| d.join("com.histv.encoder").join("bin"))
-    }
+    let parent = dirs_next();
     #[cfg(target_os = "linux")]
-    {
-        std::env::var("XDG_DATA_HOME")
-            .ok()
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".local").join("share"))
-            })
-            .map(|d| d.join("com.histv.encoder").join("bin"))
-    }
+    let parent = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        });
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+    let parent: Option<PathBuf> = None;
+
+    parent.map(|base| {
+        let preferred = base.join("com.kalzi.videotranscoder").join("bin");
+        let legacy = base.join("com.histv.encoder").join("bin");
+        if preferred.is_dir() {
+            preferred
+        } else if legacy.is_dir() {
+            legacy
+        } else {
+            preferred
+        }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -878,7 +876,7 @@ mod tests {
         }
         assert_eq!(
             result,
-            Some(PathBuf::from("/tmp/test-xdg-data/com.histv.encoder/bin"))
+            Some(PathBuf::from("/tmp/test-xdg-data/com.kalzi.videotranscoder/bin"))
         );
     }
 
@@ -902,9 +900,26 @@ mod tests {
         assert_eq!(
             result,
             Some(PathBuf::from(
-                "/tmp/test-home/.local/share/com.histv.encoder/bin"
+                "/tmp/test-home/.local/share/com.kalzi.videotranscoder/bin"
             ))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
+    fn test_app_data_bin_dir_uses_existing_legacy_downloads() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("com.histv.encoder").join("bin");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", root.path());
+        assert_eq!(app_data_bin_dir(), Some(legacy));
+        if let Some(v) = previous {
+            std::env::set_var("XDG_DATA_HOME", v);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 
     #[cfg(target_os = "linux")]
