@@ -7,7 +7,7 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Honey, I Shrunk The Vids — headless batch video encoder.
+/// Video Transcoder — headless batch video encoder.
 ///
 /// Encode video files from the command line using the same engine as the
 /// HISTV desktop app. Supports hardware-accelerated encoding, smart bitrate
