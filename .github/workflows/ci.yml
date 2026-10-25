@@ -63,13 +63,13 @@ jobs:
       - name: Run tests (library, integration, CLI binary)
         working-directory: src-tauri
         # `--features cli` already compiles and tests every crate in the
-        # workspace, histv-cli included; a separate `--bin histv-cli` run added
+        # workspace, video-transcoder-cli included; a separate `--bin video-transcoder-cli` run added
         # no unique coverage, so it was removed.
         run: cargo test --features cli
 
       - name: Feature combination check (CLI-only, no dovi)
         working-directory: src-tauri
-        run: cargo check --lib --bin histv-cli --features cli
+        run: cargo check --lib --bin video-transcoder-cli --features cli
 
       - name: Feature combination check (all features)
         working-directory: src-tauri
