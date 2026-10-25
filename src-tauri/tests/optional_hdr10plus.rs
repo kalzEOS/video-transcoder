@@ -1,6 +1,6 @@
 //! Short, opt-in physical GPU regression. No existing media are modified.
 use hdr10plus::{hevc::encode_hdr10plus_nal, metadata::Hdr10PlusMetadata};
-use histv_lib::{hdr10plus_pipeline as hdr, EventSink, QueueItem};
+use video_transcoder_lib::{hdr10plus_pipeline as hdr, EventSink, QueueItem};
 use sha2::{Digest, Sha256};
 use std::{path::Path, process::Command};
 
@@ -461,7 +461,7 @@ async fn opt_in_preserves_sparse_late_metadata_with_cpu_or_gpu_decode() {
     for enabled in [false, true] {
         for gpu in [false, true] {
             let dest = root.path().join(format!("output-{enabled}-{gpu}"));
-            let mut command = Command::new(env!("CARGO_BIN_EXE_histv-cli"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_video-transcoder-cli"));
             command
                 .args([
                     "--codec",
