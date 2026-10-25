@@ -1,294 +1,124 @@
-# Honey, I Shrunk The Vids
+# Video Transcoder
 
-[![Quillx](https://raw.githubusercontent.com/qainsights/quillx/main/badges/quillx-4.svg)](https://github.com/qainsights/quillx) Architecture, integration decisions, and review are mine. Claude generated the implementation under close direction. Output reviewed line by line (but that doesn't mean I caught everything).
+A cross-platform batch video encoder built around **FFmpeg**, with a desktop interface and a headless command-line tool. Add a queue, choose a target bitrate or quality mode, and let the application decide whether each file should be copied or encoded.
 
-A cross-platform batch video encoder that shrinks your video files to a target quality level. No need to babysit the queue or tweak settings per file - just pick a target bitrate, add your files, and hit start.
+> **Fork status:** This project is a fork of [obelisk-complex/histv-universal](https://github.com/obelisk-complex/histv-universal). The **Video Transcoder** rebrand, including executable names and application identity, is being developed separately in [PR #10](https://github.com/kalzEOS/video-transcoder/pull/10). Until that PR is merged and tested, builds from `main` may still carry the original HISTV identifiers. The README work itself changes no application code.
 
-Available as a desktop app and a headless CLI for servers (see [CLI-README.md](CLI-README.md)) The CLI can be used with Sonarr/Radarr via Custom Script; please see the [Sonarr-Radarr Guide](Sonarr-Radarr-Integration.md) for details. Both GUI and CLI use the same encoding engine for compatibility and maintainability. Portable binaries are on the GitHub [Releases page](https://github.com/obelisk-complex/histv-universal/releases).
+## Highlights
 
----
+- **Batch processing:** add files and folders, inspect per-file decisions, reorder the queue, pause or cancel, and monitor progress.
+- **Smart bitrate decisions:** copy compatible files that are already below the threshold; use VBR for larger sources and QP/CRF for quality-based encodes.
+- **Hardware encoding:** detect and test supported encoders for AMD, Intel, NVIDIA and Apple platforms, with software fallback options. On Linux, VAAPI can use a selected render device.
+- **HDR handling:** preserve HDR10 color signaling and supported static metadata. Optional HDR10+ preservation for compatible 10-bit HEVC sources uses a separate metadata extraction, reinsertion and packaging pipeline.
+- **Audio and subtitles:** retain or convert audio according to selected settings and preserve compatible subtitle tracks.
+- **Output controls:** choose an output folder, write beside the source, or replace the source when requested.
+- **Safety features:** output-size checks, disk-space monitoring, MKV statistics-tag repair, and staging for network sources.
+- **Desktop and CLI:** the same encoding engine supports interactive desktop use and automation.
 
-### Screenshots
+## Important HDR details
+
+**HDR10 and HDR10+ are different.** HDR10 uses static metadata; HDR10+ adds dynamic scene/frame metadata. Re-encoding an HDR10+ source without the optional preservation pipeline generally produces HDR10 rather than preserving the HDR10+ metadata.
+
+The HDR10+ pipeline is more demanding than ordinary encoding: it needs extra disk space for intermediate files and packaging, and it can fail after the main video encode. Recent changes on `main` address disk-backed packaging workspace and file-size estimates, but **full-length output validation is still recommended**. Do not assume HDR10+ preservation succeeded based solely on an HDR badge or successful HEVC encoding.
+
+Dolby Vision is not the same as HDR10+. The supported HDR10-compatible base layer may be retained as HDR10, but Dolby Vision metadata preservation is not promised by this fork's documented workflow. Unsupported base layers should not be silently converted.
+
+## Screenshots
+
+These images are inherited from the upstream project and may not reflect the latest fork UI or branding.
+
 <details>
+<summary>View screenshots</summary>
 
-![](/screenshots/gui-1.png)
-
-![](/screenshots/gui-2.png)
-
-![](/screenshots/gui-3.png)
-
-![](/screenshots/gui-4.png)
-
-![](/screenshots/gui-5.png)
-
-![](/screenshots/gui-6.png)
-
-![](/screenshots/cli-1.png)
-
-![](/screenshots/cli-2.png)
-
-![](/screenshots/cli-3.png)
+![Desktop interface](screenshots/gui-1.png)
+![Desktop queue](screenshots/gui-2.png)
+![Desktop settings](screenshots/gui-3.png)
+![CLI interface](screenshots/cli-1.png)
 
 </details>
 
-## Features
+## Getting the application
 
-<details>
-<summary><strong>Full feature list</strong></summary>
+Check this fork's [Releases](https://github.com/kalzEOS/video-transcoder/releases) for any published builds. **A release may not yet be available for the latest changes.** Development builds can be created from source as described below. Do not confuse upstream releases with releases of this fork.
 
-- **Queue management** - drag-and-drop, clipboard paste (Ctrl+V), file/folder picker. Click, Shift+click, Ctrl+click, Ctrl+A, Delete. Right-click context menu (also Shift+F10 for keyboard users). Drag to reorder.
-- **GIF/APNG/WebP support** - animated GIFs, APNGs, and WebPs are converted to proper video files automatically.
-- **Per-file codec resolution** - the app decides the codec, container, and audio handling for each file individually based on its source properties. H.264 stays H.264, HEVC stays HEVC, and everything else converts to HEVC. No manual codec selection needed.
-- **AV1 support** - first-class AV1 encoding via libsvtav1 and hardware AV1 encoders (AMF, NVENC, QSV, VideoToolbox, VAAPI). Enable Preserve AV1 to keep AV1 sources as AV1 instead of converting to HEVC.
-- **Compatibility Mode** - one checkbox to force H.264/MP4/AAC output for maximum device compatibility.
-- **Smart decisions** - the app figures out what to do with each file before you start. Files that are already small enough get copied untouched. Files that are too big get shrunk. The queue shows the plan in real time as you change settings.
-- **GPU encoding** - tests your GPU at startup and picks the fastest working encoder for each codec family (HEVC, H.264, AV1). Falls back to software automatically if the GPU encoder fails mid-file.
-- **QP / CRF quality modes** - two ways to control quality when files are below your target bitrate. QP gives predictable sizes; CRF gives better-looking results with less predictable sizes.
-- **Precision mode** - one checkbox for the best possible quality. Uses software encoding with smart analysis that adapts to your system's RAM. Tests a few short clips first to make sure it won't make the file bigger. Slower, but produces the smallest file that still looks great.
-- **VBR peak ceiling** - controls how much the bitrate can spike on action-heavy scenes (1.5x to 3x). Higher values look better on complex content.
-- **Audio handling** - each audio track is handled separately. Tracks already below 640kbps are copied as-is. Tracks above the cap are re-encoded to the same codec at the cap. Codecs with no ffmpeg encoder (DTS, TrueHD) fall back to EAC3. Compatibility Mode forces AAC.
-- **HDR10 and bit depth** - Source 8-bit stays 8-bit and 10-bit stays 10-bit. HDR10 color signaling and static metadata are checked after encoding. Valid Dolby Vision Profile 8.1 HDR10 base layers encode as HDR10. No automatic tone mapping or dynamic metadata processing.
-- **Pre-flight checks** - Unsupported Dolby Vision base layers trigger an explicit warning and cannot be re-encoded into incorrect HDR10 colors. No MP4Box download or forced container change.
-- **Subtitles** - all subtitle tracks are kept.
-- **Output options** - save to a folder, next to the source file, or replace the source. Container is preserved per-file (MKV stays MKV, MP4 stays MP4, MOV stays MOV; other formats default to MKV).
-- **Queue columns** - source file size, estimated compressed size, resolution, HDR type badge (DV8, HDR10+, HDR10, HLG, SDR), source and target bitrates, and resizable column headers.
-- **Size safety net** - if the encoded file ends up meaningfully bigger than the original (accounting for container overhead based on frame rate and audio streams), the app throws it away and copies the original into the new container instead. Files already below the target threshold are copied without re-encoding.
-- **MKV tag repair** - detects and corrects stale stream statistics tags left behind by ffmpeg and third-party muxing tools, so bitrate decisions use the real numbers. Runs automatically at import and after each encode, with optional manual deep repair for severely corrupted metadata.
-- **Performance controls** - limit CPU threads and/or run encoding at low priority so your PC stays usable.
-- **ETA** - shows estimated time remaining in the progress bar and the window title, so you can see it from the taskbar.
-- **Batch controls** - start, pause, cancel current file, cancel everything. Progress bars per file and overall. Files added mid-batch are picked up automatically.
-- **Dry run** - shows what the app would do without actually encoding anything.
-- **Network drive support** - detects files on network shares and stages them locally in waves before encoding, so slow networks don't bottleneck the encoder. Wave planning groups files to fit available staging space, stages an entire wave at once, encodes, cleans up, and repeats.
-- **Disk space monitoring** - pauses encoding if your drive gets too full, resumes when space frees up.
-- **Post-batch actions** - shut down, sleep, log out, or run a custom command when the batch finishes.
-- **Log console** - colour-coded log with filters, optional file export.
-- **Notifications** - system notification when the batch finishes.
-- **Auto-clear** - optionally clears finished items from the queue.
-- **Flatpak support** - available as a Flatpak bundle for Linux with host filesystem access so ffmpeg subprocesses can reach your files directly.
-- **Themes** - six built-in themes (dark, light, and four community-inspired palettes). Create your own with just 6 colour values - the app derives everything else automatically. See [THEMES.md](THEMES.md).
-- **ffmpeg downloader** - offers to download ffmpeg for you if it's not installed.
-- **Remembers settings** - everything is saved to config.json in the same folder as the .exe, and restored on next launch.
-- **CLI version** - same engine as a command-line tool for servers and scripts. Shows a persistent queue table during encoding matching the GUI's columns. See [CLI-README.md](CLI-README.md).
+On Linux, the AppImage can be launched after granting execute permission:
 
-</details>
-
-## Download
-
-Grab the latest build from the GitHub **[Releases page](https://github.com/obelisk-complex/histv-universal/releases)**.
-
-Each platform has a standard build (you provide ffmpeg) and a **-full** build (ffmpeg included). The full builds are larger but work out of the box with no extra setup.
-
-**Standard builds** - ffmpeg not included:
-
-| Platform | GUI | CLI |
-|----------|-----|-----|
-| **Windows** | `histv-windows.exe` | `histv-cli-windows.exe` |
-| **Linux** | `.AppImage` | `histv-cli-linux` |
-| **macOS (Apple Silicon)** | `.dmg` (arm64) | `histv-cli-macos-arm64` |
-| **macOS (Intel)** | `.dmg` (x64) | `histv-cli-macos-x64` |
-
-**Full builds** - ffmpeg included, no extra dependencies:
-
-| Platform | GUI | CLI |
-|----------|-----|-----|
-| **Windows** | `histv-windows-full.zip` | `histv-cli-windows-full.zip` |
-| **Linux** | `histv-linux-full.AppImage` | `histv-cli-linux-full.tar.gz` |
-| **macOS (Apple Silicon)** | `histv-macos-arm64-full.dmg` | `histv-cli-macos-arm64-full.tar.gz` |
-| **macOS (Intel)** | `histv-macos-x64-full.dmg` | `histv-cli-macos-x64-full.tar.gz` |
-
-**Flatpak** - sandboxed Linux build with ffmpeg included:
-
-| Platform | GUI |
-|----------|-----|
-| **Linux** | `histv-linux.flatpak` |
-
-The Flatpak bundles ffmpeg and has host filesystem access for encoding. The CLI is not included in the Flatpak.
-
-All binaries are portable - no installation needed. On Linux, mark the AppImage executable (`chmod +x`). On macOS, open the DMG and drag to Applications. On Windows, extract the zip to a folder.
-
-<details>
-<summary><strong>Linux display troubleshooting</strong></summary>
-
-HISTV sets three environment variables before GTK initialises to work around WebKitGTK rendering issues on Wayland. These are only set if you haven't already set them yourself:
-
-| Variable | Default | What it does |
-|----------|---------|-------------|
-| `WEBKIT_DISABLE_DMABUF_RENDERER` | `1` | Disables DMA-buf buffer sharing. Fixes `EGL_BAD_PARAMETER` and GBM buffer failures on AMD RDNA3+, some Intel iGPUs, and NVIDIA with Wayland. |
-| `WEBKIT_DISABLE_COMPOSITING_MODE` | `1` | Disables GPU compositing entirely. Catches EGL display creation failures that the DMA-buf fix alone doesn't cover. |
-| `__NV_DISABLE_EXPLICIT_SYNC` | `1` | Disables NVIDIA explicit sync. Fixes blank/flickering windows on NVIDIA 545+ drivers with Wayland. |
-
-If your system handles Wayland rendering correctly and you want GPU compositing back, override any of these before launching:
-
-```bash
-WEBKIT_DISABLE_COMPOSITING_MODE=0 WEBKIT_DISABLE_DMABUF_RENDERER=0 ./histv
+```sh
+chmod +x ./Video-Transcoder*.AppImage
+./Video-Transcoder*.AppImage
 ```
 
-The Flatpak respects these overrides via `flatpak run --env=VARIABLE=VALUE com.histv.encoder` or by setting them in your shell before `flatpak run`.
+Replace the wildcard with the actual filename if your downloaded or locally built AppImage uses another name.
 
-</details>
+FFmpeg and FFprobe are required for media processing. The desktop application can look for available binaries or offer downloads, depending on build configuration. HDR10+ packaging may also require **MP4Box (GPAC)**, supplied by the build or installed separately. Tool availability varies by package.
 
-If you use a standard build, ffmpeg is required. The GUI offers to download it on first launch. The CLI expects it on your PATH (`apt install ffmpeg`, `brew install ffmpeg`, `choco install ffmpeg`, etc.).
+## Build from source
 
-| OS | Architecture | GPU encoders |
-|----|-------------|-------------|
-| Windows | x86_64 | AMF, NVENC, QSV |
-| Linux | x86_64 | VAAPI, NVENC, QSV |
-| macOS | x86_64 / ARM64 | VideoToolbox |
+Prerequisites: a stable Rust toolchain, the Tauri v2 CLI, and [Tauri's platform-specific build dependencies](https://v2.tauri.app/start/prerequisites/).
 
-Hardware encoder detection covers HEVC, H.264, and AV1 codec families on all platforms. Each encoder is verified with a test encode at startup.
+From the repository root:
 
-<details>
-<summary><strong>Building from source</strong></summary>
+```sh
+# Check the Rust code
+cd src-tauri
+cargo check --release
+cd ..
 
-Requires Rust (stable) and the Tauri v2 CLI. See the [Tauri prerequisites guide](https://v2.tauri.app/start/prerequisites/) for platform-specific dependencies.
+# Run frontend tests
+node --test src/js/*.test.js
 
-```bash
-# GUI
-cargo install tauri-cli --version "^2"
-cargo tauri build
+# Build a Linux AppImage
+cd src-tauri
+cargo tauri build --bundles appimage
+```
 
-# CLI (no GUI/Tauri/WebKit dependencies)
+The Linux AppImage normally appears under `src-tauri/target/release/bundle/appimage/`.
+
+For a headless CLI build on the **current main branch**:
+
+```sh
 cargo build --manifest-path src-tauri/Cargo.toml --release --bin histv-cli --no-default-features --features cli
 ```
 
-**Cargo features:**
+After the separate rebrand PR is merged, the CLI target will be `video-transcoder-cli`. Do not change the command until the branch you are building actually contains that rename.
 
-| Feature | Default | What it gates |
-|---------|---------|---------------|
-| `custom-protocol` | GUI | Tauri custom-protocol handler (required for release GUI builds) |
-| `downloader` | GUI | In-app ffmpeg downloader (pulls in `reqwest` + `futures-util`); GUI-only — the CLI expects ffmpeg on your PATH |
-| `cli` | CLI | Builds the headless `histv-cli` binary without any Tauri/GTK/WebKit dependencies |
+## How decisions work
 
-</details>
+| Source / setting | Typical behavior |
+| --- | --- |
+| Compatible file already small enough | Copy without re-encoding |
+| Source above target bitrate | Re-encode using VBR |
+| Quality-based mode | Encode using QP or CRF, depending on encoder/settings |
+| Compatibility mode | Prefer H.264/MP4/AAC for broad playback support |
+| HDR10 source | Preserve compatible 10-bit HDR10 signaling |
+| HDR10+ preservation explicitly enabled | Run additional metadata processing for supported HEVC inputs |
 
-## How it works
+**File-size estimates are estimates, not guarantees.** Actual VBR output depends on encoder rate control and source complexity. The interface should distinguish target-budget projections from measured sizes.
 
-You set a target bitrate and the app decides what to do with each file:
+## CLI and integrations
 
-| Situation | What happens |
-|-----------|-------------|
-| Already small enough, same codec family | **Copied as-is** - no re-encoding |
-| Already small enough, different codec | **Re-encoded for quality** using QP or CRF into the target codec |
-| Too big | **Shrunk** to hit the target bitrate using VBR encoding |
-| Zero bitrate / unreadable header | **Re-encoded for quality** using QP or CRF |
-| GIF, APNG, or animated WebP | **Always re-encoded** into a proper video |
+The headless CLI supports dry runs, batch settings, file/folder input, overwrite policies, hardware encoding and scripting. See the existing [CLI guide](CLI-README.md) and [Sonarr/Radarr integration guide](Sonarr-Radarr-Integration.md).
 
-The target codec is determined per-file: H.264 sources stay H.264, HEVC sources stay HEVC, and everything else (MPEG-2, VP9, etc.) converts to HEVC. With Preserve AV1 enabled, AV1 sources stay AV1. With Compatibility Mode, everything becomes H.264/MP4.
+> Those guides are inherited from upstream and may still use the legacy `histv-cli` command and describe behavior from older versions. Verify flags with `--help` for the exact binary you built.
 
-Files within 15% above the threshold that are already in the target codec are also copied rather than re-encoded, to avoid wasting time on marginal gains.
+## Linux and Wayland
 
-If an encode makes the file meaningfully bigger than it was (accounting for container overhead), the app throws away the encode and copies the original into the new container instead. Small size increases from container format differences are tolerated.
+The application contains WebKitGTK compatibility workarounds for some Linux GPU/Wayland combinations. If the UI has display problems, consult the Tauri/WebKitGTK prerequisites and the application's launch environment before changing your GPU encoding settings. UI rendering and FFmpeg's video encoder are separate subsystems.
 
-### HDR10 baseline
+## Development and testing
 
-The normal re-encoding path preserves source bit depth, color primaries, transfer,
-matrix, range, and supported HDR10 static mastering/content-light metadata. A
-bounded output decode probe rejects errors and lost required HDR10 properties.
-MKV stays MKV in Auto container mode. Audio Copy bypasses bitrate caps; Auto
-retains the existing capped conversion policy. Supported subtitle streams are
-mapped to the selected container.
+Before publishing a build, verify:
 
-| Source | Re-encoding behavior |
-|--------|----------------------|
-| SDR 8-bit / 10-bit | Keep the original bit depth and SDR signaling |
-| HDR10 / HLG | Keep source bit depth, HDR color signaling and static metadata |
-| Dolby Vision Profile 8.1 with verified 10-bit BT.2020/PQ base | Encode the HDR10 base; Dolby Vision is discarded |
-| Other/unknown Dolby Vision base-layer compatibility | Block re-encoding with an explicit warning; retain original |
-| HDR10+ | Preserve standard HDR10; dynamic metadata is not promised |
+1. Rust compilation and tests, including CLI-feature builds.
+2. JavaScript tests.
+3. Desktop startup, queue import, settings persistence, and encoder detection.
+4. A short real-source encode and playback check, including audio/subtitle sync.
+5. For HDR10+, actual dynamic metadata presence and playback across the resulting file, not just the initial frames.
 
-There is no full-movie dynamic metadata extraction, reinsertion, packaging, or
-verification pipeline. MP4Box is not required. No HDR10+ preservation mode is
-enabled: reliable preservation would require additional bitstream work, which
-conflicts with this baseline's speed and simplicity priorities.
+The [rebranding PR](https://github.com/kalzEOS/video-transcoder/pull/10) additionally needs settings-migration and packaging checks before merging.
 
-On Linux, enable **Hardware Decoding (GPU)** to try supported 8/10-bit VAAPI
-decoding on the same verified render device as encoding. Failed or incompatible
-GPU decoding retries with CPU decoding while retaining the GPU encoder. The
-checkbox keeps its saved preference. Intel QSV device selection is independent.
+## Project background and credit
 
-See [the HDR10 baseline validation notes](docs/HDR10-baseline.md) for the scope
-of physical testing, metadata limitations, and recovery snapshot details.
+Video Transcoder is a fork of **[Honey, I Shrunk The Vids](https://github.com/obelisk-complex/histv-universal)** by **obelisk-complex** and contributors. The original project provided the batch-encoding architecture and much of the codebase. This fork develops Linux/AMD detection, HDR workflows, size-reporting and packaging improvements. Credit and license notices remain in the repository.
 
-### Precision mode
-
-One checkbox for the best quality the app can produce. It picks the smartest encoding strategy based on how much RAM your system has:
-
-| Your RAM | What it does |
-|----------|-------------|
-| 16GB or more | Looks 250 frames ahead to plan bitrate (single pass) |
-| 8-16GB | Looks 120 frames ahead to plan bitrate (single pass) |
-| Under 8GB | Scans the whole file first, then encodes (two passes) |
-
-Before starting the full encode, it tests a few short clips to make sure the result won't end up bigger than the original. If it would, the app switches to a safer mode automatically.
-
-### Who HISTV is for
-
-People with a pile of video files at different sizes and formats who want to shrink the big ones without fiddling with every file individually. Set the target, add the files, walk away.
-
-### How HISTV compares to other tools
-<details>
-
-**vs. HandBrake** - HandBrake is built for tweaking every file individually. HISTV is built for doing a whole folder at once without thinking about it. It figures out per-file whether to shrink, copy, or re-encode. If you want fine control over every setting on every file, HandBrake is the better tool.
-
-**vs. Tdarr** - Tdarr runs as a server with plugins, Docker, and a web dashboard. HISTV is an app you open, use, and close.
-
-**vs. writing your own ffmpeg script** - HISTV handles the parts that are annoying to script: figuring out what each file needs, picking the right encoder, falling back when hardware fails, prompting for overwrites, pausing/resuming, and cleaning up after itself.
-
-</details>
-
-<details>
-<summary><strong>Project structure</strong></summary>
-
-```
-├── src/                        # Frontend (HTML + CSS + JS)
-│   ├── index.html
-│   ├── js/app.js
-│   └── css/app.css
-├── src-tauri/
-│   ├── Cargo.toml
-│   ├── tauri.conf.json
-│   ├── build.rs
-│   └── src/
-│       ├── main.rs             # GUI entry point
-│       ├── cli_main.rs         # CLI entry point
-│       ├── lib.rs              # Tauri commands, app setup, shared state
-│       ├── encoder.rs          # Encoder detection, flag mapping, batch loop
-│       ├── ffmpeg.rs           # Binary resolution, download, spawning
-│       ├── probe.rs            # Media probing via ffprobe (DV/HDR10+ detection)
-│       ├── queue.rs            # Queue data structures, file collection
-│       ├── encoder_devices.rs  # Dedicated GPU ranking, independent Intel QSV
-│       ├── video_format.rs     # Bit depth, HDR10 policy and color validation
-│       ├── pipeline_progress.rs # UI stage and cancellation forwarding
-│       ├── mkv_tags.rs         # MKV stream statistics tag repair (EBML)
-│       ├── webp_decode.rs      # Animated WebP RIFF parser + decode pipeline
-│       ├── events.rs           # EventSink + BatchControl traits
-│       ├── config.rs           # GUI persistent settings
-│       ├── themes.rs           # Theme loading + built-in themes
-│       ├── tauri_sink.rs       # GUI EventSink (Tauri emit)
-│       ├── tauri_batch_control.rs  # GUI BatchControl (Mutex + emit)
-│       ├── cli.rs              # CLI arg parsing (clap) + job files
-│       ├── cli_sink.rs         # CLI EventSink (stderr + indicatif)
-│       ├── batch_control.rs    # CLI BatchControl (atomics + TTY prompts)
-│       ├── remote.rs           # Network mount detection + caching
-│       ├── staging.rs          # Wave-based local staging for remote files
-│       └── disk_monitor.rs     # Disk-space estimation + runtime monitoring
-├── .github/workflows/          # CI: per-platform builds
-├── THEMES.md                   # Theme creation guide
-├── CLI-README.md               # CLI documentation
-├── Sonarr-Radarr-Integration.md
-└── README.md
-```
-
-</details>
-
-### Licence
-
-[GPL-3.0-or-later](LICENSE)
-
-### Third-party software
-
-The **-full** builds bundle [FFmpeg](https://ffmpeg.org) and [MP4Box](https://gpac.io) (GPAC). FFmpeg is licensed under the [GNU General Public Licence v2+](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html). The bundled FFmpeg binaries are unmodified static GPL builds from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) (Windows/Linux) and [evermeet.cx](https://evermeet.cx/ffmpeg/) (macOS). MP4Box is licensed under the [GNU Lesser General Public Licence v2.1+](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html). The corresponding source code is available from those repositories. We will provide the source on request for three years from the date of each release - file an issue on this repo.
-
-This HDR10 baseline no longer includes the Dolby Vision/HDR10+ processing crates or requires MP4Box. The CachyOS AppImage uses the installed `/usr/bin/ffmpeg` and `/usr/bin/ffprobe` with host graphics libraries. The description of earlier full builds above is retained for historical releases.
-
-This software is based in part on the work of the Independent JPEG Group. See [THIRD-PARTY-LICENCES](THIRD-PARTY-LICENCES) for full details.
+This project is distributed under **[GPL-3.0-or-later](LICENSE)**. See [THIRD-PARTY-LICENCES](THIRD-PARTY-LICENCES) for third-party notices. FFmpeg and GPAC have their own licenses and redistribution requirements.
