@@ -1,4 +1,4 @@
-# Honey, I Shrunk The Vids
+# Video Transcoder
 
 [![Quillx](https://raw.githubusercontent.com/qainsights/quillx/main/badges/quillx-4.svg)](https://github.com/qainsights/quillx) Architecture, integration decisions, and review are mine. Claude generated the implementation under close direction. Output reviewed line by line (but that doesn't mean I caught everything).
 
