@@ -1,11 +1,11 @@
-id: com.histv.encoder
+id: com.kalzi.videotranscoder
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 
-command: histv
+command: video-transcoder
 appstream-compose: false
 
 inherit-extensions:
@@ -39,12 +39,12 @@ modules:
       - install -Dm644 LICENSE.txt /app/share/licenses/ffmpeg/LICENSE.txt
 
   # ── HISTV (built from source with vendored cargo deps) ──
-  - name: histv
+  - name: video-transcoder
     buildsystem: simple
     build-options:
       append-path: /usr/lib/sdk/rust-stable/bin
       env:
-        CARGO_HOME: /run/build/histv/cargo-home
+        CARGO_HOME: /run/build/video-transcoder/cargo-home
     sources:
       # For local builds, use type: dir.  For Flathub, switch to:
       #   type: git
@@ -67,7 +67,7 @@ modules:
           # Configure cargo for offline vendored build
           - mkdir -p cargo-home
           - >-
-            printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "/run/build/histv/cargo/vendor"\n'
+            printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "/run/build/video-transcoder/cargo/vendor"\n'
             > cargo-home/config.toml
     build-commands:
       - >-
@@ -75,19 +75,19 @@ modules:
         --manifest-path src-tauri/Cargo.toml
         --no-default-features
         --features custom-protocol,dovi
-      - install -Dm755 src-tauri/target/release/histv /app/bin/histv
+      - install -Dm755 src-tauri/target/release/video-transcoder /app/bin/video-transcoder
       # Themes (looked up adjacent to binary)
       - install -d /app/bin/themes
       - cp src-tauri/themes/*.json /app/bin/themes/
       # Desktop integration
-      - install -Dm644 com.histv.encoder.desktop /app/share/applications/com.histv.encoder.desktop
-      - install -Dm644 com.histv.encoder.metainfo.xml /app/share/metainfo/com.histv.encoder.metainfo.xml
+      - install -Dm644 com.kalzi.videotranscoder.desktop /app/share/applications/com.kalzi.videotranscoder.desktop
+      - install -Dm644 com.kalzi.videotranscoder.metainfo.xml /app/share/metainfo/com.kalzi.videotranscoder.metainfo.xml
       # Icons
-      - install -Dm644 src-tauri/icons/32x32.png /app/share/icons/hicolor/32x32/apps/com.histv.encoder.png
-      - install -Dm644 src-tauri/icons/64x64.png /app/share/icons/hicolor/64x64/apps/com.histv.encoder.png
-      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/com.histv.encoder.png
-      - install -Dm644 src-tauri/icons/256x256.png /app/share/icons/hicolor/256x256/apps/com.histv.encoder.png
-      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/512x512/apps/com.histv.encoder.png
+      - install -Dm644 src-tauri/icons/32x32.png /app/share/icons/hicolor/32x32/apps/com.kalzi.videotranscoder.png
+      - install -Dm644 src-tauri/icons/64x64.png /app/share/icons/hicolor/64x64/apps/com.kalzi.videotranscoder.png
+      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/com.kalzi.videotranscoder.png
+      - install -Dm644 src-tauri/icons/256x256.png /app/share/icons/hicolor/256x256/apps/com.kalzi.videotranscoder.png
+      - install -Dm644 src-tauri/icons/icon.png /app/share/icons/hicolor/512x512/apps/com.kalzi.videotranscoder.png
       # -t skips the index.theme existence check; the hicolor theme's
       # index.theme lives in the runtime at /usr/share/icons/hicolor,
       # not in /app/share/icons/hicolor where we install app icons.

@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>com.histv.encoder</id>
+  <id>com.kalzi.videotranscoder</id>
   <name>Video Transcoder</name>
   <summary>Batch video encoder with smart bitrate decisions</summary>
-  <developer id="com.histv">
-    <name>obelisk-complex</name>
+  <developer id="com.kalzi">
+    <name>kalzEOS</name>
   </developer>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
@@ -23,13 +23,13 @@
     </p>
   </description>
 
-  <url type="homepage">https://github.com/obelisk-complex/histv-universal</url>
-  <url type="bugtracker">https://github.com/obelisk-complex/histv-universal/issues</url>
+  <url type="homepage">https://github.com/kalzEOS/video-transcoder</url>
+  <url type="bugtracker">https://github.com/kalzEOS/video-transcoder/issues</url>
 
-  <launchable type="desktop-id">com.histv.encoder.desktop</launchable>
+  <launchable type="desktop-id">com.kalzi.videotranscoder.desktop</launchable>
 
   <provides>
-    <binary>histv</binary>
+    <binary>video-transcoder</binary>
   </provides>
 
   <branding>
