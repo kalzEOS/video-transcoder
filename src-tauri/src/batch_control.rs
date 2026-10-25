@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use histv_lib::events::BatchControl;
+use video_transcoder_lib::events::BatchControl;
 
 use crate::cli::{FallbackPolicy, OverwritePolicy};
 
@@ -183,7 +183,7 @@ fn read_tty_line() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use histv_lib::events::BatchControl;
+    use video_transcoder_lib::events::BatchControl;
 
     // Helper: construct a CliBatchControl with given policies.
     // The ctrlc handler may fail to register in test environments
