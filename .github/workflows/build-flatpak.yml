@@ -43,7 +43,7 @@ jobs:
           set -e
           python3 - <<'PYEOF'
           import yaml, os
-          data = yaml.safe_load(open('com.histv.encoder.yml'))
+          data = yaml.safe_load(open('com.kalzi.videotranscoder.yml'))
           mod = next(m for m in data['modules'] if m['name'] == 'ffmpeg')
           src = next(s for s in mod['sources'] if s['type'] == 'archive')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
@@ -122,22 +122,22 @@ jobs:
       - name: Build Flatpak from source manifest
         run: |
           set -e
-          flatpak-builder --user --force-clean --repo=flatpak-repo flatpak-build com.histv.encoder.yml
+          flatpak-builder --user --force-clean --repo=flatpak-repo flatpak-build com.kalzi.videotranscoder.yml
 
       - name: Export Flatpak bundle
         run: |
           set -e
-          flatpak build-bundle flatpak-repo histv-linux.flatpak com.histv.encoder
+          flatpak build-bundle flatpak-repo video-transcoder-linux.flatpak com.kalzi.videotranscoder
 
       - name: Upload artefact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: histv-linux-flatpak
-          path: histv-linux.flatpak
+          name: video-transcoder-linux-flatpak
+          path: video-transcoder-linux.flatpak
           retention-days: 14
 
       - name: Upload to GitHub Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
-          files: histv-linux.flatpak
+          files: video-transcoder-linux.flatpak
