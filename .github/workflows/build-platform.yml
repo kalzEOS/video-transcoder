@@ -122,7 +122,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          cargo build --release --bin histv-cli --no-default-features --features cli --target "${{ inputs.target }}"
+          cargo build --release --bin video-transcoder-cli --no-default-features --features cli --target "${{ inputs.target }}"
 
       - name: Collect artefacts
         shell: bash
@@ -133,9 +133,9 @@ jobs:
           LABEL="${{ inputs.label }}"
 
           # Portable Windows exe (GUI)
-          PORTABLE="$GITHUB_WORKSPACE/src-tauri/target/$TARGET/release/histv.exe"
+          PORTABLE="$GITHUB_WORKSPACE/src-tauri/target/$TARGET/release/video-transcoder.exe"
           if [ -f "$PORTABLE" ]; then
-            cp "$PORTABLE" "artefacts/histv-$LABEL.exe"
+            cp "$PORTABLE" "artefacts/video-transcoder-$LABEL.exe"
           fi
 
           # AppImage (Linux portable GUI)
@@ -147,16 +147,16 @@ jobs:
           # CLI binary
           case "$LABEL" in
             windows)
-              CLI_SRC="$GITHUB_WORKSPACE/src-tauri/target/$TARGET/release/histv-cli.exe"
-              CLI_DEST="artefacts/histv-cli-windows.exe"
+              CLI_SRC="$GITHUB_WORKSPACE/src-tauri/target/$TARGET/release/video-transcoder-cli.exe"
+              CLI_DEST="artefacts/video-transcoder-cli-windows.exe"
               ;;
             linux)
-              CLI_SRC="$GITHUB_WORKSPACE/src-tauri/target/$TARGET/release/histv-cli"
-              CLI_DEST="artefacts/histv-cli-linux"
+              CLI_SRC="$GITHUB_WORKSPACE/src-tauri/target/$TARGET/release/video-transcoder-cli"
+              CLI_DEST="artefacts/video-transcoder-cli-linux"
               ;;
             macos-*)
-              CLI_SRC="$GITHUB_WORKSPACE/src-tauri/target/$TARGET/release/histv-cli"
-              CLI_DEST="artefacts/histv-cli-$LABEL"
+              CLI_SRC="$GITHUB_WORKSPACE/src-tauri/target/$TARGET/release/video-transcoder-cli"
+              CLI_DEST="artefacts/video-transcoder-cli-$LABEL"
               ;;
           esac
 
@@ -239,19 +239,19 @@ jobs:
           set -e
           # GUI full - zip with ffmpeg
           mkdir -p bundle-gui
-          cp "artefacts/histv-windows.exe" bundle-gui/
+          cp "artefacts/video-transcoder-windows.exe" bundle-gui/
           cp ffmpeg-bin/ffmpeg.exe bundle-gui/
           cp ffmpeg-bin/ffprobe.exe bundle-gui/
           cp THIRD-PARTY-LICENCES bundle-gui/
-          cd bundle-gui && 7z a -tzip -mx=9 ../artefacts/histv-windows-full.zip * && cd ..
+          cd bundle-gui && 7z a -tzip -mx=9 ../artefacts/video-transcoder-windows-full.zip * && cd ..
 
           # CLI full - zip with ffmpeg
           mkdir -p bundle-cli
-          cp "artefacts/histv-cli-windows.exe" bundle-cli/
+          cp "artefacts/video-transcoder-cli-windows.exe" bundle-cli/
           cp ffmpeg-bin/ffmpeg.exe bundle-cli/
           cp ffmpeg-bin/ffprobe.exe bundle-cli/
           cp THIRD-PARTY-LICENCES bundle-cli/
-          cd bundle-cli && 7z a -tzip -mx=9 ../artefacts/histv-cli-windows-full.zip * && cd ..
+          cd bundle-cli && 7z a -tzip -mx=9 ../artefacts/video-transcoder-cli-windows-full.zip * && cd ..
 
       - name: Bundle full (Linux)
         if: inputs.label == 'linux'
@@ -291,7 +291,7 @@ jobs:
           # when the AppImage is mounted on a different machine. Replace with a
           # real copy so file managers can display the icon.
           rm -f squashfs-root/.DirIcon
-          ICON_SRC=$(find squashfs-root/usr/share/icons/hicolor -name 'histv.png' -path '*/512x512/*' -print -quit 2>/dev/null || find squashfs-root/usr/share/icons/hicolor -name 'histv.png' -print -quit 2>/dev/null)
+          ICON_SRC=$(find squashfs-root/usr/share/icons/hicolor -name 'video-transcoder.png' -path '*/512x512/*' -print -quit 2>/dev/null || find squashfs-root/usr/share/icons/hicolor -name 'video-transcoder.png' -print -quit 2>/dev/null)
           if [ -n "$ICON_SRC" ]; then
             cp "$ICON_SRC" squashfs-root/.DirIcon
           fi
@@ -301,15 +301,15 @@ jobs:
           curl -fSL --retry 3 -o appimagetool "$APPIMAGETOOL_URL"
           echo "${APPIMAGETOOL_SHA256}  appimagetool" | sha256sum -c -
           chmod +x appimagetool
-          ARCH=x86_64 ./appimagetool --appimage-extract-and-run squashfs-root/ artefacts/histv-linux-full.AppImage
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run squashfs-root/ artefacts/video-transcoder-linux-full.AppImage
 
           # CLI full - tar.gz with ffmpeg
           mkdir -p bundle-cli
-          cp "artefacts/histv-cli-linux" bundle-cli/
+          cp "artefacts/video-transcoder-cli-linux" bundle-cli/
           cp ffmpeg-bin/ffmpeg bundle-cli/
           cp ffmpeg-bin/ffprobe bundle-cli/
           cp THIRD-PARTY-LICENCES bundle-cli/
-          tar czf artefacts/histv-cli-linux-full.tar.gz -C bundle-cli .
+          tar czf artefacts/video-transcoder-cli-linux-full.tar.gz -C bundle-cli .
 
       - name: Bundle full (macOS)
         if: startsWith(inputs.label, 'macos')
@@ -343,20 +343,20 @@ jobs:
             -srcfolder dmg-contents \
             -format UDZO \
             -ov \
-            "artefacts/histv-$LABEL-full.dmg"
+            "artefacts/video-transcoder-$LABEL-full.dmg"
 
           rm -rf dmg-contents
 
           # CLI full - tar.gz with ffmpeg
           mkdir -p bundle-cli
-          cp "artefacts/histv-cli-$LABEL" bundle-cli/
+          cp "artefacts/video-transcoder-cli-$LABEL" bundle-cli/
           cp ffmpeg-bin/ffmpeg bundle-cli/
           cp ffmpeg-bin/ffprobe bundle-cli/
           cp THIRD-PARTY-LICENCES bundle-cli/
-          tar czf "artefacts/histv-cli-$LABEL-full.tar.gz" -C bundle-cli .
+          tar czf "artefacts/video-transcoder-cli-$LABEL-full.tar.gz" -C bundle-cli .
 
       - name: Upload artefacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: histv-${{ inputs.label }}
+          name: video-transcoder-${{ inputs.label }}
           path: artefacts/*
