@@ -1,4 +1,4 @@
-//! CLI entry point for histv-cli.
+//! CLI entry point for video-transcoder-cli.
 //!
 //! Parses arguments, resolves ffmpeg, detects encoders, collects files,
 //! probes them, and either prints a dry-run plan or encodes them.
@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use tokio::sync::Semaphore;
 
-use histv_lib::encoder::{self, EncodeDecision, EncoderInfo};
-use histv_lib::events::EventSink;
-use histv_lib::queue::{self, QueueItem, QueueItemStatus};
+use video_transcoder_lib::encoder::{self, EncodeDecision, EncoderInfo};
+use video_transcoder_lib::events::EventSink;
+use video_transcoder_lib::queue::{self, QueueItem, QueueItemStatus};
 
 fn main() {
     let mut args = cli::CliArgs::parse();
@@ -57,12 +57,12 @@ fn main() {
     let sink = Arc::new(cli_sink::CliSink::new(args.log_level.clone()));
 
     // Resolve ffmpeg/ffprobe binary paths (no resource dir for CLI)
-    histv_lib::ffmpeg::init(None, None, &*sink);
+    video_transcoder_lib::ffmpeg::init(None, None, &*sink);
 
     // Check ffmpeg availability
     let rt = tokio::runtime::Runtime::new().expect("Could not create tokio runtime");
 
-    if !rt.block_on(histv_lib::ffmpeg::is_available()) {
+    if !rt.block_on(video_transcoder_lib::ffmpeg::is_available()) {
         eprintln!("ERROR: ffmpeg not found. Install ffmpeg and ensure it is on your PATH.");
         std::process::exit(4);
     }
@@ -98,7 +98,7 @@ fn main() {
                 .to_path_buf(),
             cli::OutputMode::Folder => args.output.clone(),
         };
-        histv_lib::disk_monitor::partition_free_space(&output_path)
+        video_transcoder_lib::disk_monitor::partition_free_space(&output_path)
     };
 
     print_dry_run_plan(
@@ -142,7 +142,7 @@ fn collect_and_probe_files(
     is_tty: bool,
 ) -> Vec<QueueItem> {
     if args.inputs.is_empty() {
-        eprintln!("No input files specified. Use histv-cli --help for usage.");
+        eprintln!("No input files specified. Use video-transcoder-cli --help for usage.");
         std::process::exit(3);
     }
 
@@ -180,7 +180,7 @@ fn collect_and_probe_files(
         let sink_ref = sink.clone();
         handles.push(rt.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let result = histv_lib::probe::probe_file(&file_path, &*sink_ref).await;
+            let result = video_transcoder_lib::probe::probe_file(&file_path, &*sink_ref).await;
             (i, file_path, result)
         }));
     }
@@ -202,7 +202,7 @@ fn collect_and_probe_files(
             Ok(pr) => {
                 // Queue bitrate correction is read-only; repairing source tags
                 // requires the explicit repair command.
-                let repair = histv_lib::mkv_tags::estimate_bitrate_after_probe(
+                let repair = video_transcoder_lib::mkv_tags::estimate_bitrate_after_probe(
                     &file_path,
                     pr.duration_secs,
                     &pr.audio_streams,
@@ -304,9 +304,9 @@ fn run_repair_tags(
         }
 
         let result = if is_deep {
-            rt.block_on(histv_lib::mkv_tags::deep_repair(path, sink))
+            rt.block_on(video_transcoder_lib::mkv_tags::deep_repair(path, sink))
         } else {
-            rt.block_on(histv_lib::mkv_tags::repair_file_tags(path, sink))
+            rt.block_on(video_transcoder_lib::mkv_tags::repair_file_tags(path, sink))
         };
 
         if is_tty {
@@ -441,7 +441,7 @@ fn print_dry_run_plan(
     let decisions = compute_decisions(&probed_items, args, detected_encoders);
 
     // ── Remote mount detection ────────────────────────────────
-    let mut mount_cache = histv_lib::remote::MountCache::new();
+    let mut mount_cache = video_transcoder_lib::remote::MountCache::new();
     let remote_annotations: Vec<Option<String>> = probed_items
         .iter()
         .map(|item| match args.remote {
@@ -463,7 +463,7 @@ fn print_dry_run_plan(
         .collect();
 
     // ── Disk-space estimate ───────────────────────────────────
-    let batch_estimate = histv_lib::disk_monitor::estimate_batch(&probed_items, &decisions);
+    let batch_estimate = video_transcoder_lib::disk_monitor::estimate_batch(&probed_items, &decisions);
 
     // ── Encoder label ─────────────────────────────────────────
     let encoder_label = if is_hw_encoder {
@@ -524,7 +524,7 @@ fn print_dry_run_plan(
     for (item, decision) in probed_items.iter().zip(decisions.iter()) {
         let resolution = format!("{}x{}", item.probe.video_width, item.probe.video_height);
         let hdr_label = hdr_type_label(item);
-        let from_size = histv_lib::disk_monitor::format_bytes(item.source_bytes);
+        let from_size = video_transcoder_lib::disk_monitor::format_bytes(item.source_bytes);
         let to_size = format_estimated_size(item, decision);
 
         let from_br = source_bitrate_label(item);
@@ -598,8 +598,8 @@ fn print_dry_run_plan(
         eprintln!("{}Disk-space estimate:{}", bold, reset);
         eprintln!(
             "  Output partition:  {} total, {} free, {}% used",
-            histv_lib::disk_monitor::format_bytes(total_bytes),
-            histv_lib::disk_monitor::format_bytes(free_bytes),
+            video_transcoder_lib::disk_monitor::format_bytes(total_bytes),
+            video_transcoder_lib::disk_monitor::format_bytes(free_bytes),
             used_pct,
         );
 
@@ -618,17 +618,17 @@ fn print_dry_run_plan(
             let net_desc = if net < 0 {
                 format!(
                     "{} freed after batch",
-                    histv_lib::disk_monitor::format_bytes(net.unsigned_abs())
+                    video_transcoder_lib::disk_monitor::format_bytes(net.unsigned_abs())
                 )
             } else {
                 format!(
                     "{} additional after batch",
-                    histv_lib::disk_monitor::format_bytes(net as u64)
+                    video_transcoder_lib::disk_monitor::format_bytes(net as u64)
                 )
             };
             eprintln!(
                 "  With --delete-source:  up to {} needed during encoding, {}",
-                histv_lib::disk_monitor::format_bytes(peak_with_delete),
+                video_transcoder_lib::disk_monitor::format_bytes(peak_with_delete),
                 net_desc,
             );
         } else {
@@ -639,7 +639,7 @@ fn print_dry_run_plan(
             };
             eprintln!(
                 "  Estimated output:    {} additional space needed, would reach {}%{}",
-                histv_lib::disk_monitor::format_bytes(peak_without_delete),
+                video_transcoder_lib::disk_monitor::format_bytes(peak_without_delete),
                 projected_pct_no_delete,
                 warning,
             );
@@ -648,17 +648,17 @@ fn print_dry_run_plan(
             let net_desc = if net_delete < 0 {
                 format!(
                     "{} freed after batch",
-                    histv_lib::disk_monitor::format_bytes(net_delete.unsigned_abs())
+                    video_transcoder_lib::disk_monitor::format_bytes(net_delete.unsigned_abs())
                 )
             } else {
                 format!(
                     "{} additional after batch",
-                    histv_lib::disk_monitor::format_bytes(net_delete as u64)
+                    video_transcoder_lib::disk_monitor::format_bytes(net_delete as u64)
                 )
             };
             eprintln!(
                 "  With --delete-source:  up to {} needed during encoding, {}",
-                histv_lib::disk_monitor::format_bytes(peak_with_delete),
+                video_transcoder_lib::disk_monitor::format_bytes(peak_with_delete),
                 net_desc,
             );
         }
@@ -668,13 +668,13 @@ fn print_dry_run_plan(
     if remote_count > 0 {
         // Build a dry-run wave plan to show grouping
         let dry_pending: Vec<usize> = probed_items.iter().enumerate().map(|(i, _)| i).collect();
-        let staging_dir = histv_lib::staging::resolve_staging_dir(None);
+        let staging_dir = video_transcoder_lib::staging::resolve_staging_dir(None);
         let remote_never = matches!(args.remote, cli::RemotePolicy::Never);
 
         let dry_plan = if matches!(args.remote, cli::RemotePolicy::Always) {
             // All files as one big set of waves
-            use histv_lib::staging::WaveItem;
-            let budget: u64 = histv_lib::disk_monitor::partition_free_space(&staging_dir)
+            use video_transcoder_lib::staging::WaveItem;
+            let budget: u64 = video_transcoder_lib::disk_monitor::partition_free_space(&staging_dir)
                 .map(|(_, free)| (free as f64 * 0.9) as u64)
                 .unwrap_or(u64::MAX);
             let mut plan: Vec<WaveItem> = Vec::new();
@@ -714,7 +714,7 @@ fn print_dry_run_plan(
             }
             plan
         } else {
-            histv_lib::staging::WavePlanner::plan(
+            video_transcoder_lib::staging::WavePlanner::plan(
                 queue_items,
                 &dry_pending,
                 &mut mount_cache,
@@ -726,11 +726,11 @@ fn print_dry_run_plan(
 
         let wave_count = dry_plan
             .iter()
-            .filter(|item| matches!(item, histv_lib::staging::WaveItem::Wave { .. }))
+            .filter(|item| matches!(item, video_transcoder_lib::staging::WaveItem::Wave { .. }))
             .count();
         let local_count = dry_plan
             .iter()
-            .filter(|item| matches!(item, histv_lib::staging::WaveItem::Local { .. }))
+            .filter(|item| matches!(item, video_transcoder_lib::staging::WaveItem::Local { .. }))
             .count();
 
         if wave_count > 0 {
@@ -749,7 +749,7 @@ fn print_dry_run_plan(
             let mut wave_num = 0u32;
             for item in &dry_plan {
                 match item {
-                    histv_lib::staging::WaveItem::Wave {
+                    video_transcoder_lib::staging::WaveItem::Wave {
                         indices,
                         total_stage_bytes,
                     } => {
@@ -759,10 +759,10 @@ fn print_dry_run_plan(
                             wave_num,
                             indices.len(),
                             if indices.len() == 1 { "" } else { "s" },
-                            histv_lib::disk_monitor::format_bytes(*total_stage_bytes),
+                            video_transcoder_lib::disk_monitor::format_bytes(*total_stage_bytes),
                         );
                     }
-                    histv_lib::staging::WaveItem::Local { .. } => {}
+                    video_transcoder_lib::staging::WaveItem::Local { .. } => {}
                 }
             }
             if local_count > 0 {
@@ -793,7 +793,7 @@ fn run_batch(
     // covers both create-if-missing and writable-probe; CLI translates the
     // helper's human-readable error to an eprintln + exit(4).
     if matches!(args.output_mode, cli::OutputMode::Folder) {
-        if let Err(e) = histv_lib::encoder::validate_output_folder(&args.output) {
+        if let Err(e) = video_transcoder_lib::encoder::validate_output_folder(&args.output) {
             eprintln!("ERROR: {e}");
             std::process::exit(4);
         }
@@ -807,10 +807,10 @@ fn run_batch(
     }
 
     // Staging directory
-    let staging_dir = histv_lib::staging::resolve_staging_dir(args.local_tmp.as_deref());
+    let staging_dir = video_transcoder_lib::staging::resolve_staging_dir(args.local_tmp.as_deref());
 
     // Disk monitor
-    let disk_monitor = histv_lib::disk_monitor::DiskMonitor::new(
+    let disk_monitor = video_transcoder_lib::disk_monitor::DiskMonitor::new(
         &args.disk_limit,
         args.disk_resume,
         &args.output,
@@ -824,7 +824,7 @@ fn run_batch(
         sink.log(&format!(
             "Disk-aware mode enabled: pause at {}% usage, resume at {} free.",
             args.disk_limit,
-            histv_lib::disk_monitor::format_bytes(dm.baseline_free()),
+            video_transcoder_lib::disk_monitor::format_bytes(dm.baseline_free()),
         ));
     }
 
@@ -881,12 +881,12 @@ fn run_batch(
     let remote_never = matches!(args.remote, cli::RemotePolicy::Never);
     let force_local = batch_settings.force_local;
 
-    let mut mount_cache = histv_lib::remote::MountCache::new();
+    let mut mount_cache = video_transcoder_lib::remote::MountCache::new();
 
     let wave_plan = if matches!(args.remote, cli::RemotePolicy::Always) {
         // All files treated as remote - put them all in waves
-        use histv_lib::staging::WaveItem;
-        let budget: u64 = histv_lib::disk_monitor::partition_free_space(&staging_dir)
+        use video_transcoder_lib::staging::WaveItem;
+        let budget: u64 = video_transcoder_lib::disk_monitor::partition_free_space(&staging_dir)
             .map(|(_, free)| (free as f64 * 0.9) as u64)
             .unwrap_or(u64::MAX);
 
@@ -928,7 +928,7 @@ fn run_batch(
         }
         plan
     } else {
-        histv_lib::staging::WavePlanner::plan(
+        video_transcoder_lib::staging::WavePlanner::plan(
             queue_items,
             &pending_indices,
             &mut mount_cache,
@@ -959,7 +959,7 @@ fn run_batch(
                 };
                 cli_sink::DisplayItem {
                     file_name: item.file_name.clone(),
-                    source_size: histv_lib::disk_monitor::format_bytes(item.source_bytes),
+                    source_size: video_transcoder_lib::disk_monitor::format_bytes(item.source_bytes),
                     estimated_size: format_estimated_size(item, decision),
                     resolution: format!("{}x{}", item.probe.video_width, item.probe.video_height),
                     hdr_label: hdr_type_label(item),
@@ -1235,8 +1235,8 @@ fn estimate_output_size(item: &QueueItem, decision: &EncodeDecision) -> Option<(
 /// Format estimated output size for display, matching the GUI's To Size column.
 fn format_estimated_size(item: &QueueItem, decision: &EncodeDecision) -> String {
     match estimate_output_size(item, decision) {
-        Some((bytes, true)) => format!("~{}", histv_lib::disk_monitor::format_bytes(bytes)),
-        Some((bytes, false)) => histv_lib::disk_monitor::format_bytes(bytes),
+        Some((bytes, true)) => format!("~{}", video_transcoder_lib::disk_monitor::format_bytes(bytes)),
+        Some((bytes, false)) => video_transcoder_lib::disk_monitor::format_bytes(bytes),
         None => "-".to_string(),
     }
 }
@@ -1250,8 +1250,8 @@ mod tests {
         bitrate_mbps: f64,
         duration: f64,
         hdr: bool,
-    ) -> histv_lib::probe::ProbeResult {
-        histv_lib::probe::ProbeResult {
+    ) -> video_transcoder_lib::probe::ProbeResult {
+        video_transcoder_lib::probe::ProbeResult {
             video_codec: codec.to_string(),
             video_bitrate_bps: bitrate_mbps * 1_000_000.0,
             video_bitrate_mbps: bitrate_mbps,
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[test]
     fn test_merge_job_adds_files() {
-        let mut args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let mut args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let job = cli::JobFile {
             files: vec!["b.mkv".into(), "c.mkv".into()],
             ..Default::default()
@@ -1505,7 +1505,7 @@ mod tests {
 
     #[test]
     fn test_merge_job_applies_settings() {
-        let mut args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let mut args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let job = cli::JobFile {
             bitrate: Some(8.0),
             codec: Some("h264".into()),
@@ -1523,7 +1523,7 @@ mod tests {
 
     #[test]
     fn test_merge_job_clamps_qp() {
-        let mut args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let mut args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let job = cli::JobFile {
             qp_i: Some(999),
             qp_p: Some(100),
@@ -1540,7 +1540,7 @@ mod tests {
 
     #[test]
     fn test_merge_job_empty_no_change() {
-        let mut args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let mut args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let original_bitrate = args.bitrate;
         let job = cli::JobFile::default();
         merge_job_into_args(&mut args, &job);
@@ -1549,7 +1549,7 @@ mod tests {
 
     #[test]
     fn test_merge_job_hdr_flag() {
-        let mut args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let mut args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let job = cli::JobFile {
             hdr: Some(true),
             ..Default::default()
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[test]
     fn test_merge_job_invalid_codec_ignored() {
-        let mut args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let mut args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let job = cli::JobFile {
             codec: Some("invalid_codec".into()),
             ..Default::default()
@@ -1575,7 +1575,7 @@ mod tests {
 
     #[test]
     fn auto_encoder_prefers_verified_hardware_after_software_entries() {
-        let args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let mut encoders = default_encoders();
         for name in ["hevc_vaapi", "hevc_qsv"] {
             encoders.push(EncoderInfo {
@@ -1590,7 +1590,7 @@ mod tests {
 
     #[test]
     fn precision_keeps_software_when_verified_hardware_exists() {
-        let mut args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let mut args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         args.precision_mode = true;
         let mut encoders = default_encoders();
         encoders.push(EncoderInfo {
@@ -1604,14 +1604,14 @@ mod tests {
 
     #[test]
     fn test_resolve_encoder_forced() {
-        let args = cli::CliArgs::parse_from(["histv-cli", "-e", "hevc_nvenc", "a.mkv"]);
+        let args = cli::CliArgs::parse_from(["video-transcoder-cli", "-e", "hevc_nvenc", "a.mkv"]);
         let encoders = default_encoders();
         assert_eq!(resolve_encoder(&args, &encoders), "hevc_nvenc");
     }
 
     #[test]
     fn test_resolve_encoder_auto_hevc() {
-        let args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let encoders = default_encoders();
         let result = resolve_encoder(&args, &encoders);
         // Should find an HEVC encoder from the list or fall back to libx265
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn test_resolve_encoder_compat_h264() {
-        let args = cli::CliArgs::parse_from(["histv-cli", "--compat", "a.mkv"]);
+        let args = cli::CliArgs::parse_from(["video-transcoder-cli", "--compat", "a.mkv"]);
         let encoders = default_encoders();
         let result = resolve_encoder(&args, &encoders);
         assert!(
@@ -1634,7 +1634,7 @@ mod tests {
 
     #[test]
     fn test_resolve_encoder_empty_list_fallback() {
-        let args = cli::CliArgs::parse_from(["histv-cli", "a.mkv"]);
+        let args = cli::CliArgs::parse_from(["video-transcoder-cli", "a.mkv"]);
         let result = resolve_encoder(&args, &[]);
         // Should fall back to software encoder
         assert_eq!(result, "libx265");
