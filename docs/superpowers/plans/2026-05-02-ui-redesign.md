@@ -197,7 +197,7 @@ This phase fully rewrites `src/index.html`. The output keeps every required DOM 
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Honey, I Shrunk The Vids v2.6.0</title>
+    <title>Video Transcoder v2.6.0</title>
     <link rel="stylesheet" href="css/app.css" />
   </head>
   <body data-breakpoint="expanded" data-sheet-open="false">
@@ -205,7 +205,7 @@ This phase fully rewrites `src/index.html`. The output keeps every required DOM 
 
       <!-- ═══ Slim header (cog → opens settings sheet) ═══ -->
       <header id="app-header">
-        <div class="app-title">Honey, I Shrunk The Vids</div>
+        <div class="app-title">Video Transcoder</div>
         <button id="btn-open-settings" class="icon-btn" aria-label="Open settings (Ctrl+,)" title="Settings (Ctrl+,)">⚙</button>
       </header>
 
@@ -1449,7 +1449,7 @@ Each task is an atomic checklist item. Run them in order; do not skip.
 
 ### Task 7.2 — Note the title-string version mismatch (do NOT block on it)
 
-- [ ] The title in `src/index.html` reads `Honey, I Shrunk The Vids v2.6.0`. After the bump, it is now stale by one minor. **Do not edit it in this PR** — the title traditionally tracks released versions, not -dev tags. Add a TODO note in the deviations section of the snapshot doc instead.
+- [ ] The title in `src/index.html` reads `Video Transcoder v2.6.0`. After the bump, it is now stale by one minor. **Do not edit it in this PR** — the title traditionally tracks released versions, not -dev tags. Add a TODO note in the deviations section of the snapshot doc instead.
 
 ### Task 7.3 — Commit version bump
 
