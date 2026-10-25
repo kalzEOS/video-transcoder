@@ -68,16 +68,27 @@ function computeEstimatedSize(item, settings) {
 
   if (!mbps || mbps <= 0) {
     if (!item.videoCodec) return null;
-    return { bytes: item.sourceBytes, approx: true };
+    return { variable: true };
   }
 
   const isSameCodec = sourceCodec === settings.targetCodecFamily;
 
   if (mbps > settings.target * 1.15 || (mbps > settings.target && !isSameCodec)) {
-    const estimatedBytes = (settings.target * 1000000 * item.durationSecs) / 8;
-    return { bytes: Math.round(estimatedBytes), approx: false };
+    // VBR is a target bitrate, not a guaranteed average. Include copied
+    // audio, but label the calculated size as a budget, not a prediction.
+    const audioBps = (item.audioStreams || []).reduce((sum, stream) => {
+      const sourceKbps = Number(stream.bitrateKbps) || 0;
+      const outputKbps = settings.compatibilityMode &&
+        !(stream.codec === 'aac' && sourceKbps <= 640)
+        ? (sourceKbps ? Math.min(sourceKbps, 640) : 640)
+        : sourceKbps;
+      return sum + outputKbps * 1000;
+    }, 0);
+    const budgetBytes = ((settings.target * 1000000 + audioBps) * item.durationSecs) / 8;
+    if (!Number.isFinite(budgetBytes) || budgetBytes <= 0) return null;
+    return { bytes: Math.round(budgetBytes), approx: true, atTarget: true };
   } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
-    return { bytes: item.sourceBytes, approx: true };
+    return { variable: true };
   } else if (mbps > 0) {
     return { bytes: item.sourceBytes, approx: false };
   }
@@ -88,8 +99,9 @@ function computeEstimatedSize(item, settings) {
 function formatEstimatedSize(item, settings) {
   const est = computeEstimatedSize(item, settings);
   if (!est) return '-';
+  if (est.variable) return 'Variable (quality-based)';
   const formatted = formatBytes(est.bytes);
-  return est.approx ? '~' + formatted : formatted;
+  return est.atTarget ? `${formatted} target budget` : est.approx ? '~' + formatted : formatted;
 }
 
 module.exports = {
