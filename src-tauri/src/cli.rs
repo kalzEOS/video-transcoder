@@ -13,7 +13,7 @@ use std::path::PathBuf;
 /// HISTV desktop app. Supports hardware-accelerated encoding, smart bitrate
 /// decisions, and batch processing via flags or JSON job files.
 #[derive(Parser, Debug)]
-#[command(name = "histv-cli", version, about, long_about = None)]
+#[command(name = "video-transcoder-cli", version, about, long_about = None)]
 pub struct CliArgs {
     /// Files and/or folders to encode
     #[arg(trailing_var_arg = true)]
@@ -673,8 +673,8 @@ mod tests {
 
     #[test]
     fn hdr10plus_flag_is_opt_in_and_exports_to_job() {
-        assert!(!CliArgs::parse_from(["histv-cli", "source.mkv"]).preserve_hdr10plus);
-        let args = CliArgs::parse_from(["histv-cli", "--preserve-hdr10plus", "source.mkv"]);
+        assert!(!CliArgs::parse_from(["video-transcoder-cli", "source.mkv"]).preserve_hdr10plus);
+        let args = CliArgs::parse_from(["video-transcoder-cli", "--preserve-hdr10plus", "source.mkv"]);
         assert!(args.preserve_hdr10plus);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("job.json");
