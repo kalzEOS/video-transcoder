@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>com.histv.encoder</id>
-  <name>Honey, I Shrunk The Vids</name>
+  <name>Video Transcoder</name>
   <summary>Batch video encoder with smart bitrate decisions</summary>
   <developer id="com.histv">
     <name>obelisk-complex</name>
