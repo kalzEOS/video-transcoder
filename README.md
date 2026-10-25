@@ -48,7 +48,7 @@ Available as a desktop app and a headless CLI for servers (see [CLI-README.md](C
 - **VBR peak ceiling** - controls how much the bitrate can spike on action-heavy scenes (1.5x to 3x). Higher values look better on complex content.
 - **Audio handling** - each audio track is handled separately. Tracks already below 640kbps are copied as-is. Tracks above the cap are re-encoded to the same codec at the cap. Codecs with no ffmpeg encoder (DTS, TrueHD) fall back to EAC3. Compatibility Mode forces AAC.
 - **HDR10 and bit depth** - Preserve compatible 8-bit/10-bit color properties and HDR10 signaling; optional HDR10+ preservation is available for supported sources (see below).
-- **Pre-flight checks** - Warn about unsupported Dolby Vision base layers and other combinations that could produce incorrect output.
+- **Dolby Vision safety checks** - Dolby Vision metadata is **not preserved** during re-encoding. For compatible Profile 8.1 sources, the app can encode the HDR10 base layer instead; incompatible or unverified base layers are blocked from re-encoding.
 - **Subtitles** - all subtitle tracks are kept.
 - **Output options** - save to a folder, next to the source file, or replace the source. Container is preserved per-file (MKV stays MKV, MP4 stays MP4, MOV stays MOV; other formats default to MKV).
 - **Queue columns** - source size, estimated output size, resolution, HDR badge, source/target bitrate and resizable headers. Estimated sizes are not guaranteed.
@@ -190,7 +190,7 @@ Video Transcoder aims to keep compatible HDR10 sources in HDR10 when re-encoding
 
 An **optional HDR10+ Preservation** workflow can extract and reinsert compatible HDR10+ metadata for supported 10-bit HEVC sources. It requires additional processing and temporary disk space. **This workflow is still being tested on full-length movies**, so check the completed output before deleting your source.
 
-For Dolby Vision Profile 8.1 files with a verified HDR10-compatible base layer, HDR10 output may be possible; preserving Dolby Vision metadata is not promised. Unsupported Dolby Vision profiles are not silently treated as HDR10.
+**Dolby Vision is not preserved.** When re-encoding a supported Dolby Vision Profile 8.1 source with a verified HDR10-compatible base layer, Video Transcoder outputs **HDR10 only** and discards the Dolby Vision metadata. If the source does not have a verified compatible HDR10 base layer, the app blocks re-encoding rather than producing incorrect HDR colors. Files copied without re-encoding are a separate case: their original video bitstream is not intentionally stripped of Dolby Vision metadata.
 
 On Linux, Hardware Decoding (GPU) can use a compatible VAAPI render device. If GPU decoding is unavailable, the app can fall back to CPU decoding while retaining GPU encoding.
 
