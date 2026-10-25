@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
-  "productName": "Honey I Shrunk The Vids",
+  "productName": "Video Transcoder",
   "version": "2.7.1",
   "identifier": "com.histv.encoder",
   "build": {
@@ -10,7 +10,7 @@
 	"withGlobalTauri": true,
     "windows": [
       {
-        "title": "Honey, I Shrunk The Vids v2.7.1",
+        "title": "Video Transcoder v2.7.1",
         "width": 1100,
         "height": 915,
         "minWidth": 910,
