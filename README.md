@@ -1,10 +1,10 @@
-# Honey, I Shrunk The Vids
+# Video Transcoder
 
-[![Quillx](https://raw.githubusercontent.com/qainsights/quillx/main/badges/quillx-4.svg)](https://github.com/qainsights/quillx) Architecture, integration decisions, and review are mine. Claude generated the implementation under close direction. Output reviewed line by line (but that doesn't mean I caught everything).
+**Video Transcoder** is a fork of [Honey, I Shrunk The Vids](https://github.com/obelisk-complex/video-transcoder-universal), developed by obelisk-complex and contributors. It builds on the original batch encoder with ongoing Linux/AMD GPU detection, HDR handling, and size-reporting improvements.
 
 A cross-platform batch video encoder that shrinks your video files to a target quality level. No need to babysit the queue or tweak settings per file - just pick a target bitrate, add your files, and hit start.
 
-Available as a desktop app and a headless CLI for servers (see [CLI-README.md](CLI-README.md)) The CLI can be used with Sonarr/Radarr via Custom Script; please see the [Sonarr-Radarr Guide](Sonarr-Radarr-Integration.md) for details. Both GUI and CLI use the same encoding engine for compatibility and maintainability. Portable binaries are on the GitHub [Releases page](https://github.com/obelisk-complex/histv-universal/releases).
+Available as a desktop app and a headless CLI for servers (see [CLI-README.md](CLI-README.md)) The CLI can be used with Sonarr/Radarr via Custom Script; please see the [Sonarr-Radarr Guide](Sonarr-Radarr-Integration.md) for details. Both GUI and CLI use the same encoding engine for compatibility and maintainability. Portable binaries are on the GitHub [Releases page](https://github.com/kalzEOS/video-transcoder/releases).
 
 ---
 
@@ -47,11 +47,11 @@ Available as a desktop app and a headless CLI for servers (see [CLI-README.md](C
 - **Precision mode** - one checkbox for the best possible quality. Uses software encoding with smart analysis that adapts to your system's RAM. Tests a few short clips first to make sure it won't make the file bigger. Slower, but produces the smallest file that still looks great.
 - **VBR peak ceiling** - controls how much the bitrate can spike on action-heavy scenes (1.5x to 3x). Higher values look better on complex content.
 - **Audio handling** - each audio track is handled separately. Tracks already below 640kbps are copied as-is. Tracks above the cap are re-encoded to the same codec at the cap. Codecs with no ffmpeg encoder (DTS, TrueHD) fall back to EAC3. Compatibility Mode forces AAC.
-- **HDR10 and bit depth** - Source 8-bit stays 8-bit and 10-bit stays 10-bit. HDR10 color signaling and static metadata are checked after encoding. Valid Dolby Vision Profile 8.1 HDR10 base layers encode as HDR10. No automatic tone mapping or dynamic metadata processing.
-- **Pre-flight checks** - Unsupported Dolby Vision base layers trigger an explicit warning and cannot be re-encoded into incorrect HDR10 colors. No MP4Box download or forced container change.
+- **HDR10 and bit depth** - Preserve compatible 8-bit/10-bit color properties and HDR10 signaling; optional HDR10+ preservation is available for supported sources (see below).
+- **Dolby Vision safety checks** - Dolby Vision metadata is **not preserved** during re-encoding. For compatible Profile 8.1 sources, the app can encode the HDR10 base layer instead; incompatible or unverified base layers are blocked from re-encoding.
 - **Subtitles** - all subtitle tracks are kept.
 - **Output options** - save to a folder, next to the source file, or replace the source. Container is preserved per-file (MKV stays MKV, MP4 stays MP4, MOV stays MOV; other formats default to MKV).
-- **Queue columns** - source file size, estimated compressed size, resolution, HDR type badge (DV8, HDR10+, HDR10, HLG, SDR), source and target bitrates, and resizable column headers.
+- **Queue columns** - source size, estimated output size, resolution, HDR badge, source/target bitrate and resizable headers. Estimated sizes are not guaranteed.
 - **Size safety net** - if the encoded file ends up meaningfully bigger than the original (accounting for container overhead based on frame rate and audio streams), the app throws it away and copies the original into the new container instead. Files already below the target threshold are copied without re-encoding.
 - **MKV tag repair** - detects and corrects stale stream statistics tags left behind by ffmpeg and third-party muxing tools, so bitrate decisions use the real numbers. Runs automatically at import and after each encode, with optional manual deep repair for severely corrupted metadata.
 - **Performance controls** - limit CPU threads and/or run encoding at low priority so your PC stays usable.
@@ -67,14 +67,16 @@ Available as a desktop app and a headless CLI for servers (see [CLI-README.md](C
 - **Flatpak support** - available as a Flatpak bundle for Linux with host filesystem access so ffmpeg subprocesses can reach your files directly.
 - **Themes** - six built-in themes (dark, light, and four community-inspired palettes). Create your own with just 6 colour values - the app derives everything else automatically. See [THEMES.md](THEMES.md).
 - **ffmpeg downloader** - offers to download ffmpeg for you if it's not installed.
-- **Remembers settings** - everything is saved to config.json in the same folder as the .exe, and restored on next launch.
+- **Remembers settings** - settings are saved to the platform's application data directory and restored on the next launch.
 - **CLI version** - same engine as a command-line tool for servers and scripts. Shows a persistent queue table during encoding matching the GUI's columns. See [CLI-README.md](CLI-README.md).
 
 </details>
 
+> **Build availability:** Check this fork's [Releases](https://github.com/kalzEOS/video-transcoder/releases) for actual downloads. Some names below describe intended packaging; they do not guarantee that a particular build has been published. The full internal rename is under review in [PR #10](https://github.com/kalzEOS/video-transcoder/pull/10), so existing builds may still use legacy filenames.
+
 ## Download
 
-Grab the latest build from the GitHub **[Releases page](https://github.com/obelisk-complex/histv-universal/releases)**.
+Grab the latest build from the GitHub **[Releases page](https://github.com/kalzEOS/video-transcoder/releases)**.
 
 Each platform has a standard build (you provide ffmpeg) and a **-full** build (ffmpeg included). The full builds are larger but work out of the box with no extra setup.
 
@@ -82,34 +84,34 @@ Each platform has a standard build (you provide ffmpeg) and a **-full** build (f
 
 | Platform | GUI | CLI |
 |----------|-----|-----|
-| **Windows** | `histv-windows.exe` | `histv-cli-windows.exe` |
-| **Linux** | `.AppImage` | `histv-cli-linux` |
-| **macOS (Apple Silicon)** | `.dmg` (arm64) | `histv-cli-macos-arm64` |
-| **macOS (Intel)** | `.dmg` (x64) | `histv-cli-macos-x64` |
+| **Windows** | `video-transcoder-windows.exe` | `video-transcoder-cli-windows.exe` |
+| **Linux** | `.AppImage` | `video-transcoder-cli-linux` |
+| **macOS (Apple Silicon)** | `.dmg` (arm64) | `video-transcoder-cli-macos-arm64` |
+| **macOS (Intel)** | `.dmg` (x64) | `video-transcoder-cli-macos-x64` |
 
 **Full builds** - ffmpeg included, no extra dependencies:
 
 | Platform | GUI | CLI |
 |----------|-----|-----|
-| **Windows** | `histv-windows-full.zip` | `histv-cli-windows-full.zip` |
-| **Linux** | `histv-linux-full.AppImage` | `histv-cli-linux-full.tar.gz` |
-| **macOS (Apple Silicon)** | `histv-macos-arm64-full.dmg` | `histv-cli-macos-arm64-full.tar.gz` |
-| **macOS (Intel)** | `histv-macos-x64-full.dmg` | `histv-cli-macos-x64-full.tar.gz` |
+| **Windows** | `video-transcoder-windows-full.zip` | `video-transcoder-cli-windows-full.zip` |
+| **Linux** | `video-transcoder-linux-full.AppImage` | `video-transcoder-cli-linux-full.tar.gz` |
+| **macOS (Apple Silicon)** | `video-transcoder-macos-arm64-full.dmg` | `video-transcoder-cli-macos-arm64-full.tar.gz` |
+| **macOS (Intel)** | `video-transcoder-macos-x64-full.dmg` | `video-transcoder-cli-macos-x64-full.tar.gz` |
 
 **Flatpak** - sandboxed Linux build with ffmpeg included:
 
 | Platform | GUI |
 |----------|-----|
-| **Linux** | `histv-linux.flatpak` |
+| **Linux** | `video-transcoder-linux.flatpak` |
 
 The Flatpak bundles ffmpeg and has host filesystem access for encoding. The CLI is not included in the Flatpak.
 
-All binaries are portable - no installation needed. On Linux, mark the AppImage executable (`chmod +x`). On macOS, open the DMG and drag to Applications. On Windows, extract the zip to a folder.
+Most downloadable builds are intended to be portable; packaging requirements vary by platform. On Linux, mark the AppImage executable (`chmod +x`). On macOS, open the DMG and drag to Applications. On Windows, extract the zip to a folder.
 
 <details>
 <summary><strong>Linux display troubleshooting</strong></summary>
 
-HISTV sets three environment variables before GTK initialises to work around WebKitGTK rendering issues on Wayland. These are only set if you haven't already set them yourself:
+Video Transcoder sets three environment variables before GTK initialises to work around WebKitGTK rendering issues on Wayland. These are only set if you haven't already set them yourself:
 
 | Variable | Default | What it does |
 |----------|---------|-------------|
@@ -120,10 +122,10 @@ HISTV sets three environment variables before GTK initialises to work around Web
 If your system handles Wayland rendering correctly and you want GPU compositing back, override any of these before launching:
 
 ```bash
-WEBKIT_DISABLE_COMPOSITING_MODE=0 WEBKIT_DISABLE_DMABUF_RENDERER=0 ./histv
+WEBKIT_DISABLE_COMPOSITING_MODE=0 WEBKIT_DISABLE_DMABUF_RENDERER=0 ./video-transcoder
 ```
 
-The Flatpak respects these overrides via `flatpak run --env=VARIABLE=VALUE com.histv.encoder` or by setting them in your shell before `flatpak run`.
+The Flatpak respects these overrides via `flatpak run --env=VARIABLE=VALUE com.kalzi.videotranscoder` or by setting them in your shell before `flatpak run`.
 
 </details>
 
@@ -148,8 +150,11 @@ cargo install tauri-cli --version "^2"
 cargo tauri build
 
 # CLI (no GUI/Tauri/WebKit dependencies)
-cargo build --manifest-path src-tauri/Cargo.toml --release --bin histv-cli --no-default-features --features cli
+cargo build --manifest-path src-tauri/Cargo.toml --release --bin video-transcoder-cli --no-default-features --features cli
 ```
+
+
+**Note:** Until [PR #10](https://github.com/kalzEOS/video-transcoder/pull/10) is merged, the actual CLI executable and Cargo target on `main` are still `histv-cli`. Use the name corresponding to the branch you are building.
 
 **Cargo features:**
 
@@ -157,7 +162,7 @@ cargo build --manifest-path src-tauri/Cargo.toml --release --bin histv-cli --no-
 |---------|---------|---------------|
 | `custom-protocol` | GUI | Tauri custom-protocol handler (required for release GUI builds) |
 | `downloader` | GUI | In-app ffmpeg downloader (pulls in `reqwest` + `futures-util`); GUI-only — the CLI expects ffmpeg on your PATH |
-| `cli` | CLI | Builds the headless `histv-cli` binary without any Tauri/GTK/WebKit dependencies |
+| `cli` | CLI | Builds the headless `video-transcoder-cli` binary without any Tauri/GTK/WebKit dependencies |
 
 </details>
 
@@ -179,35 +184,19 @@ Files within 15% above the threshold that are already in the target codec are al
 
 If an encode makes the file meaningfully bigger than it was (accounting for container overhead), the app throws away the encode and copies the original into the new container instead. Small size increases from container format differences are tolerated.
 
-### HDR10 baseline
+### HDR10 and HDR10+ handling
 
-The normal re-encoding path preserves source bit depth, color primaries, transfer,
-matrix, range, and supported HDR10 static mastering/content-light metadata. A
-bounded output decode probe rejects errors and lost required HDR10 properties.
-MKV stays MKV in Auto container mode. Audio Copy bypasses bitrate caps; Auto
-retains the existing capped conversion policy. Supported subtitle streams are
-mapped to the selected container.
+Video Transcoder aims to keep compatible HDR10 sources in HDR10 when re-encoding, including 10-bit color signaling and supported static metadata. HDR10+ adds dynamic metadata, which is not automatically retained by an ordinary HEVC re-encode.
 
-| Source | Re-encoding behavior |
-|--------|----------------------|
-| SDR 8-bit / 10-bit | Keep the original bit depth and SDR signaling |
-| HDR10 / HLG | Keep source bit depth, HDR color signaling and static metadata |
-| Dolby Vision Profile 8.1 with verified 10-bit BT.2020/PQ base | Encode the HDR10 base; Dolby Vision is discarded |
-| Other/unknown Dolby Vision base-layer compatibility | Block re-encoding with an explicit warning; retain original |
-| HDR10+ | Preserve standard HDR10; dynamic metadata is not promised |
+An **optional HDR10+ Preservation** workflow can extract and reinsert compatible HDR10+ metadata for supported 10-bit HEVC sources. It requires additional processing and temporary disk space. **This workflow is still being tested on full-length movies**, so check the completed output before deleting your source.
 
-There is no full-movie dynamic metadata extraction, reinsertion, packaging, or
-verification pipeline. MP4Box is not required. No HDR10+ preservation mode is
-enabled: reliable preservation would require additional bitstream work, which
-conflicts with this baseline's speed and simplicity priorities.
+**Dolby Vision is not preserved.** When re-encoding a supported Dolby Vision Profile 8.1 source with a verified HDR10-compatible base layer, Video Transcoder outputs **HDR10 only** and discards the Dolby Vision metadata. If the source does not have a verified compatible HDR10 base layer, the app blocks re-encoding rather than producing incorrect HDR colors. Files copied without re-encoding are a separate case: their original video bitstream is not intentionally stripped of Dolby Vision metadata.
 
-On Linux, enable **Hardware Decoding (GPU)** to try supported 8/10-bit VAAPI
-decoding on the same verified render device as encoding. Failed or incompatible
-GPU decoding retries with CPU decoding while retaining the GPU encoder. The
-checkbox keeps its saved preference. Intel QSV device selection is independent.
+On Linux, Hardware Decoding (GPU) can use a compatible VAAPI render device. If GPU decoding is unavailable, the app can fall back to CPU decoding while retaining GPU encoding.
 
-See [the HDR10 baseline validation notes](docs/HDR10-baseline.md) for the scope
-of physical testing, metadata limitations, and recovery snapshot details.
+### File-size estimates
+
+The size shown before encoding is an estimate, not a promise. VBR settings specify a bitrate **target**, and actual output size depends on the video and encoder. Quality-based CRF/QP encodes have variable output sizes. The fork is improving these labels so the estimate is easier to interpret.
 
 ### Precision mode
 
@@ -221,18 +210,18 @@ One checkbox for the best quality the app can produce. It picks the smartest enc
 
 Before starting the full encode, it tests a few short clips to make sure the result won't end up bigger than the original. If it would, the app switches to a safer mode automatically.
 
-### Who HISTV is for
+### Who Video Transcoder is for
 
 People with a pile of video files at different sizes and formats who want to shrink the big ones without fiddling with every file individually. Set the target, add the files, walk away.
 
-### How HISTV compares to other tools
+### How Video Transcoder compares to other tools
 <details>
 
-**vs. HandBrake** - HandBrake is built for tweaking every file individually. HISTV is built for doing a whole folder at once without thinking about it. It figures out per-file whether to shrink, copy, or re-encode. If you want fine control over every setting on every file, HandBrake is the better tool.
+**vs. HandBrake** - HandBrake is built for tweaking every file individually. Video Transcoder is built for doing a whole folder at once without thinking about it. It figures out per-file whether to shrink, copy, or re-encode. If you want fine control over every setting on every file, HandBrake is the better tool.
 
-**vs. Tdarr** - Tdarr runs as a server with plugins, Docker, and a web dashboard. HISTV is an app you open, use, and close.
+**vs. Tdarr** - Tdarr runs as a server with plugins, Docker, and a web dashboard. Video Transcoder is an app you open, use, and close.
 
-**vs. writing your own ffmpeg script** - HISTV handles the parts that are annoying to script: figuring out what each file needs, picking the right encoder, falling back when hardware fails, prompting for overwrites, pausing/resuming, and cleaning up after itself.
+**vs. writing your own ffmpeg script** - Video Transcoder handles the parts that are annoying to script: figuring out what each file needs, picking the right encoder, falling back when hardware fails, prompting for overwrites, pausing/resuming, and cleaning up after itself.
 
 </details>
 
@@ -281,14 +270,18 @@ People with a pile of video files at different sizes and formats who want to shr
 
 </details>
 
+### Fork and upstream credits
+
+Video Transcoder is based on [Honey, I Shrunk The Vids](https://github.com/obelisk-complex/histv-universal) by obelisk-complex and contributors. The original project supplies the foundation for the desktop UI, queue engine, CLI and cross-platform encoding workflows. This fork is evolving the Linux/AMD experience and HDR and size-reporting behavior. Upstream credits, commit history and license obligations are retained.
+
 ### Licence
 
 [GPL-3.0-or-later](LICENSE)
 
 ### Third-party software
 
-The **-full** builds bundle [FFmpeg](https://ffmpeg.org) and [MP4Box](https://gpac.io) (GPAC). FFmpeg is licensed under the [GNU General Public Licence v2+](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html). The bundled FFmpeg binaries are unmodified static GPL builds from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) (Windows/Linux) and [evermeet.cx](https://evermeet.cx/ffmpeg/) (macOS). MP4Box is licensed under the [GNU Lesser General Public Licence v2.1+](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html). The corresponding source code is available from those repositories. We will provide the source on request for three years from the date of each release - file an issue on this repo.
+Depending on the release, **-full** builds may bundle [FFmpeg](https://ffmpeg.org) and [MP4Box](https://gpac.io) (GPAC). FFmpeg is licensed under the [GNU General Public Licence v2+](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html). The bundled FFmpeg binaries are unmodified static GPL builds from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds) (Windows/Linux) and [evermeet.cx](https://evermeet.cx/ffmpeg/) (macOS). MP4Box is licensed under the [GNU Lesser General Public Licence v2.1+](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html). The corresponding source code is available from those repositories. For source and license compliance information, see the linked upstream projects and the license files in this repository.
 
-This HDR10 baseline no longer includes the Dolby Vision/HDR10+ processing crates or requires MP4Box. The CachyOS AppImage uses the installed `/usr/bin/ffmpeg` and `/usr/bin/ffprobe` with host graphics libraries. The description of earlier full builds above is retained for historical releases.
+The optional HDR10+ workflow may require GPAC/MP4Box. The exact bundled tools depend on the build; check your release before relying on them.
 
 This software is based in part on the work of the Independent JPEG Group. See [THIRD-PARTY-LICENCES](THIRD-PARTY-LICENCES) for full details.
