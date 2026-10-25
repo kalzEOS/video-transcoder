@@ -908,6 +908,23 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     #[serial]
+    fn test_app_data_bin_dir_uses_existing_legacy_downloads() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("com.histv.encoder").join("bin");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", root.path());
+        assert_eq!(app_data_bin_dir(), Some(legacy));
+        if let Some(v) = previous {
+            std::env::set_var("XDG_DATA_HOME", v);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial]
     fn test_app_data_bin_dir_no_env() {
         let orig_xdg = std::env::var("XDG_DATA_HOME").ok();
         let orig_home = std::env::var("HOME").ok();
