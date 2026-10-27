@@ -987,8 +987,9 @@ fn hdr_plan(input: HdrPlanInput<'_>) -> Result<HdrPlan, String> {
     Ok(HdrPlan {
         preserve_hdr: true,
         scan_hdr10plus,
-        require_hdr10plus: mode == HdrMode::Hdr10Plus
-            || (mode == HdrMode::Auto && detected_hdr10plus),
+        // Preview absence is inconclusive. A clean full scan with no metadata
+        // may preserve HDR10; previously detected metadata must never vanish.
+        require_hdr10plus: detected_hdr10plus && matches!(mode, HdrMode::Hdr10Plus | HdrMode::Auto),
     })
 }
 
@@ -4658,7 +4659,15 @@ mod tests {
         .unwrap();
         assert!(hdr10.preserve_hdr && !hdr10.scan_hdr10plus);
         let plus = hdr_plan(source).unwrap();
-        assert!(plus.require_hdr10plus && plus.scan_hdr10plus);
+        assert!(plus.preserve_hdr && plus.scan_hdr10plus && !plus.require_hdr10plus);
+        let known_plus = hdr_plan(HdrPlanInput {
+            detected_hdr10plus: true,
+            ..source
+        })
+        .unwrap();
+        assert!(
+            known_plus.preserve_hdr && known_plus.scan_hdr10plus && known_plus.require_hdr10plus
+        );
         assert!(hdr_plan(HdrPlanInput {
             mode: Some(HdrMode::Hdr10),
             is_hdr: false,

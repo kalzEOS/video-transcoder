@@ -292,7 +292,7 @@
       };
       hdrModeNote.textContent = notes[selHdrMode.value] || notes.auto;
       if (selHdrMode.value === 'hdr10plus' && candidates.some(item => !item.hasHdr10plus)) {
-        hdrModeNote.textContent += ' A full scan will confirm metadata missing from the preview.';
+        hdrModeNote.textContent += ' A full scan checks for metadata missed by the preview. If none is found, HDR10 is preserved.';
       }
       if (selHdrMode.value === 'hdr10' && hdrOption.disabled) hdrModeNote.textContent += ` ${availability.hdr10Reason}`;
       if (selHdrMode.value === 'hdr10plus' && plusOption.disabled) hdrModeNote.textContent += ` ${availability.hdr10plusReason}`;

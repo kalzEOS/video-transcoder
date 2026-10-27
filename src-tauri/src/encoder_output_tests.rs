@@ -600,3 +600,140 @@ async fn remote_install_failure_retains_completed_encode_after_wave_cleanup() {
     std::fs::remove_dir(input_dir).unwrap();
     std::fs::remove_dir(input_dir.parent().unwrap()).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires FFmpeg with 10-bit libx265/E-AC3 and MP4Box; no GPU required"]
+async fn hdr10plus_mode_keeps_hdr10_after_clean_scan_but_rejects_missing_advertised_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("hdr10-only.mkv");
+    let generated = std::process::Command::new("ffmpeg").args([
+        "-v", "error", "-y", "-f", "lavfi", "-i",
+        "testsrc2=size=384x216:rate=24:duration=1", "-f", "lavfi", "-i",
+        "sine=frequency=440:sample_rate=48000:duration=1",
+        "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+        "-x265-params", "pools=2:frame-threads=2:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1):max-cll=1000,400:log-level=error",
+        "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+        "-c:a", "eac3", "-b:a", "384k",
+    ]).arg(&source).output().unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let original = std::fs::read(&source).unwrap();
+    let item = queue_item(&source).await;
+    assert!(item.probe.is_hdr && !item.probe.has_hdr10plus);
+    for advertised in [false, true] {
+        let folder = root.path().join(if advertised {
+            "advertised-but-missing"
+        } else {
+            "clean-hdr10"
+        });
+        std::fs::create_dir(&folder).unwrap();
+        let output = folder.join(source.file_name().unwrap());
+        if advertised {
+            std::fs::write(&output, b"previous output").unwrap();
+        }
+        let mut item = item.clone();
+        item.probe.has_hdr10plus = advertised;
+        let mut queue = vec![item];
+        let mut config = settings(&folder);
+        config.codec_family = "hevc".into();
+        config.video_encoder = "libx265".into();
+        config.hdr_mode = Some(HdrMode::Hdr10Plus);
+        let sink = crate::test_helpers::RecordingSink::new();
+        let result = run_encode_loop(
+            &sink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut queue,
+            &config,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        if advertised {
+            assert_eq!(result, (0, 1, 0, false));
+            assert_eq!(std::fs::read(&output).unwrap(), b"previous output");
+        } else {
+            assert_eq!(result, (1, 0, 0, false), "{:?}", sink.take_logs());
+            assert!(sink
+                .take_logs()
+                .iter()
+                .any(|line| line.contains("full source scan found no HDR10+ metadata")));
+            assert!(!sink
+                .stages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(stage, _, _)| stage == "reinserting"));
+            let probe =
+                crate::probe::probe_file_for_validation(output.to_str().unwrap(), &NoopSink)
+                    .await
+                    .unwrap();
+            queue[0]
+                .probe
+                .video_format
+                .verify(&probe.video_format, false)
+                .unwrap();
+            assert_eq!(probe.video_format.bit_depth, 10);
+            assert_eq!(probe.color_transfer, "smpte2084");
+            let audio_hash = |path: &Path| {
+                let output = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-i"])
+                    .arg(path)
+                    .args([
+                        "-map",
+                        "0:a",
+                        "-c",
+                        "copy",
+                        "-f",
+                        "streamhash",
+                        "-hash",
+                        "sha256",
+                        "-",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                output.stdout
+            };
+            assert_eq!(audio_hash(&source), audio_hash(&output));
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read_dir(folder).unwrap().count(), 1);
+    }
+    let invalid = root.path().join("unreadable-bitstream.mkv");
+    std::fs::write(&invalid, b"invalid disposable video").unwrap();
+    let folder = root.path().join("extraction-failure");
+    std::fs::create_dir(&folder).unwrap();
+    let output = folder.join("unreadable-bitstream.mkv");
+    std::fs::write(&output, b"previous successful output").unwrap();
+    let mut invalid_item = queue_item(&source).await;
+    invalid_item.full_path = invalid.to_string_lossy().into_owned();
+    invalid_item.file_name = "unreadable-bitstream.mkv".into();
+    invalid_item.base_name = "unreadable-bitstream".into();
+    let mut queue = vec![invalid_item];
+    let mut config = settings(&folder);
+    config.codec_family = "hevc".into();
+    config.video_encoder = "libx265".into();
+    config.hdr_mode = Some(HdrMode::Hdr10Plus);
+    assert_eq!(
+        run_encode_loop(
+            &NoopSink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut queue,
+            &config,
+            &[],
+            None,
+            None
+        )
+        .await,
+        (0, 1, 0, false)
+    );
+    assert_eq!(
+        std::fs::read(output).unwrap(),
+        b"previous successful output"
+    );
+    assert_eq!(std::fs::read(invalid).unwrap(), b"invalid disposable video");
+}
