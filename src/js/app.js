@@ -20,6 +20,7 @@
 	let queueData = [];                // mirrors backend queue
     let videoEncoders = [];            // EncoderInfo[]
 	let batchWasCancelled = false;     // check if batch was user-cancelled
+    let batchHadFailures = false;
     let themes = [];                   // Theme[]
     let selectedRows = new Set();      // indices of selected rows
     let batchRunning = false;
@@ -2953,6 +2954,7 @@
 
       // Batch started
       listen('batch-started', () => {
+        batchHadFailures = false;
         batchRunning = true;
         btnPause.textContent = 'Pause';
         jobStatus.textContent = 'Encoding...';
@@ -3009,6 +3011,7 @@
 
       // Batch finished
       listen('batch-finished', async (event) => {
+        batchHadFailures = Number(event.payload.failed) > 0;
         batchRunning = false;
         document.querySelector('#bottom-panel')?.classList.remove('is-encoding');
         currentEncodingIndex = -1;
@@ -3056,7 +3059,7 @@
         // Auto-continue: if new files were added during the batch, start another.
         // Check batchWasCancelled BEFORE clearing it so a user cancel actually
         // prevents auto-continue.
-        if (!batchRunning && !batchWasCancelled) {
+        if (!batchRunning && !batchWasCancelled && !batchHadFailures) {
           const hasPending = queueData.some(i => (i.status || '').toLowerCase() === 'pending');
           if (hasPending) {
             startBatch(true, true);

@@ -133,6 +133,20 @@ async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
             .success
     );
     hdr::verify_output(&output, &metadata, &Sink).await.unwrap();
+    // Exercise the application's complete-output validation on the packaged
+    // HDR10+ result too, including B-frame timing and sparse subtitles.
+    let validated_dir = root.path().join("validated");
+    run(Command::new(env!("CARGO_BIN_EXE_video-transcoder-cli"))
+        .args([
+            "--hdr", "--encoder", "libx265", "--codec", "hevc",
+            "--bitrate", "100", "--audio", "copy", "--overwrite", "yes",
+            "--fallback", "no", "--log-level", "quiet", "--output",
+        ])
+        .arg(&validated_dir)
+        .arg(&output));
+    hdr::verify_output(&validated_dir.join("preserved.mkv"), &metadata, &Sink)
+        .await
+        .unwrap();
     // A successful mux and metadata scan alone do not rule out a frozen
     // picture. Compare decoded frames at the start and after a later seek.
     let decoded_frames = |path: &Path, start: Option<&str>| -> Vec<String> {

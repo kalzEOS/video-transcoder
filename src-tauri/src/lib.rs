@@ -6,11 +6,13 @@ pub mod hdr10plus_pipeline;
 pub mod hevc_utils;
 pub mod metadata_order;
 pub mod mkv_tags;
+mod output_integrity;
 pub mod output_transaction;
 pub mod pipeline_progress;
 pub mod probe;
 pub mod queue;
 pub mod remote;
+mod remote_delivery;
 pub mod staging;
 pub mod video_format;
 pub mod webp_decode;
@@ -717,7 +719,11 @@ mod gui_commands {
                 ));
             }
 
-            if post_action != "None" && !was_cancelled && !batch_ctrl.should_cancel_all() {
+            if post_action != "None"
+                && failed == 0
+                && !was_cancelled
+                && !batch_ctrl.should_cancel_all()
+            {
                 mapping_sink.post_batch(&post_action, post_countdown);
             }
 
