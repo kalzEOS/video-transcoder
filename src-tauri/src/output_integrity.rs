@@ -188,10 +188,10 @@ fn compare(
         ));
     }
     if copy_subtitles
-        && ss
-            .iter()
-            .zip(os)
-            .any(|(s, o)| s.codec != o.codec || s.packets != o.packets)
+        && ss.iter().zip(os).any(|(s, o)| {
+            !(s.codec == "mov_text" && o.codec == "ass")
+                && (s.codec != o.codec || s.packets != o.packets)
+        })
     {
         return Err("Copied subtitle codec or packet count changed".into());
     }

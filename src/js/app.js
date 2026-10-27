@@ -996,7 +996,7 @@
       if (mbps > settings.target * 1.15 || (mbps > settings.target && !isSameCodec)) {
         const peak = (settings.target * settings.peakMultiplier).toFixed(1).replace(/\.0$/, '');
         return `${settings.target}/${peak}Mbps (VBR)`;
-      } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
+      } else if (isNonCopyable || (settings.compatibilityMode && sourceCodec !== 'h264') || (settings.toneMapHdr && item.isHdr)) {
         if (settings.rcMode === 'CRF') {
           return `CRF ${settings.crf}`;
         }
@@ -1043,7 +1043,7 @@
         const budgetBytes = ((settings.target * 1000000 + audioBps) * item.durationSecs) / 8;
         if (!Number.isFinite(budgetBytes) || budgetBytes <= 0) return null;
         return { bytes: Math.round(budgetBytes), approx: true, atTarget: true };
-      } else if (isNonCopyable || (settings.toneMapHdr && item.isHdr)) {
+      } else if (isNonCopyable || (settings.compatibilityMode && sourceCodec !== 'h264') || (settings.toneMapHdr && item.isHdr)) {
         // Output size cannot be inferred from input size in quality-based mode.
         return { variable: true };
       } else if (mbps > 0) {

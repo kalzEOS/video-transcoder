@@ -63,6 +63,8 @@ async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
     let root = tempfile::tempdir().unwrap();
     let source = root.path().join("intermediate.mkv");
     let subtitles = root.path().join("sparse.srt");
+    let attachment = root.path().join("fixture.ttf");
+    std::fs::write(&attachment, b"disposable attachment preservation fixture").unwrap();
     std::fs::write(
         &subtitles,
         "1\n00:00:00,000 --> 00:00:01,000\nBeginning\n\n2\n00:00:24,000 --> 00:00:25,000\nLater\n",
@@ -80,7 +82,8 @@ async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
         "-x265-params", "pools=2:frame-threads=2:bframes=3:repeat-headers=1:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1):max-cll=1000,400",
         "-c:a", "eac3", "-b:a", "768k", "-c:s", "srt",
         "-metadata:s:a:0", "language=eng", "-metadata:s:s:0", "language=spa",
-    ]).arg(&source));
+    ]).args(["-disposition:s:0", "forced", "-attach"]).arg(&attachment)
+        .args(["-metadata:s:t:0", "mimetype=application/x-truetype-font"]).arg(&source));
     let inspect = |path: &Path| -> serde_json::Value {
         serde_json::from_slice(
             &run(Command::new("ffprobe")
@@ -133,6 +136,14 @@ async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
             .success
     );
     hdr::verify_output(&output, &metadata, &Sink).await.unwrap();
+    let tracks = |path: &Path| {
+        let value: serde_json::Value = serde_json::from_slice(&run(Command::new("ffprobe")
+            .args(["-v", "error", "-show_streams", "-show_data_hash", "sha256", "-show_entries",
+                "stream=codec_type,codec_name,extradata_hash:stream_disposition:stream_tags=language,filename,mimetype", "-of", "json"])
+            .arg(path)).stdout).unwrap();
+        value["streams"].as_array().unwrap().iter().filter(|s|matches!(s["codec_type"].as_str(),Some("subtitle"|"attachment"))).cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(tracks(&source), tracks(&output), "HDR10+ remux changed subtitles/fonts");
     // Exercise the application's complete-output validation on the packaged
     // HDR10+ result too, including B-frame timing and sparse subtitles.
     let validated_dir = root.path().join("validated");

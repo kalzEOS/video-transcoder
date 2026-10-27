@@ -320,6 +320,7 @@ pub fn synthetic_probe(
         has_hdr10plus: false,
         video_fps: 23.976,
         subtitle_stream_count: 0,
+        tracks: Default::default(),
     }
 }
 

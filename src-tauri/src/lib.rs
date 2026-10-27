@@ -14,6 +14,7 @@ pub mod queue;
 pub mod remote;
 mod remote_delivery;
 pub mod staging;
+pub mod tracks;
 pub mod video_format;
 pub mod webp_decode;
 

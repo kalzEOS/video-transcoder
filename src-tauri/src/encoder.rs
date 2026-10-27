@@ -346,6 +346,14 @@ pub fn require_tonemap_encode(
 }
 
 // ── Encoder detection (§8) ──────────────────────────────────────
+pub fn require_compatibility_encode(
+    decision: EncodeDecision,
+    compatibility: bool,
+    source_codec: &str,
+    rc: &RateControlParams<'_>,
+) -> EncodeDecision {
+    require_tonemap_encode(decision, compatibility && source_codec != "h264", rc)
+}
 
 /// Detect available encoders by running `ffmpeg -encoders`, then verifying
 /// each hardware encoder with a single-frame test encode.
@@ -784,12 +792,12 @@ pub fn resolve_file_settings(
     settings: &BatchSettings,
     detected_encoders: &[EncoderInfo],
 ) -> ResolvedFileSettings {
-    // 1. Codec family — explicit --codec override takes priority, then
-    //    compatibility mode, then per-file detection from the source codec.
+    // 1. Compatibility is a mandatory H.264 contract; otherwise honor the
+    // explicit codec override, then per-file source detection.
     let codec_family = match settings.codec_family.as_str() {
+        _ if settings.compatibility_mode => "h264",
         "h264" => "h264",
         "hevc" => "hevc",
-        _ if settings.compatibility_mode => "h264",
         _ if source_video_codec == "h264" => "h264",
         _ if source_video_codec == "hevc" || source_video_codec == "h265" => "hevc",
         _ if settings.preserve_av1 && source_video_codec == "av1" => "av1",
@@ -798,7 +806,17 @@ pub fn resolve_file_settings(
 
     // 2. Encoder — explicit --encoder override takes priority, then
     //    precision mode forces software, then auto-detect from detected list.
-    let encoder_name = match settings.video_encoder.as_str() {
+    let requested_encoder = if settings.compatibility_mode
+        && !settings.video_encoder.starts_with("h264_")
+        && !matches!(
+            settings.video_encoder.as_str(),
+            "libx264" | "libx264rgb" | "libopenh264"
+        ) {
+        "auto"
+    } else {
+        settings.video_encoder.as_str()
+    };
+    let encoder_name = match requested_encoder {
         "" | "auto" => {
             if settings.precision_mode {
                 software_fallback(codec_family).to_string()
@@ -1324,6 +1342,7 @@ async fn handle_post_encode(
             && !is_image_source
             && !is_copy
             && !tone_mapped
+            && (!settings.compatibility_mode || queue[idx].probe.video_codec == "h264")
         {
             sink.log(&format!(
                 "  WARNING: Output ({:.1}MB) larger than source ({:.1}MB) - remuxing source instead",
@@ -1351,26 +1370,22 @@ async fn handle_post_encode(
             ];
             remux_args.extend(audio_map);
 
-            if ext == "mp4" {
-                // MP4: convert text subs to mov_text; ffmpeg silently
-                // skips bitmap subs (PGS, DVB) that can't be converted.
-                remux_args.extend([
-                    "-map".into(),
-                    "0:s?".into(),
-                    "-c:v".into(),
-                    "copy".into(),
-                    "-c:s".into(),
-                    "mov_text".into(),
-                ]);
-            } else {
-                remux_args.extend([
-                    "-map".into(),
-                    "0:s?".into(),
-                    "-c:v".into(),
-                    "copy".into(),
-                    "-c:s".into(),
-                    "copy".into(),
-                ]);
+            remux_args.extend([
+                "-map".into(),
+                "0:s?".into(),
+                "-c:v".into(),
+                "copy".into(),
+                "-c:s".into(),
+                if ext == "mp4" { "mov_text" } else { "copy" }.into(),
+            ]);
+            match queue[idx].probe.tracks.output_args(ext, 0) {
+                Ok(args) => remux_args.extend(args),
+                Err(reason) => {
+                    sink.log(&format!("  ERROR: {reason}"));
+                    queue[idx].status = QueueItemStatus::Failed;
+                    sink.queue_item_updated(idx, "Failed");
+                    return false;
+                }
             }
             remux_args.extend(audio_codec);
             if ext == "mp4" {
@@ -1850,6 +1865,17 @@ async fn encode_single_file(
         settings.peak_multiplier,
     );
 
+    let decision = require_compatibility_encode(
+        decision,
+        settings.compatibility_mode,
+        &item_video_codec,
+        &RateControlParams {
+            mode: &settings.rate_control_mode,
+            qp_i: settings.qp_i,
+            qp_p: settings.qp_p,
+            crf_val: settings.crf_val,
+        },
+    );
     let decision = require_tonemap_encode(
         decision,
         tonemap_filter.is_some(),
@@ -1912,11 +1938,34 @@ async fn encode_single_file(
         );
         return EncodeFileResult::Failed;
     }
-    let metadata = if crate::hdr10plus_pipeline::preservation_requested(
-        hdr_plan.scan_hdr10plus,
-        &item_video_codec,
-        source_format.bit_depth,
-    ) {
+    let track_args = match queue[idx].probe.tracks.output_args(ext, 0) {
+        Ok(args) => args,
+        Err(reason) => {
+            sink.log(&format!("  ERROR: {reason}"));
+            queue[idx].status = QueueItemStatus::Failed;
+            sink.queue_item_updated(idx, "Failed");
+            return EncodeFileResult::Failed;
+        }
+    };
+    if matches!(decision, EncodeDecision::Copy) && hdr_plan.scan_hdr10plus {
+        sink.log("  Video stream copy preserves original HDR metadata; skipping HDR10+ extraction, alignment and reinsertion.");
+    }
+    if ext == "mkv"
+        && queue[idx]
+            .probe
+            .tracks
+            .subtitles
+            .iter()
+            .any(|s| s.codec == "mov_text")
+    {
+        sink.log("  MP4 timed-text subtitles are converted to ASS for MKV compatibility; languages and dispositions are retained.");
+    }
+    let metadata = if !matches!(decision, EncodeDecision::Copy)
+        && crate::hdr10plus_pipeline::preservation_requested(
+            hdr_plan.scan_hdr10plus,
+            &item_video_codec,
+            source_format.bit_depth,
+        ) {
         sink.log("  HDR10+ preservation enabled: extra extraction, alignment, reinsertion and full metadata verification passes. Dolby Vision restoration remains disabled.");
         match crate::hdr10plus_pipeline::prepare(
             std::path::Path::new(&item_full_path),
@@ -2240,45 +2289,51 @@ async fn encode_single_file(
         // the conformance window themselves; validate output dimensions below.
         let vaapi_hevc_bsf = None;
 
-        let ffmpeg_args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
-            input_path: &item_full_path,
-            output_path: &output_str,
-            video_args: &video_arg_refs,
-            render_device: encoder_render_device(detected_encoders, file_encoder),
-            hardware_decode,
-            source_format: Some(source_format),
-            pix_fmt: file_pix_fmt,
-            audio_map_args: &audio_map_args,
-            audio_codec_args: &audio_codec_args,
-            is_image_source,
-            threads: settings.threads,
-            tonemap_filter,
-            codec_family: target_codec,
-            colour_metadata,
-            vaapi_hevc_bsf,
-        });
+        let ffmpeg_args = crate::tracks::apply(
+            assemble_ffmpeg_args(&FfmpegAssemblyParts {
+                input_path: &item_full_path,
+                output_path: &output_str,
+                video_args: &video_arg_refs,
+                render_device: encoder_render_device(detected_encoders, file_encoder),
+                hardware_decode,
+                source_format: Some(source_format),
+                pix_fmt: file_pix_fmt,
+                audio_map_args: &audio_map_args,
+                audio_codec_args: &audio_codec_args,
+                is_image_source,
+                threads: settings.threads,
+                tonemap_filter,
+                codec_family: target_codec,
+                colour_metadata,
+                vaapi_hevc_bsf,
+            }),
+            &track_args,
+        );
 
-        let retry_args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
-            input_path: &item_full_path,
-            output_path: &output_str,
-            video_args: &video_arg_refs,
-            render_device: encoder_render_device(detected_encoders, file_encoder),
-            hardware_decode: false,
-            source_format: Some(source_format),
-            pix_fmt: if file_encoder.starts_with("lib") && tonemap_filter.is_none() {
-                &software_pixel_format
-            } else {
-                file_pix_fmt
-            },
-            audio_map_args: &audio_map_args,
-            audio_codec_args: &audio_codec_args,
-            is_image_source,
-            threads: settings.threads,
-            tonemap_filter,
-            codec_family: target_codec,
-            colour_metadata,
-            vaapi_hevc_bsf: None,
-        });
+        let retry_args = crate::tracks::apply(
+            assemble_ffmpeg_args(&FfmpegAssemblyParts {
+                input_path: &item_full_path,
+                output_path: &output_str,
+                video_args: &video_arg_refs,
+                render_device: encoder_render_device(detected_encoders, file_encoder),
+                hardware_decode: false,
+                source_format: Some(source_format),
+                pix_fmt: if file_encoder.starts_with("lib") && tonemap_filter.is_none() {
+                    &software_pixel_format
+                } else {
+                    file_pix_fmt
+                },
+                audio_map_args: &audio_map_args,
+                audio_codec_args: &audio_codec_args,
+                is_image_source,
+                threads: settings.threads,
+                tonemap_filter,
+                codec_family: target_codec,
+                colour_metadata,
+                vaapi_hevc_bsf: None,
+            }),
+            &track_args,
+        );
         let cmd_line = format!("ffmpeg {}", ffmpeg_args.join(" "));
         sink.batch_command(&cmd_line);
         let cmd_log = format!("  CMD: {cmd_line}");
@@ -2515,27 +2570,30 @@ async fn encode_single_file(
 
                 // Reuse audio args from the primary encode - inputs haven't changed
                 let sw_ref: Vec<&str> = sw_video_args.iter().map(|s| s.as_str()).collect();
-                let sw_args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
-                    input_path: &item_full_path,
-                    output_path: &output_str,
-                    video_args: &sw_ref,
-                    render_device: None,
-                    hardware_decode: false,
-                    source_format: Some(source_format),
-                    pix_fmt: if tonemap_filter.is_none() {
-                        &software_pixel_format
-                    } else {
-                        file_pix_fmt
-                    },
-                    audio_map_args: &audio_map_args,
-                    audio_codec_args: &audio_codec_args,
-                    is_image_source,
-                    threads: settings.threads,
-                    tonemap_filter,
-                    codec_family: target_codec,
-                    colour_metadata, // Preserve the source tags on software fallback
-                    vaapi_hevc_bsf: None, // SW encode doesn't need VAAPI crop fix
-                });
+                let sw_args = crate::tracks::apply(
+                    assemble_ffmpeg_args(&FfmpegAssemblyParts {
+                        input_path: &item_full_path,
+                        output_path: &output_str,
+                        video_args: &sw_ref,
+                        render_device: None,
+                        hardware_decode: false,
+                        source_format: Some(source_format),
+                        pix_fmt: if tonemap_filter.is_none() {
+                            &software_pixel_format
+                        } else {
+                            file_pix_fmt
+                        },
+                        audio_map_args: &audio_map_args,
+                        audio_codec_args: &audio_codec_args,
+                        is_image_source,
+                        threads: settings.threads,
+                        tonemap_filter,
+                        codec_family: target_codec,
+                        colour_metadata, // Preserve the source tags on software fallback
+                        vaapi_hevc_bsf: None, // SW encode doesn't need VAAPI crop fix
+                    }),
+                    &track_args,
+                );
 
                 let sw_cmd = format!("ffmpeg {}", sw_args.join(" "));
                 sink.batch_command(&sw_cmd);
@@ -3236,6 +3294,9 @@ async fn validate_encoded_output(
     source
         .video_format
         .verify(&output.video_format, tone_mapped)?;
+    source
+        .tracks
+        .verify(&output.tracks, path.ends_with(".mp4"))?;
     if (source.video_width, source.video_height) != (output.video_width, output.video_height) {
         return Err(format!(
             "Frame dimensions changed: {}x{} -> {}x{}",
@@ -3954,10 +4015,8 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
             args.extend(vec!["-pix_fmt".into(), parts.pix_fmt.to_string()]);
         }
         args.extend_from_slice(parts.audio_codec_args);
-        // Subtitle handling: MP4 only supports mov_text (timed text).
-        // Using `-c:s mov_text` converts text-based subs (SRT, ASS) and
-        // causes ffmpeg to silently skip bitmap subs (PGS, DVB) that
-        // cannot be converted. MKV supports all subtitle codecs as-is.
+        // Track preflight rejects unsupported MP4 subtitles before encoding.
+        // Per-track overrides/dispositions are appended after these defaults.
         if parts.output_path.ends_with(".mp4") {
             args.extend(vec![
                 "-map".into(),
@@ -3971,8 +4030,6 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
                 "0:s?".into(),
                 "-c:s".into(),
                 "copy".into(),
-                "-disposition:s:0".into(),
-                "default".into(),
             ]);
         }
     }

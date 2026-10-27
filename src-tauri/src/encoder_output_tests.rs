@@ -623,6 +623,38 @@ async fn hdr10plus_mode_keeps_hdr10_after_clean_scan_but_rejects_missing_adverti
     let original = std::fs::read(&source).unwrap();
     let item = queue_item(&source).await;
     assert!(item.probe.is_hdr && !item.probe.has_hdr10plus);
+    let copy_folder = root.path().join("auto-copy");
+    std::fs::create_dir(&copy_folder).unwrap();
+    let mut copy_settings = settings(&copy_folder);
+    copy_settings.codec_family = "hevc".into();
+    copy_settings.video_encoder = "libx265".into();
+    copy_settings.hdr_mode = Some(HdrMode::Auto);
+    let copy_sink = crate::test_helpers::RecordingSink::new();
+    let mut copy_queue = vec![item.clone()];
+    assert_eq!(
+        run_encode_loop(
+            &copy_sink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut copy_queue,
+            &copy_settings,
+            &[],
+            None,
+            None
+        )
+        .await,
+        (1, 0, 0, false)
+    );
+    assert!(copy_sink
+        .take_logs()
+        .iter()
+        .any(|m| m.contains("skipping HDR10+ extraction")));
+    assert!(!copy_sink
+        .stages
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, message, _)| message.contains("Extracting HDR10+")
+            || message.contains("Scanning HDR10+")));
     for advertised in [false, true] {
         let folder = root.path().join(if advertised {
             "advertised-but-missing"
@@ -641,6 +673,7 @@ async fn hdr10plus_mode_keeps_hdr10_after_clean_scan_but_rejects_missing_adverti
         config.codec_family = "hevc".into();
         config.video_encoder = "libx265".into();
         config.hdr_mode = Some(HdrMode::Hdr10Plus);
+        config.threshold = 0.1; // Exercise metadata preparation, not the copy bypass.
         let sink = crate::test_helpers::RecordingSink::new();
         let result = run_encode_loop(
             &sink,
@@ -718,6 +751,7 @@ async fn hdr10plus_mode_keeps_hdr10_after_clean_scan_but_rejects_missing_adverti
     config.codec_family = "hevc".into();
     config.video_encoder = "libx265".into();
     config.hdr_mode = Some(HdrMode::Hdr10Plus);
+    config.threshold = 0.1;
     assert_eq!(
         run_encode_loop(
             &NoopSink,
@@ -736,4 +770,237 @@ async fn hdr10plus_mode_keeps_hdr10_after_clean_scan_but_rejects_missing_adverti
         b"previous successful output"
     );
     assert_eq!(std::fs::read(invalid).unwrap(), b"invalid disposable video");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compatibility_encodes_below_target_hevc_and_never_restores_it_for_size() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("hevc.mkv");
+    let result = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=128x96:rate=24:duration=1",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            "pools=1:frame-threads=1:log-level=error",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let folder = root.path().join("output");
+    std::fs::create_dir(&folder).unwrap();
+    let mut config = settings(&folder);
+    config.compatibility_mode = true;
+    config.codec_family = "hevc".into(); // Stale/forced settings cannot defeat Compatibility.
+    config.video_encoder = "libx265".into();
+    config.qp_i = 0;
+    config.qp_p = 0; // Produce a larger output to exercise size-fallback guard.
+    let mut queue = vec![queue_item(&source).await];
+    let sink = crate::test_helpers::RecordingSink::new();
+    assert_eq!(
+        run_encode_loop(
+            &sink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut queue,
+            &config,
+            &[],
+            None,
+            None
+        )
+        .await,
+        (1, 0, 0, false),
+        "{:?}",
+        sink.take_logs()
+    );
+    let output = folder.join("hevc.mp4");
+    let actual = crate::probe::probe_file_for_validation(output.to_str().unwrap(), &NoopSink)
+        .await
+        .unwrap();
+    assert_eq!(actual.video_codec, "h264");
+    assert!(std::fs::metadata(output).unwrap().len() > std::fs::metadata(source).unwrap().len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mkv_copy_keeps_attachment_bytes_and_nondefault_forced_subtitles() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("tracks.mkv");
+    let subtitle = root.path().join("cue.srt");
+    let font = root.path().join("fixture.ttf");
+    std::fs::write(&subtitle, "1\n00:00:00,000 --> 00:00:00,800\nHello\n").unwrap();
+    std::fs::write(&font, b"disposable font attachment preservation fixture").unwrap();
+    let result = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=128x96:rate=24:duration=1",
+            "-i",
+        ])
+        .arg(&subtitle)
+        .arg("-i")
+        .arg(&subtitle)
+        .args([
+            "-map",
+            "0:v",
+            "-map",
+            "1:s",
+            "-map",
+            "2:s",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:s",
+            "srt",
+            "-disposition:s:0",
+            "0",
+            "-disposition:s:1",
+            "forced",
+            "-metadata:s:s:0",
+            "language=eng",
+            "-metadata:s:s:1",
+            "language=spa",
+            "-attach",
+        ])
+        .arg(&font)
+        .args(["-metadata:s:t:0", "mimetype=application/x-truetype-font"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let folder = root.path().join("output");
+    std::fs::create_dir(&folder).unwrap();
+    let mut queue = vec![queue_item(&source).await];
+    assert_eq!(queue[0].probe.tracks.attachment_count, 1);
+    assert_eq!(
+        run_encode_loop(
+            &NoopSink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut queue,
+            &settings(&folder),
+            &[],
+            None,
+            None
+        )
+        .await,
+        (1, 0, 0, false)
+    );
+    let output = folder.join("tracks.mkv");
+    let inspect = |path: &Path| {
+        let result = std::process::Command::new("ffprobe").args([
+            "-v","error","-show_streams","-show_data_hash","sha256","-show_entries",
+            "stream=codec_type,codec_name,extradata_hash:stream_disposition:stream_tags=language,filename,mimetype",
+            "-of","json",
+        ]).arg(path).output().unwrap();
+        assert!(result.status.success());
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["codec_type"] != "video")
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(inspect(&source), inspect(&output));
+    // MP4 timed text cannot be stream-copied into MKV; convert it to ASS
+    // while retaining the video and the subtitle's language/dispositions.
+    let text_source = root.path().join("timed-text.mp4");
+    let result = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(&source)
+        .args([
+            "-map", "0:v:0", "-map", "0:s:0", "-c:v", "copy", "-c:s", "mov_text",
+        ])
+        .arg(&text_source)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut text_queue = vec![queue_item(&text_source).await];
+    let mut text_config = settings(&folder);
+    text_config.output_container = "mkv".into();
+    let text_sink = crate::test_helpers::RecordingSink::new();
+    assert_eq!(
+        run_encode_loop(
+            &text_sink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut text_queue,
+            &text_config,
+            &[],
+            None,
+            None
+        )
+        .await,
+        (1, 0, 0, false),
+        "{:?}",
+        text_sink.take_logs()
+    );
+    let text_output =
+        crate::probe::probe_file(folder.join("timed-text.mkv").to_str().unwrap(), &NoopSink)
+            .await
+            .unwrap();
+    assert_eq!(text_output.tracks.subtitles[0].codec, "ass");
+    text_queue[0]
+        .probe
+        .tracks
+        .verify(&text_output.tracks, false)
+        .unwrap();
+    let mut config = settings(&folder);
+    config.output_container = "mp4".into();
+    let mut queue = vec![queue_item(&source).await];
+    let sink = crate::test_helpers::RecordingSink::new();
+    assert_eq!(
+        run_encode_loop(
+            &sink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut queue,
+            &config,
+            &[],
+            None,
+            None
+        )
+        .await,
+        (0, 1, 0, false)
+    );
+    assert!(sink
+        .take_logs()
+        .iter()
+        .any(|line| line.contains("MP4 cannot preserve attached files/fonts")));
+    assert!(!sink
+        .stages
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(stage, _, _)| stage == "encoding"));
 }

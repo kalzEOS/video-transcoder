@@ -25,6 +25,8 @@ pub struct ProbeResult {
     pub has_hdr10plus: bool,
     pub video_fps: f64,
     pub subtitle_stream_count: u32,
+    #[serde(default)]
+    pub tracks: crate::tracks::TrackInfo,
 }
 
 /// Run ffprobe with the given arguments and return trimmed stdout.
@@ -164,6 +166,7 @@ async fn probe_file_mode(
                     30.0
                 },
                 subtitle_stream_count: 0,
+                tracks: Default::default(),
             });
         }
         // Fall through to normal probe if RIFF parse fails
@@ -507,6 +510,7 @@ async fn probe_file_mode(
         has_hdr10plus,
         video_fps,
         subtitle_stream_count,
+        tracks: crate::tracks::TrackInfo::from_streams(streams.map(Vec::as_slice).unwrap_or(&[])),
     })
 }
 

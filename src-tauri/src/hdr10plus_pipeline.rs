@@ -274,6 +274,28 @@ pub async fn inject_hdr10plus(
         ));
     }
     let mut remux = ffbin::ffmpeg_command();
+    let stream_json = crate::probe::run_ffprobe_public(&[
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name:stream_disposition",
+        "-of",
+        "json",
+        &encoded_path.to_string_lossy(),
+    ])
+    .await?;
+    let stream_json: serde_json::Value =
+        serde_json::from_str(&stream_json).map_err(|e| e.to_string())?;
+    let track_info = crate::tracks::TrackInfo::from_streams(
+        stream_json["streams"]
+            .as_array()
+            .ok_or("Cannot inspect intermediate tracks")?,
+    );
+    let container = output_path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("mkv");
+    let track_args = track_info.output_args(container, 1)?;
     remux.kill_on_drop(true).args([
         "-y",
         "-copyts",
@@ -310,6 +332,7 @@ pub async fn inject_hdr10plus(
         // This can buffer packets until the next sparse subtitle or EOF.
         remux.args(["-max_interleave_delta", "0"]);
     }
+    remux.args(track_args);
     let child = remux
         .arg(output_path)
         .stdout(std::process::Stdio::null())
