@@ -11,6 +11,10 @@ use tokio::process::Command;
 #[path = "encoder_devices.rs"]
 mod devices;
 
+#[cfg(test)]
+#[path = "encoder_output_tests.rs"]
+mod output_tests;
+
 // ── Rate-control parameters (options struct) ───────────────────
 
 /// Rate control parameters for the encoding decision.
@@ -1258,7 +1262,7 @@ async fn handle_post_encode(
     queue: &mut [QueueItem],
     decision: &EncodeDecision,
     temp_output_file: &std::path::Path,
-    output_file: &std::path::Path,
+    output_transaction: &mut crate::output_transaction::OutputTransaction,
     output_str: &str,
     final_output_str: &str,
     ext: &str,
@@ -1289,7 +1293,7 @@ async fn handle_post_encode(
     }
     sink.processing_stage("finalizing", "Validating and finalizing output...", None);
     // Post-encode size check
-    // In replace mode, ffmpeg wrote to temp_output_file; in other modes temp == final.
+    // All modes write to a unique pending file, leaving the destination intact.
     // Skip for Copy decisions: the output is just a remux of the source, so
     // a "remux source instead" fallback would produce the same file again.
     let is_copy = matches!(decision, EncodeDecision::Copy);
@@ -1492,60 +1496,23 @@ async fn handle_post_encode(
         if sink.cancellation_requested() {
             return false;
         }
-        if sink.cancellation_requested() {
-            return false;
-        }
         // Once the source replacement starts, finish the atomic commit before
         // accepting cancellation. The completed output must never be removed.
-        // Replace mode: safely swap source with encoded output.
-        // Rename source to .bak first so we can recover if the final
-        // rename fails (avoids TOCTOU data loss).
-        if is_replace_mode && temp_output_file.exists() {
-            let backup = std::path::PathBuf::from(format!("{}.histv-bak", item_full_path));
-            let source_backed_up = match std::fs::rename(item_full_path, &backup) {
-                Ok(_) => true,
-                Err(e) => {
-                    let warn = format!("  WARNING: Could not back up source for replacement: {e}");
-                    sink.log(&warn);
-                    write_log(log_writer, &warn);
-                    false
-                }
-            };
-            // Rename temp to final
-            if temp_output_file != output_file {
-                if let Err(e) = std::fs::rename(temp_output_file, output_file) {
-                    let warn = format!("  WARNING: Could not rename temp to final path: {e}");
-                    sink.log(&warn);
-                    write_log(log_writer, &warn);
-                    // Restore the backup so the source is not lost
-                    if source_backed_up {
-                        let _ = std::fs::rename(&backup, item_full_path);
-                    }
-                } else {
-                    // Success — remove the backup
-                    if source_backed_up {
-                        let _ = std::fs::remove_file(&backup);
-                    }
-                    let msg = format!("  Replaced source → {}", final_output_str);
-                    sink.log(&msg);
-                    write_log(log_writer, &msg);
-                }
-            } else if source_backed_up {
-                // temp_output_file == output_file, just clean up backup
-                let _ = std::fs::remove_file(&backup);
-            }
-        } else if settings.delete_source && temp_output_file.exists() {
-            // Normal delete-source mode
-            match std::fs::remove_file(item_full_path) {
-                Ok(_) => {
-                    sink.log("  Source file deleted");
-                    write_log(log_writer, "  Source deleted");
-                }
-                Err(e) => {
-                    let warn = format!("  WARNING: Could not delete source: {e}");
-                    sink.log(&warn);
-                    write_log(log_writer, &warn);
-                }
+        if let Err(reason) = output_transaction.commit() {
+            sink.log(&format!(
+                "  ERROR: {reason}. Source and existing output retained."
+            ));
+            write_log(log_writer, &reason);
+            queue[idx].status = QueueItemStatus::Failed;
+            sink.queue_item_updated(idx, "Failed");
+            return false;
+        }
+        if is_replace_mode || settings.delete_source {
+            if let Err(reason) = output_transaction.remove_source() {
+                sink.log(&format!(
+                    "  WARNING: {reason}. Validated output installed at {final_output_str}"
+                ));
+                write_log(log_writer, &reason);
             }
         }
 
@@ -1697,7 +1664,7 @@ async fn encode_single_file(
     let is_replace_mode = settings.output_mode == "replace";
 
     // Determine output path based on output mode (#8 - eliminate clone)
-    let (output_file, temp_output_file) = match settings.output_mode.as_str() {
+    let output_file = match settings.output_mode.as_str() {
         "beside" => {
             // Create an "output" subfolder next to the input file
             let input_dir = std::path::Path::new(&item_full_path)
@@ -1714,18 +1681,15 @@ async fn encode_single_file(
                     return EncodeFileResult::Failed;
                 }
             }
-            let out = out_dir.join(format!("{}.{}", item_base_name, ext));
-            (out.clone(), out)
+            out_dir.join(format!("{}.{}", item_base_name, ext))
         }
         "replace" => {
-            // Encode to a temp file in the same directory, then replace the source
+            // Final installation is staged on this same destination filesystem.
             let input_path = std::path::Path::new(&item_full_path);
             let input_dir = input_path
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new("."));
-            let final_path = input_dir.join(format!("{}.{}", item_base_name, ext));
-            let temp_path = input_dir.join(format!("{}.histv-tmp.{}", item_base_name, ext));
-            (final_path, temp_path)
+            input_dir.join(format!("{}.{}", item_base_name, ext))
         }
         _ => {
             // "folder" - default: use the configured output folder. When that
@@ -1734,10 +1698,26 @@ async fn encode_single_file(
             // (mirrors replace/beside: keeps the network to a single burst).
             let folder: &std::path::Path = output_dir_override
                 .unwrap_or_else(|| std::path::Path::new(&settings.output_folder));
-            let out = folder.join(format!("{}.{}", item_base_name, ext));
-            (out.clone(), out)
+            folder.join(format!("{}.{}", item_base_name, ext))
         }
     };
+    // Reject input aliases before any FFmpeg command or failure cleanup can
+    // touch them. Only this transaction's pending path is ever encoded/deleted.
+    let mut output_transaction = match crate::output_transaction::OutputTransaction::new(
+        std::path::Path::new(&item_full_path),
+        &output_file,
+        is_replace_mode,
+    ) {
+        Ok(transaction) => transaction,
+        Err(reason) => {
+            sink.log(&format!("  ERROR: {reason}"));
+            write_log(log_writer, &reason);
+            queue[idx].status = QueueItemStatus::Failed;
+            sink.queue_item_updated(idx, "Failed");
+            return EncodeFileResult::Failed;
+        }
+    };
+    let temp_output_file = output_transaction.pending_path().to_path_buf();
     // On Windows, prepend the extended-length path prefix when the path
     // exceeds 240 characters to avoid MAX_PATH (260) failures.
     #[cfg(target_os = "windows")]
@@ -1772,9 +1752,12 @@ async fn encode_single_file(
         sink.log("  HDR → SDR: tonemapping with Hable curve");
     }
 
-    // Overwrite check - in replace mode, we're replacing the source so
-    // no overwrite prompt is needed. In other modes, check the final output.
-    if !is_replace_mode && output_file.exists() && !batch_control.overwrite_always() {
+    // Replace mode bypasses the prompt only for the source itself. A sibling
+    // file with a different extension is an existing output and needs consent.
+    if !output_transaction.replaces_source()
+        && output_file.exists()
+        && !batch_control.overwrite_always()
+    {
         let response = batch_control.overwrite_prompt(&final_output_str);
         match response.as_str() {
             "no" | "skip" => {
@@ -2607,7 +2590,7 @@ async fn encode_single_file(
         queue,
         &decision,
         &temp_output_file,
-        &output_file,
+        &mut output_transaction,
         &output_str,
         &final_output_str,
         ext,
@@ -2635,6 +2618,16 @@ async fn encode_single_file(
         } else {
             EncodeFileResult::CancelledCurrent
         };
+    }
+    if !success && temp_output_file.is_file() {
+        match output_transaction.retain_pending() {
+            Ok(Some(path)) => sink.log(&format!(
+                "  RECOVERY: Uninstalled output retained at {} (not marked as successfully finalized).",
+                path.display()
+            )),
+            Err(reason) => sink.log(&format!("  WARNING: Could not retain pending output: {reason}")),
+            Ok(None) => {}
+        }
     }
     if success {
         EncodeFileResult::Done

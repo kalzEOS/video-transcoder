@@ -39,6 +39,7 @@ console = { version = "0.16", optional = true }
 ctrlc = { version = "3", optional = true }
 sha2 = "0.10"
 tempfile = "3"
+same-file = "1"
 hdr10plus = { version = "~2.1.5", features = ["hevc", "json"] }
 
 [features]

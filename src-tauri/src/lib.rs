@@ -6,6 +6,7 @@ pub mod hdr10plus_pipeline;
 pub mod hevc_utils;
 pub mod metadata_order;
 pub mod mkv_tags;
+pub mod output_transaction;
 pub mod pipeline_progress;
 pub mod probe;
 pub mod queue;
