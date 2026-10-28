@@ -274,15 +274,18 @@ pub async fn inject_hdr10plus(
         ));
     }
     let mut remux = ffbin::ffmpeg_command();
-    let stream_json = crate::probe::run_ffprobe_public(&[
-        "-v",
-        "error",
-        "-show_entries",
-        "stream=codec_type,codec_name:stream_disposition",
-        "-of",
-        "json",
-        &encoded_path.to_string_lossy(),
-    ])
+    let stream_json = crate::probe::run_ffprobe_with_sink(
+        &[
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name:stream_disposition",
+            "-of",
+            "json",
+            &encoded_path.to_string_lossy(),
+        ],
+        sink,
+    )
     .await?;
     let stream_json: serde_json::Value =
         serde_json::from_str(&stream_json).map_err(|e| e.to_string())?;

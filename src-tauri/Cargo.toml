@@ -60,3 +60,6 @@ cli = ["dep:clap", "dep:indicatif", "dep:ctrlc", "dep:console"]
 [dev-dependencies]
 proptest = "1"
 serial_test = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

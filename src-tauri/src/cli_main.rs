@@ -1299,6 +1299,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         QueueItem {
+            id: video_transcoder_lib::queue::new_queue_id(),
             full_path: path.to_string(),
             file_name,
             base_name,
@@ -1323,6 +1324,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
         QueueItem {
+            id: video_transcoder_lib::queue::new_queue_id(),
             full_path: path.to_string(),
             file_name,
             base_name,

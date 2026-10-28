@@ -1158,8 +1158,10 @@
     // failure, not probe failure), schedule a full refresh as a
     // belt-and-braces fallback in case the event never fired.
     async function probeFileAt(index) {
+      const id = queueData[index]?.id;
+      if (!id) return;
       try {
-        await invoke('probe_file', { index });
+        await invoke('probe_file', { index, id });
       } catch (e) {
         console.warn(`Probe failed for index ${index}:`, e);
         scheduleQueueRefresh();
@@ -2894,7 +2896,11 @@
       // instead of walking the entire queue table. Also tracks the currently-
       // encoding row index so the file-progress listener can skip querySelector.
       listen('queue-item-updated', (event) => {
-        const [index, status] = event.payload;
+        let [index, status, id] = event.payload;
+        if (id && queueData[index]?.id !== id) {
+          index = queueData.findIndex(item => item.id === id);
+          if (index < 0) { scheduleQueueRefresh(); return; }
+        }
         if (index >= 0 && index < queueData.length) {
           queueData[index].status = status;
         }
@@ -2941,8 +2947,9 @@
       // probe event. renderQueue() is already a differential update, so
       // the DOM cost is bounded to cells that actually changed.
       listen('queue-item-probed', (event) => {
-        const [index, item] = event.payload;
-        if (index >= queueData.length) {
+        let [index, item] = event.payload;
+        if (item.id && queueData[index]?.id !== item.id) index = queueData.findIndex(entry => entry.id === item.id);
+        if (index < 0 || index >= queueData.length) {
           // Index out of sync with frontend state — fall back to a full
           // refresh so we don't silently desync.
           scheduleQueueRefresh();

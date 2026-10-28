@@ -342,6 +342,7 @@ pub fn make_queue_item(
         .to_string();
     let source_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     crate::queue::QueueItem {
+        id: crate::queue::new_queue_id(),
         full_path: path.to_string(),
         file_name,
         base_name,
@@ -370,6 +371,7 @@ pub fn make_queue_item_sized(
         .to_string_lossy()
         .to_string();
     crate::queue::QueueItem {
+        id: crate::queue::new_queue_id(),
         full_path: path.to_string(),
         file_name,
         base_name,

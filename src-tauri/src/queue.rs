@@ -40,6 +40,8 @@ impl std::fmt::Display for QueueItemStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueItem {
+    #[serde(default = "new_queue_id")]
+    pub id: String,
     pub full_path: String,
     pub file_name: String,
     pub base_name: String,
@@ -47,6 +49,43 @@ pub struct QueueItem {
     pub source_bytes: u64,
     #[serde(flatten)]
     pub probe: ProbeResult,
+}
+
+pub fn new_queue_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{time:x}-{:x}-{:x}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Apply a late probe only to the same queue entry, even after reorder/removal.
+pub fn apply_probe(
+    queue: &mut [QueueItem],
+    hint: usize,
+    id: &str,
+    path: &str,
+    result: &Result<ProbeResult, String>,
+) -> Option<(usize, QueueItem)> {
+    let matches = |item: &QueueItem| item.id == id && item.full_path == path;
+    let index = if queue.get(hint).is_some_and(matches) {
+        hint
+    } else {
+        queue.iter().position(matches)?
+    };
+    match result {
+        Ok(probe) => {
+            queue[index].probe = probe.clone();
+            queue[index].status = QueueItemStatus::Pending;
+        }
+        Err(_) => queue[index].status = QueueItemStatus::Failed,
+    }
+    Some((index, queue[index].clone()))
 }
 
 /// Per-stream audio metadata collected during probing.
@@ -174,6 +213,7 @@ pub fn add_paths_to_queue(queue: &mut Vec<QueueItem>, paths: &[String]) -> AddRe
         let source_bytes = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
 
         let item = QueueItem {
+            id: crate::queue::new_queue_id(),
             full_path: file_path,
             file_name,
             base_name,
@@ -260,9 +300,29 @@ pub fn move_item(queue: &mut Vec<QueueItem>, from: usize, to: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn late_probe_follows_identity_and_cannot_update_readded_path() {
+        let mut queue = vec![
+            make_item("first.mkv", QueueItemStatus::Pending),
+            make_item("other.mkv", QueueItemStatus::Pending),
+        ];
+        let id = queue[0].id.clone();
+        let path = queue[0].full_path.clone();
+        queue.swap(0, 1);
+        let result = Ok(crate::test_helpers::synthetic_probe("hevc", 8.0, 1.0, true));
+        let (index, _) = apply_probe(&mut queue, 0, &id, &path, &result).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(queue[1].probe.video_codec, "hevc");
+        queue.remove(1);
+        queue.push(make_item("first.mkv", QueueItemStatus::Pending));
+        assert_ne!(id, queue[1].id);
+        assert!(apply_probe(&mut queue, 0, &id, &path, &result).is_none());
+        assert_ne!(queue[1].probe.video_codec, "hevc");
+    }
 
     fn make_item(name: &str, status: QueueItemStatus) -> QueueItem {
         QueueItem {
+            id: crate::queue::new_queue_id(),
             full_path: format!("/tmp/{name}"),
             file_name: name.to_string(),
             base_name: name.to_string(),

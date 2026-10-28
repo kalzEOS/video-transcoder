@@ -14,6 +14,9 @@ mod devices;
 #[cfg(test)]
 #[path = "encoder_output_tests.rs"]
 mod output_tests;
+#[cfg(test)]
+#[path = "encoder_supervision_tests.rs"]
+mod supervision_tests;
 
 // ── Rate-control parameters (options struct) ───────────────────
 
@@ -1395,14 +1398,16 @@ async fn handle_post_encode(
 
             let remux_refs: Vec<&str> = remux_args.iter().map(|s| s.as_str()).collect();
             let remux_output = ffbin::ffmpeg_command()
+                .kill_on_drop(true)
                 .args(&remux_refs)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
-                .map(|child| child.wait_with_output())
                 .ok();
             let remux_status = match remux_output {
-                Some(fut) => fut.await.ok(),
+                Some(child) => crate::pipeline_progress::wait_output(child, sink)
+                    .await
+                    .ok(),
                 None => None,
             };
 
@@ -3442,8 +3447,9 @@ async fn run_ffmpeg_with_progress(
     let phase_start = std::time::Instant::now();
     let mut cmd = ffbin::ffmpeg_command();
     cmd.args(args)
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
 
     // Set below-normal priority on the ffmpeg child process
@@ -3478,6 +3484,8 @@ async fn run_ffmpeg_with_progress(
 
     // Stream stderr for progress using a blocking thread, with log capture
     let progress = FfmpegProgress::new();
+    let mut pause =
+        crate::process_control::PauseGuard::new(child.id().ok_or("FFmpeg PID unavailable")?);
     let stderr_thread = child.stderr.take().map(|stderr| {
         spawn_stderr_reader(stderr, &progress, ctx.stderr_log.clone(), ctx.stderr_label)
     });
@@ -3491,6 +3499,7 @@ async fn run_ffmpeg_with_progress(
             Err(_) => break,
         }
         if ctx.batch_control.should_cancel_current() || ctx.batch_control.should_cancel_all() {
+            pause.set(false)?;
             if let Some(mut stdin) = child.stdin.take() {
                 use tokio::io::AsyncWriteExt;
                 let _ = stdin.write_all(b"q").await;
@@ -3504,11 +3513,10 @@ async fn run_ffmpeg_with_progress(
             break;
         }
 
-        while ctx.batch_control.is_paused() {
-            if ctx.batch_control.should_cancel_current() || ctx.batch_control.should_cancel_all() {
-                break;
-            }
+        pause.set(ctx.batch_control.is_paused())?;
+        if ctx.batch_control.is_paused() {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
         }
 
         if file_duration > 0.0 {
@@ -3532,12 +3540,25 @@ async fn run_ffmpeg_with_progress(
     if let Some(handle) = stderr_thread {
         let _ = handle.join();
     }
-    if file_duration > 0.0 {
+    let exit_code = exit_status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+    if exit_code != 0
+        && !ctx.batch_control.should_cancel_current()
+        && !ctx.batch_control.should_cancel_all()
+    {
+        let tail = progress.stderr_tail();
+        ctx.sink
+            .log(&format!("  FFmpeg failed (exit {exit_code}):\n{tail}"));
+        ctx.sink.ffmpeg_stderr(&tail);
+    }
+    if file_duration > 0.0
+        && exit_code == 0
+        && !ctx.batch_control.should_cancel_current()
+        && !ctx.batch_control.should_cancel_all()
+    {
         ctx.sink
             .file_progress(100.0, file_duration, file_duration, pass);
     }
 
-    let exit_code = exit_status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
     let final_frames = progress.frames();
 
     ctx.sink.log(&format!(
@@ -4315,6 +4336,7 @@ pub async fn execute_post_action(action: &str) -> Result<(), String> {
 pub struct FfmpegProgress {
     pub progress_secs: Arc<std::sync::atomic::AtomicU64>,
     pub frame_count: Arc<std::sync::atomic::AtomicU64>,
+    pub diagnostics: Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>,
 }
 
 impl Default for FfmpegProgress {
@@ -4328,6 +4350,7 @@ impl FfmpegProgress {
         Self {
             progress_secs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             frame_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            diagnostics: Arc::default(),
         }
     }
 
@@ -4342,6 +4365,16 @@ impl FfmpegProgress {
     /// Read the current frame count.
     pub fn frames(&self) -> u64 {
         self.frame_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn stderr_tail(&self) -> String {
+        let bytes: Vec<_> = self
+            .diagnostics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 }
 
@@ -4457,6 +4490,7 @@ pub fn spawn_stderr_reader(
     };
     let progress_secs = Arc::clone(&progress.progress_secs);
     let frames = Arc::clone(&progress.frame_count);
+    let diagnostics = Arc::clone(&progress.diagnostics);
     let label = label.to_owned();
 
     std::thread::spawn(move || {
@@ -4481,6 +4515,12 @@ pub fn spawn_stderr_reader(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    {
+                        let mut tail = diagnostics.lock().unwrap_or_else(|e| e.into_inner());
+                        tail.extend(&buf[..n]);
+                        let overflow = tail.len().saturating_sub(65536);
+                        tail.drain(..overflow);
+                    }
                     // Write raw bytes to shared log file
                     if let Some(ref log) = stderr_log {
                         if let Ok(mut w) = log.lock() {
@@ -4509,6 +4549,11 @@ pub fn spawn_stderr_reader(
                                 if let Some(pos) = line_buf.windows(6).position(|w| w == b"frame=")
                                 {
                                     let start = pos + 6;
+                                    let start = start
+                                        + line_buf[start..]
+                                            .iter()
+                                            .take_while(|b| b.is_ascii_whitespace())
+                                            .count();
                                     let end = line_buf[start..]
                                         .iter()
                                         .position(|&b| b == b' ' || b == b'\t')
@@ -4522,7 +4567,7 @@ pub fn spawn_stderr_reader(
                                 }
                                 line_buf.clear();
                             }
-                        } else {
+                        } else if line_buf.len() < 8192 {
                             line_buf.push(byte);
                         }
                     }

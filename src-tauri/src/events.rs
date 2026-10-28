@@ -23,6 +23,10 @@ pub trait EventSink: Send + Sync {
     fn batch_progress(&self, current: u32, total: usize);
     fn batch_status(&self, message: &str);
     fn queue_item_updated(&self, index: usize, status: &str);
+    fn queue_item_status(&self, id: &str, index: usize, status: &str) {
+        let _ = id;
+        self.queue_item_updated(index, status);
+    }
     /// Emitted after a queue item's probe (or repair) completes. The full
     /// post-probe `QueueItem` snapshot travels with the event so the frontend
     /// can patch a single row without refetching the whole queue (#3c).
@@ -45,6 +49,9 @@ pub trait EventSink: Send + Sync {
 /// Blanket impl: `Arc<T>` delegates to the inner `T`, allowing shared
 /// ownership of sinks across async tasks without trait-object indirection.
 impl<T: EventSink> EventSink for std::sync::Arc<T> {
+    fn queue_item_status(&self, id: &str, index: usize, status: &str) {
+        (**self).queue_item_status(id, index, status)
+    }
     fn processing_stage(&self, stage: &str, message: &str, percent: Option<f64>) {
         (**self).processing_stage(stage, message, percent)
     }
@@ -145,6 +152,7 @@ mod tests {
 
     fn make_item(path: &str, status: QueueItemStatus) -> QueueItem {
         QueueItem {
+            id: crate::queue::new_queue_id(),
             full_path: path.to_string(),
             file_name: "test.mkv".to_string(),
             base_name: "test".to_string(),

@@ -31,25 +31,41 @@ pub struct ProbeResult {
 
 /// Run ffprobe with the given arguments and return trimmed stdout.
 async fn run_ffprobe(args: &[&str]) -> Result<String, String> {
-    run_ffprobe_mode(args, false).await
+    run_ffprobe_mode(args, false, None).await
 }
 
-async fn run_ffprobe_mode(args: &[&str], verify_decode: bool) -> Result<String, String> {
-    let output = ffmpeg::ffprobe_command()
+async fn run_ffprobe_mode(
+    args: &[&str],
+    verify_decode: bool,
+    sink: Option<&dyn EventSink>,
+) -> Result<String, String> {
+    let child = ffmpeg::ffprobe_command()
         .kill_on_drop(true)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to spawn ffprobe: {e}"))?
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("ffprobe wait failed: {e}"))?;
-
+        .map_err(|e| format!("Failed to spawn ffprobe: {e}"))?;
+    let output = match sink {
+        Some(sink) => crate::pipeline_progress::capture_output(child, sink).await?,
+        None => child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("ffprobe wait failed: {e}"))?,
+    };
     if verify_decode {
         check_decoded_probe(output.status.success(), &output.stderr)?;
+    } else if !output.status.success() {
+        return Err(format!(
+            "FFprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub async fn run_ffprobe_with_sink(args: &[&str], sink: &dyn EventSink) -> Result<String, String> {
+    run_ffprobe_mode(args, false, Some(sink)).await
 }
 
 fn check_decoded_probe(success: bool, stderr: &[u8]) -> Result<(), String> {
@@ -174,15 +190,18 @@ async fn probe_file_mode(
     }
 
     // ── Single-pass probe: all streams + format in one call ──
-    let json_raw = run_ffprobe(&[
-        "-v",
-        "error",
-        "-show_streams",
-        "-show_format",
-        "-of",
-        "json",
-        file_path,
-    ])
+    let json_raw = run_ffprobe_with_sink(
+        &[
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            file_path,
+        ],
+        sink,
+    )
     .await
     .unwrap_or_default();
 
@@ -446,7 +465,7 @@ async fn probe_file_mode(
             "-of",
             "json",
             file_path,
-        ], verify_decode).await;
+        ], verify_decode, Some(sink)).await;
         if verify_decode {
             if let Err(error) = &frame_result {
                 return Err(error.clone());
@@ -526,19 +545,22 @@ async fn packet_scan_duration(file_path: &str, sink: &dyn EventSink) -> f64 {
 
     // Approach 1: seek near the end and read the last packet's PTS.
     // This is fast even on large files since ffprobe seeks by percentage.
-    let raw = run_ffprobe(&[
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-read_intervals",
-        "99999%+#1",
-        "-show_entries",
-        "packet=pts_time",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        file_path,
-    ])
+    let raw = run_ffprobe_with_sink(
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-read_intervals",
+            "99999%+#1",
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            file_path,
+        ],
+        sink,
+    )
     .await
     .unwrap_or_default();
 
@@ -549,16 +571,19 @@ async fn packet_scan_duration(file_path: &str, sink: &dyn EventSink) -> f64 {
 
     // Approach 2: force ffprobe to calculate duration via the demuxer
     // by requesting format duration with -count_packets.
-    let raw2 = run_ffprobe(&[
-        "-v",
-        "error",
-        "-count_packets",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        file_path,
-    ])
+    let raw2 = run_ffprobe_with_sink(
+        &[
+            "-v",
+            "error",
+            "-count_packets",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            file_path,
+        ],
+        sink,
+    )
     .await
     .unwrap_or_default();
 
@@ -583,17 +608,20 @@ async fn packet_count_bitrate(file_path: &str, sink: &dyn EventSink) -> f64 {
     ));
 
     // Sum packet sizes using CSV output (one size per line).
-    let raw = match run_ffprobe(&[
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "packet=size",
-        "-of",
-        "csv=p=0",
-        file_path,
-    ])
+    let raw = match run_ffprobe_with_sink(
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "packet=size",
+            "-of",
+            "csv=p=0",
+            file_path,
+        ],
+        sink,
+    )
     .await
     {
         Ok(r) => r,
@@ -610,19 +638,22 @@ async fn packet_count_bitrate(file_path: &str, sink: &dyn EventSink) -> f64 {
     }
 
     // Fetch duration separately (tiny response, no DOM needed).
-    let dur_raw = match run_ffprobe(&[
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=duration",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        file_path,
-    ])
+    let dur_raw = match run_ffprobe_with_sink(
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            file_path,
+        ],
+        sink,
+    )
     .await
     {
         Ok(r) => r,

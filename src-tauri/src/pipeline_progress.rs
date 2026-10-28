@@ -147,6 +147,34 @@ pub async fn wait_output(
 }
 
 /// Throttle frame-based progress without inventing time estimates.
+pub async fn capture_output(
+    mut child: tokio::process::Child,
+    sink: &dyn EventSink,
+) -> Result<std::process::Output, String> {
+    use tokio::io::AsyncReadExt;
+    let stdout = child.stdout.take();
+    let reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(stdout) = stdout {
+            // Packet JSON can be large, but must never consume unbounded RAM.
+            stdout
+                .take(256 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|e| e.to_string())?;
+            if bytes.len() > 256 * 1024 * 1024 {
+                return Err("Probe response exceeded 256 MiB".to_string());
+            }
+        }
+        Ok(bytes)
+    });
+    let result = wait_output(child, sink).await;
+    let stdout = reader.await.map_err(|e| e.to_string())??;
+    let mut result = result?;
+    result.stdout = stdout;
+    Ok(result)
+}
+
 pub fn frames(
     sink: &dyn EventSink,
     stage: &str,
@@ -164,6 +192,32 @@ pub fn frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_capture_reaps_child_and_closes_stdout() {
+        let control = crate::test_helpers::CancellableBatchControl::new();
+        control
+            .cancel_current
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let sink = PipelineSink {
+            inner: &crate::test_helpers::NoopSink,
+            control: &control,
+        };
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            capture_output(child, &sink),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err(), "Cancelled");
+    }
     use crate::test_helpers::{CancellableBatchControl, RecordingSink};
     use std::sync::{atomic::Ordering, Arc};
 

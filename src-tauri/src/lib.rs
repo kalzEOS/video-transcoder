@@ -10,6 +10,7 @@ mod output_integrity;
 pub mod output_transaction;
 pub mod pipeline_progress;
 pub mod probe;
+mod process_control;
 pub mod queue;
 pub mod remote;
 mod remote_delivery;
@@ -75,6 +76,7 @@ mod gui_commands {
         inner: Arc<dyn EventSink>,
         /// `index_map[local_idx] == original_queue_idx`
         index_map: Vec<usize>,
+        ids: Vec<String>,
     }
 
     impl EventSink for IndexMappingSink {
@@ -102,7 +104,9 @@ mod gui_commands {
         }
         fn queue_item_updated(&self, index: usize, status: &str) {
             let mapped = self.index_map.get(index).copied().unwrap_or(index);
-            self.inner.queue_item_updated(mapped, status);
+            if let Some(id) = self.ids.get(index) {
+                self.inner.queue_item_status(id, mapped, status);
+            }
         }
         fn queue_item_probed(&self, index: usize, item: &queue::QueueItem) {
             let mapped = self.index_map.get(index).copied().unwrap_or(index);
@@ -364,70 +368,43 @@ mod gui_commands {
         app: tauri::AppHandle,
         state: tauri::State<'_, Arc<AppState>>,
         index: usize,
+        id: Option<String>,
     ) -> Result<ProbeResult, String> {
         let sink = tauri_sink::TauriSink::new(app.clone());
-
-        let file_path = {
-            let q = state.queue.read().await;
-            if index >= q.len() {
-                return Err("Index out of range".to_string());
-            }
-            q[index].full_path.clone()
-        };
-
-        // Update status to Probing
-        {
+        let (index, id, file_path) = {
             let mut q = state.queue.write().await;
-            if index < q.len() {
-                q[index].status = QueueItemStatus::Probing;
+            let index = match id {
+                Some(ref id) => q
+                    .iter()
+                    .position(|item| &item.id == id)
+                    .ok_or("Queue entry was removed")?,
+                None if index < q.len() => index,
+                None => return Err("Index out of range".into()),
+            };
+            q[index].status = QueueItemStatus::Probing;
+            (index, q[index].id.clone(), q[index].full_path.clone())
+        };
+        sink.queue_item_status(&id, index, "Probing");
+        let mut result = probe::probe_file(&file_path, &sink).await;
+        if let Ok(probe) = &mut result {
+            if let Some(bps) = crate::mkv_tags::estimate_bitrate_after_probe(
+                &file_path,
+                probe.duration_secs,
+                &probe.audio_streams,
+            ) {
+                probe.video_bitrate_bps = bps as f64;
+                probe.video_bitrate_mbps = bps as f64 / 1_000_000.0;
             }
         }
-        sink.queue_item_updated(index, "Probing");
-
-        let result = probe::probe_file(&file_path, &sink).await;
-
-        // Update the queue item with probe results and capture a snapshot
-        // for the delta event (#3c).
-        let item_snapshot: Option<queue::QueueItem> = {
+        let snapshot = {
             let mut q = state.queue.write().await;
-            if index < q.len() {
-                match &result {
-                    Ok(pr) => {
-                        // Estimate queue bitrate without modifying the source.
-                        // Tag repair remains an explicit user action.
-                        let repair = crate::mkv_tags::estimate_bitrate_after_probe(
-                            &file_path,
-                            pr.duration_secs,
-                            &pr.audio_streams,
-                        );
-                        q[index].probe = pr.clone();
-                        q[index].status = QueueItemStatus::Pending;
-
-                        if let Some(bps) = repair {
-                            let corrected_mbps = bps as f64 / 1_000_000.0;
-                            q[index].probe.video_bitrate_bps = bps as f64;
-                            q[index].probe.video_bitrate_mbps = corrected_mbps;
-                        }
-                    }
-                    Err(_) => {
-                        q[index].status = QueueItemStatus::Failed;
-                    }
-                }
-                Some(q[index].clone())
-            } else {
-                None
-            }
+            queue::apply_probe(&mut q, index, &id, &file_path, &result)
         };
-        if let Some(ref item) = item_snapshot {
-            sink.queue_item_probed(index, item);
+        if let Some((index, item)) = snapshot {
+            sink.queue_item_probed(index, &item);
         }
-
         result
     }
-
-    /// Repair stale MKV stream statistics tags on queued files.
-    /// Probes each file, computes correct values, and patches in-place.
-    /// Returns the number of files that were updated.
     #[tauri::command]
     pub async fn repair_tags(
         app: tauri::AppHandle,
@@ -683,6 +660,7 @@ mod gui_commands {
         let mapping_sink = Arc::new(IndexMappingSink {
             inner: sink.clone() as Arc<dyn EventSink>,
             index_map: index_map.clone(),
+            ids: pending_items.iter().map(|item| item.id.clone()).collect(),
         });
 
         tokio::spawn(async move {
@@ -701,11 +679,14 @@ mod gui_commands {
             // the shared queue using the index map.
             {
                 let mut q = state_for_task.queue.write().await;
-                for (local_idx, item) in pending_items.iter().enumerate() {
-                    if let Some(&orig_idx) = index_map.get(local_idx) {
-                        if orig_idx < q.len() {
-                            q[orig_idx].status = item.status.clone();
-                        }
+                let positions: std::collections::HashMap<_, _> = q
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| (item.id.clone(), index))
+                    .collect();
+                for item in &pending_items {
+                    if let Some(&index) = positions.get(&item.id) {
+                        q[index].status = item.status.clone();
                     }
                 }
             }
@@ -754,9 +735,20 @@ mod gui_commands {
 
     #[tauri::command]
     pub async fn toggle_pause(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
-        let mut b = state.batch.lock().await;
-        b.paused = !b.paused;
-        Ok(b.paused)
+        #[cfg(not(unix))]
+        {
+            let _ = state;
+            return Err(
+                "Process pausing is unavailable on this platform; cancellation is still supported."
+                    .into(),
+            );
+        }
+        #[cfg(unix)]
+        {
+            let mut b = state.batch.lock().await;
+            b.paused = !b.paused;
+            Ok(b.paused)
+        }
     }
 
     #[tauri::command]

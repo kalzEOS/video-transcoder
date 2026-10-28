@@ -5293,6 +5293,7 @@ dependencies = [
  "futures-util",
  "hdr10plus",
  "indicatif",
+ "libc",
  "proptest",
  "regex",
  "reqwest",

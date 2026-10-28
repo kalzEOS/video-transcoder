@@ -116,6 +116,9 @@ impl EventSink for TauriSink {
     fn queue_item_updated(&self, index: usize, status: &str) {
         let _ = self.app.emit("queue-item-updated", (index, status));
     }
+    fn queue_item_status(&self, id: &str, index: usize, status: &str) {
+        let _ = self.app.emit("queue-item-updated", (index, status, id));
+    }
 
     fn queue_item_probed(&self, index: usize, item: &QueueItem) {
         // Payload carries the full post-probe row so the frontend can patch
