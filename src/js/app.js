@@ -545,85 +545,84 @@
       const leftPanel = $('#left-panel');
       const rightPanel = $('#right-panel');
       const mainArea = $('#main-area');
-      let dragging = false;
+      let drag = null;
+      let suppressClick = false;
+      const horizontal = () => getComputedStyle(mainArea).flexDirection === 'row-reverse';
+      let expandedWidth = horizontal() ? rightPanel.getBoundingClientRect().width
+        : parseFloat(getComputedStyle(rightPanel).getPropertyValue('--rail-w')) || 320;
 
-      // Read the CSS min/max constraints on the right panel
-      const rpStyle = getComputedStyle(rightPanel);
-      const rightMinW = parseInt(rpStyle.minWidth, 10) || 280;
-      const rightMaxW = parseInt(rpStyle.maxWidth, 10) || 520;
+      function applyWidth() {
+        if (settingsPanelCollapsed || !horizontal()) {
+          rightPanel.style.removeProperty('flex-basis');
+          return;
+        }
+        const style = getComputedStyle(rightPanel);
+        const min = parseFloat(style.minWidth) || 258;
+        const max = Math.min(parseFloat(style.maxWidth) || Infinity,
+          mainArea.getBoundingClientRect().width - splitter.getBoundingClientRect().width
+          - (parseFloat(getComputedStyle(leftPanel).minWidth) || 340));
+        rightPanel.style.flexBasis = `${Math.max(min, Math.min(max, expandedWidth))}px`;
+      }
 
-      // ── Splitter drag ──
+      function endDrag() {
+        drag = null;
+        splitter.classList.remove('dragging');
+        document.body.classList.remove('dragging');
+      }
+
+      // Resize the visually left rail; the queue remains the flexible sibling.
+      // Use a delta so grabbing anywhere on the handle cannot jump its edge.
       splitter.addEventListener('mousedown', (e) => {
-        if (settingsPanelCollapsed) return;
-        if (e.target === splitterToggle || splitterToggle.contains(e.target)) return;
-        dragging = true;
-        splitter.classList.add('dragging');
+        if (e.button !== 0 || settingsPanelCollapsed || !horizontal()) return;
+        suppressClick = false;
+        drag = { x: e.clientX, width: rightPanel.getBoundingClientRect().width, moved: false };
         e.preventDefault();
       });
 
       document.addEventListener('mousemove', (e) => {
-        if (!dragging) return;
-        const rect = mainArea.getBoundingClientRect();
-        const offset = e.clientX - rect.left;
-        const minLeft = 220;
-        // Clamp so right panel stays between its min and max width
-        const maxLeft = rect.width - rightMinW - 5;
-        const minLeftFromMax = rect.width - rightMaxW - 5;
-        const clamped = Math.max(Math.max(minLeft, minLeftFromMax), Math.min(maxLeft, offset));
-        leftPanel.style.flex = 'none';
-        leftPanel.style.width = clamped + 'px';
+        if (!drag) return;
+        if (!drag.moved && Math.abs(e.clientX - drag.x) < 4) return;
+        drag.moved = true;
+        suppressClick = true;
+        splitter.classList.add('dragging');
+        document.body.classList.add('dragging');
+        expandedWidth = drag.width + e.clientX - drag.x;
+        applyWidth();
+        // Remember the displayed width, not an overshoot beyond its limits.
+        expandedWidth = parseFloat(rightPanel.style.flexBasis);
       });
 
       document.addEventListener('mouseup', () => {
-        if (dragging) {
-          dragging = false;
-          splitter.classList.remove('dragging');
-        }
+        if (!drag) return;
+        endDrag();
+        // The mouse-generated click follows mouseup before the next task.
+        setTimeout(() => { suppressClick = false; }, 0);
+      });
+      window.addEventListener('blur', () => {
+        endDrag();
+        suppressClick = false;
       });
 
       // ── Toggle button ──
       splitterToggle.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (suppressClick) return;
         settingsPanelCollapsed = !settingsPanelCollapsed;
-
-        if (settingsPanelCollapsed) {
-          rightPanel.classList.add('collapsed');
-          splitterToggle.innerHTML = '&#x25C0;';
-          splitterToggle.title = 'Show settings panel';
-          splitterToggle.setAttribute('aria-label', 'Show settings panel');
-          leftPanel.style.flex = '1';
-          leftPanel.style.width = '';
-        } else {
-          rightPanel.classList.remove('collapsed');
-          splitterToggle.innerHTML = '&#x25B6;';
-          splitterToggle.title = 'Hide settings panel';
-          splitterToggle.setAttribute('aria-label', 'Hide settings panel');
-          // Let flex layout restore the split naturally
-          leftPanel.style.flex = 'none';
-          const mainRect = mainArea.getBoundingClientRect();
-          // Default to giving the right panel ~480px
-          const desiredRight = Math.min(rightMaxW, Math.max(rightMinW, 480));
-          leftPanel.style.width = (mainRect.width - desiredRight - 5) + 'px';
-        }
+        rightPanel.classList.toggle('collapsed', settingsPanelCollapsed);
+        splitterToggle.innerHTML = settingsPanelCollapsed ? '&#x25B6;' : '&#x25C0;';
+        const label = settingsPanelCollapsed ? 'Show settings panel' : 'Hide settings panel';
+        splitterToggle.title = settingsPanelCollapsed ? label : 'Drag to resize or click to hide settings panel';
+        splitterToggle.setAttribute('aria-label', label);
+        splitterToggle.setAttribute('aria-expanded', String(!settingsPanelCollapsed));
+        applyWidth();
       });
 
-      // ── Window resize - clamp left panel so right panel stays within min/max ──
-      let resizeDebounce;
       window.addEventListener('resize', () => {
-        clearTimeout(resizeDebounce);
-        resizeDebounce = setTimeout(() => {
-          if (settingsPanelCollapsed) return;
-          if (!leftPanel.style.width) return;
-          const mainRect = mainArea.getBoundingClientRect();
-          let currentLeft = parseInt(leftPanel.style.width, 10);
-          const maxLeft = mainRect.width - rightMinW - 5;
-          const minLeft = mainRect.width - rightMaxW - 5;
-          const clamped = Math.max(220, Math.max(minLeft, Math.min(maxLeft, currentLeft)));
-          if (clamped !== currentLeft) {
-            leftPanel.style.width = clamped + 'px';
-          }
-        }, 100);
+        endDrag();
+        suppressClick = false;
+        applyWidth();
       });
+      applyWidth();
     }
 
     // ═══════════════════════════════════════════════════════════════
