@@ -5,6 +5,7 @@ description = "Honey, I Shrunk The Vids - batch video encoder"
 authors = ["claude.ai", "obelisk-complex"]
 license = "GPL-3.0-or-later"
 edition = "2021"
+rust-version = "1.89"
 
 [lib]
 name = "histv_lib"
@@ -59,3 +60,6 @@ cli = ["dep:clap", "dep:indicatif", "dep:ctrlc", "dep:console"]
 [dev-dependencies]
 proptest = "1"
 serial_test = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

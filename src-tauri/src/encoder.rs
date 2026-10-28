@@ -1783,7 +1783,11 @@ async fn encode_single_file(
         let source_bytes = std::fs::metadata(&item_full_path)
             .map(|m| m.len())
             .unwrap_or(0);
-        match crate::temp_workspace::create_job_workspace(&temp_parent, source_bytes) {
+        match crate::temp_workspace::create_job_workspace_for_output(
+            &temp_parent,
+            source_bytes,
+            Some(&temp_output_file),
+        ) {
             Ok(workspace) => Some(workspace),
             Err(reason) => {
                 sink.log(&format!("  ERROR: {reason}"));

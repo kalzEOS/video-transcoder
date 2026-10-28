@@ -145,6 +145,23 @@ pub async fn inject_hdr10plus(
     temp_parent: &Path,
     sink: &dyn EventSink,
 ) -> Result<Hdr10PlusPipelineResult, String> {
+    let encoded_bytes = std::fs::metadata(encoded_path)
+        .map_err(|e| e.to_string())?
+        .len();
+    let metadata_bytes = metadata
+        .frames
+        .iter()
+        .flatten()
+        .fold(0u64, |sum, nal| sum.saturating_add(nal.len() as u64));
+    let (work_bytes, output_bytes) =
+        crate::temp_workspace::reinsertion_budget(encoded_bytes, metadata_bytes);
+    crate::temp_workspace::check_stage(
+        temp_parent,
+        Some(encoded_path),
+        work_bytes,
+        output_bytes,
+        "before HDR10+ reinsertion",
+    )?;
     let temp_dir = hevc_utils::make_tempdir(".histv-hdr10plus-inject-", Some(temp_parent))?;
 
     // Step 1: Demux encoded output to raw HEVC
@@ -435,12 +452,75 @@ pub async fn inject_pending(
         return Err(result.message);
     }
     crate::pipeline_progress::check(sink).map_err(|e| e.to_string())?;
-    let backup = staging.path().join("encoded-backup");
-    std::fs::rename(encoded, &backup).map_err(|e| e.to_string())?;
-    if let Err(error) = std::fs::rename(&output, encoded) {
-        let _ = std::fs::rename(&backup, encoded);
-        return Err(format!("Cannot install HDR10+ output: {error}"));
+    install_preserved(encoded, &output, temp_parent, sink).await?;
+    Ok(())
+}
+
+/// Copy across filesystems into an owned sibling, then atomically replace
+/// only the pending encode. The pre-injection encode survives every failure.
+async fn install_preserved(
+    encoded: &Path,
+    preserved: &Path,
+    workspace: &Path,
+    sink: &dyn EventSink,
+) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let expected = std::fs::metadata(preserved)
+        .map_err(|e| e.to_string())?
+        .len();
+    if expected == 0 {
+        return Err("Cannot install empty HDR10+ output".into());
     }
+    crate::temp_workspace::check_stage(
+        workspace,
+        Some(encoded),
+        0,
+        expected,
+        "before installing HDR10+ output",
+    )?;
+    let permission = std::fs::metadata(encoded)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    let pending = tempfile::Builder::new()
+        .prefix(".histv-install-")
+        .tempfile_in(encoded.parent().unwrap_or(Path::new(".")))
+        .map_err(|e| e.to_string())?
+        .into_temp_path();
+    let mut input = tokio::fs::File::open(preserved)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut output = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&pending)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    loop {
+        crate::pipeline_progress::check(sink).map_err(|e| e.to_string())?;
+        let n = input.read(&mut buffer).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..n])
+            .await
+            .map_err(|e| e.to_string())?;
+        copied += n as u64;
+    }
+    if copied != expected {
+        return Err("Incomplete HDR10+ installation copy".into());
+    }
+    output.flush().await.map_err(|e| e.to_string())?;
+    output.sync_all().await.map_err(|e| e.to_string())?;
+    drop(output);
+    drop(input);
+    std::fs::set_permissions(&pending, permission).map_err(|e| e.to_string())?;
+    crate::pipeline_progress::check(sink).map_err(|e| e.to_string())?;
+    pending
+        .persist(encoded)
+        .map_err(|e| format!("Cannot install HDR10+ output; original encode retained: {e}"))?;
     Ok(())
 }
 
@@ -452,6 +532,14 @@ pub async fn verify_output(
     temp_parent: &Path,
     sink: &dyn EventSink,
 ) -> Result<(), String> {
+    let bytes = std::fs::metadata(output).map_err(|e| e.to_string())?.len();
+    crate::temp_workspace::check_stage(
+        temp_parent,
+        Some(output),
+        bytes.saturating_add(128 * 1024 * 1024),
+        0,
+        "before HDR10+ verification",
+    )?;
     let actual = crate::pipeline_progress::metadata_work(extract_hdr10plus_in(
         output,
         sink,
@@ -524,6 +612,65 @@ pub(crate) fn parse_hdr10plus_from_sei_nalu(nalu_data: &[u8]) -> Option<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn installation_preserves_encode_on_cancellation_and_empty_result() {
+        let root = tempfile::tempdir().unwrap();
+        let encoded = root.path().join("encoded.mkv");
+        let preserved = root.path().join("preserved.mkv");
+        fs_write(&encoded, b"working encode");
+        fs_write(&preserved, b"");
+        assert!(install_preserved(
+            &encoded,
+            &preserved,
+            root.path(),
+            &crate::test_helpers::NoopSink
+        )
+        .await
+        .is_err());
+        fs_write(&preserved, b"completed metadata output");
+        let control = crate::test_helpers::CancellableBatchControl::new();
+        control
+            .cancel_current
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let sink = crate::pipeline_progress::PipelineSink {
+            inner: &crate::test_helpers::NoopSink,
+            control: &control,
+        };
+        assert!(install_preserved(&encoded, &preserved, root.path(), &sink)
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&encoded).unwrap(), b"working encode");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+    fn fs_write(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn custom_workspace_on_another_filesystem_installs_without_rename_exdev() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir_in("/dev/shm").unwrap();
+        if std::fs::metadata(root.path()).unwrap().dev()
+            == std::fs::metadata(other.path()).unwrap().dev()
+        {
+            return;
+        }
+        let encoded = root.path().join("encoded movie ü.mkv");
+        let preserved = other.path().join("HDR10+ preserved.mkv");
+        fs_write(&encoded, b"before metadata");
+        fs_write(&preserved, b"completed HDR10+ output");
+        install_preserved(
+            &encoded,
+            &preserved,
+            other.path(),
+            &crate::test_helpers::NoopSink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&encoded).unwrap(), b"completed HDR10+ output");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 
     #[tokio::test]
     async fn cancellation_cleans_metadata_workspaces_and_keeps_input() {

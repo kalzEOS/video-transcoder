@@ -14,6 +14,7 @@ pub mod staging;
 pub mod temp_workspace;
 pub mod video_format;
 pub mod webp_decode;
+mod workspace_registry;
 
 #[cfg(test)]
 pub mod test_helpers;
@@ -920,6 +921,11 @@ pub fn run() {
         ])
         .setup(move |app| {
             let sink = tauri_sink::TauriSink::new(app.handle().clone());
+            match crate::temp_workspace::cleanup_registered_abandoned() {
+                Ok(count) if count>0 => sink.log(&format!("Cleaned {count} abandoned metadata workspace(s); active and unmanaged directories were retained.")),
+                Err(error) => sink.log(&format!("Could not clean abandoned metadata workspaces: {error}")),
+                _=>{}
+            }
 
             // Resolve ffmpeg/ffprobe binary paths (sidecar or PATH)
             let resource_dir = app.path().resource_dir().ok();
