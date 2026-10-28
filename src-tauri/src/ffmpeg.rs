@@ -78,8 +78,7 @@ pub fn app_data_bin_dir() -> Option<PathBuf> {
     let parent = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".local").join("share"))
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
         });
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let parent: Option<PathBuf> = None;
@@ -876,7 +875,9 @@ mod tests {
         }
         assert_eq!(
             result,
-            Some(PathBuf::from("/tmp/test-xdg-data/com.kalzi.videotranscoder/bin"))
+            Some(PathBuf::from(
+                "/tmp/test-xdg-data/com.kalzi.videotranscoder/bin"
+            ))
         );
     }
 
