@@ -434,6 +434,9 @@ pub async fn demux_to_annexb(
 ) -> Result<(), String> {
     crate::pipeline_progress::check(sink).map_err(|e| e.to_string())?;
     let child = crate::ffmpeg::ffmpeg_command()
+        .env("TMPDIR", output_path.parent().unwrap_or(Path::new(".")))
+        .env("TMP", output_path.parent().unwrap_or(Path::new(".")))
+        .env("TEMP", output_path.parent().unwrap_or(Path::new(".")))
         .kill_on_drop(true)
         .args([
             "-y",

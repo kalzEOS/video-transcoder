@@ -5,6 +5,7 @@ description = "Video Transcoder - batch video encoder"
 authors = ["claude.ai", "obelisk-complex"]
 license = "GPL-3.0-or-later"
 edition = "2021"
+rust-version = "1.89"
 
 [lib]
 name = "video_transcoder_lib"

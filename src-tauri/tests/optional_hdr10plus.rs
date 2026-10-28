@@ -1,8 +1,8 @@
 //! Short, opt-in physical GPU regression. No existing media are modified.
 use hdr10plus::{hevc::encode_hdr10plus_nal, metadata::Hdr10PlusMetadata};
-use video_transcoder_lib::{hdr10plus_pipeline as hdr, EventSink, QueueItem};
 use sha2::{Digest, Sha256};
 use std::{path::Path, process::Command};
+use video_transcoder_lib::{hdr10plus_pipeline as hdr, EventSink, QueueItem};
 
 struct Sink;
 impl EventSink for Sink {
@@ -61,6 +61,13 @@ fn packets(path: &Path, selector: &str) -> serde_json::Value {
 #[ignore = "requires FFmpeg with libx265/E-AC3 and MP4Box; no GPU required"]
 async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
     let root = tempfile::tempdir().unwrap();
+    // Exercise a custom workspace on another filesystem when available.
+    #[cfg(target_os = "linux")]
+    let custom = tempfile::tempdir_in("/dev/shm").unwrap();
+    #[cfg(not(target_os = "linux"))]
+    let custom = tempfile::tempdir().unwrap();
+    let workspace =
+        video_transcoder_lib::temp_workspace::create_job_workspace(custom.path(), 0).unwrap();
     let source = root.path().join("intermediate.mkv");
     let subtitles = root.path().join("sparse.srt");
     let attachment = root.path().join("fixture.ttf");
@@ -129,35 +136,63 @@ async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
             .collect(),
     };
     let output = root.path().join("preserved.mkv");
-    assert!(
-        hdr::inject_hdr10plus(&source, &output, &metadata, &Sink)
-            .await
-            .unwrap()
-            .success
-    );
-    hdr::verify_output(&output, &metadata, &Sink).await.unwrap();
+    std::fs::copy(&source, &output).unwrap();
+    hdr::inject_pending(&output, &metadata, workspace.path(), &Sink)
+        .await
+        .unwrap();
+    hdr::verify_output(&output, &metadata, workspace.path(), &Sink)
+        .await
+        .unwrap();
     let tracks = |path: &Path| {
         let value: serde_json::Value = serde_json::from_slice(&run(Command::new("ffprobe")
             .args(["-v", "error", "-show_streams", "-show_data_hash", "sha256", "-show_entries",
                 "stream=codec_type,codec_name,extradata_hash:stream_disposition:stream_tags=language,filename,mimetype", "-of", "json"])
             .arg(path)).stdout).unwrap();
-        value["streams"].as_array().unwrap().iter().filter(|s|matches!(s["codec_type"].as_str(),Some("subtitle"|"attachment"))).cloned().collect::<Vec<_>>()
+        value["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| matches!(s["codec_type"].as_str(), Some("subtitle" | "attachment")))
+            .cloned()
+            .collect::<Vec<_>>()
     };
-    assert_eq!(tracks(&source), tracks(&output), "HDR10+ remux changed subtitles/fonts");
+    assert_eq!(
+        tracks(&source),
+        tracks(&output),
+        "HDR10+ remux changed subtitles/fonts"
+    );
     // Exercise the application's complete-output validation on the packaged
     // HDR10+ result too, including B-frame timing and sparse subtitles.
     let validated_dir = root.path().join("validated");
     run(Command::new(env!("CARGO_BIN_EXE_video-transcoder-cli"))
         .args([
-            "--hdr", "--encoder", "libx265", "--codec", "hevc",
-            "--bitrate", "100", "--audio", "copy", "--overwrite", "yes",
-            "--fallback", "no", "--log-level", "quiet", "--output",
+            "--hdr",
+            "--encoder",
+            "libx265",
+            "--codec",
+            "hevc",
+            "--bitrate",
+            "100",
+            "--audio",
+            "copy",
+            "--overwrite",
+            "yes",
+            "--fallback",
+            "no",
+            "--log-level",
+            "quiet",
+            "--output",
         ])
         .arg(&validated_dir)
         .arg(&output));
-    hdr::verify_output(&validated_dir.join("preserved.mkv"), &metadata, &Sink)
-        .await
-        .unwrap();
+    hdr::verify_output(
+        &validated_dir.join("preserved.mkv"),
+        &metadata,
+        workspace.path(),
+        &Sink,
+    )
+    .await
+    .unwrap();
     // A successful mux and metadata scan alone do not rule out a frozen
     // picture. Compare decoded frames at the start and after a later seek.
     let decoded_frames = |path: &Path, start: Option<&str>| -> Vec<String> {
@@ -377,12 +412,14 @@ async fn opt_in_preserves_sparse_late_metadata_with_cpu_or_gpu_decode() {
     };
     let source = root.path().join("late-hdr10plus.mkv");
     assert!(
-        hdr::inject_hdr10plus(&plain, &source, &expected, &Sink)
+        hdr::inject_hdr10plus(&plain, &source, &expected, root.path(), &Sink)
             .await
             .unwrap()
             .success
     );
-    hdr::verify_output(&source, &expected, &Sink).await.unwrap();
+    hdr::verify_output(&source, &expected, root.path(), &Sink)
+        .await
+        .unwrap();
     // A delayed video track must stay delayed relative to copied audio/subs.
     let delayed = root.path().join("delayed.mkv");
     run(Command::new("ffmpeg")
@@ -394,7 +431,7 @@ async fn opt_in_preserves_sparse_late_metadata_with_cpu_or_gpu_decode() {
         .arg(&delayed));
     let delayed_preserved = root.path().join("delayed-preserved.mkv");
     assert!(
-        hdr::inject_hdr10plus(&delayed, &delayed_preserved, &expected, &Sink)
+        hdr::inject_hdr10plus(&delayed, &delayed_preserved, &expected, root.path(), &Sink)
             .await
             .unwrap()
             .success
@@ -456,12 +493,12 @@ async fn opt_in_preserves_sparse_late_metadata_with_cpu_or_gpu_decode() {
         .arg(&mp4_plain));
     let mp4_preserved = root.path().join("preserved.mp4");
     assert!(
-        hdr::inject_hdr10plus(&mp4_plain, &mp4_preserved, &expected, &Sink)
+        hdr::inject_hdr10plus(&mp4_plain, &mp4_preserved, &expected, root.path(), &Sink)
             .await
             .unwrap()
             .success
     );
-    hdr::verify_output(&mp4_preserved, &expected, &Sink)
+    hdr::verify_output(&mp4_preserved, &expected, root.path(), &Sink)
         .await
         .unwrap();
     assert_eq!(pixels(&plain), pixels(&mp4_preserved));
@@ -469,7 +506,7 @@ async fn opt_in_preserves_sparse_late_metadata_with_cpu_or_gpu_decode() {
         frames: expected.frames.clone(),
     };
     misaligned.frames.swap(25, 26);
-    assert!(hdr::verify_output(&source, &misaligned, &Sink)
+    assert!(hdr::verify_output(&source, &misaligned, root.path(), &Sink)
         .await
         .is_err());
     assert!(source.exists());

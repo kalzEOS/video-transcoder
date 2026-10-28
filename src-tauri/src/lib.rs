@@ -15,9 +15,11 @@ pub mod queue;
 pub mod remote;
 mod remote_delivery;
 pub mod staging;
+pub mod temp_workspace;
 pub mod tracks;
 pub mod video_format;
 pub mod webp_decode;
+mod workspace_registry;
 
 #[cfg(test)]
 pub mod test_helpers;
@@ -584,6 +586,17 @@ mod gui_commands {
             let out_path = std::path::Path::new(&batch_settings.output_folder);
             encoder::validate_output_folder(out_path)?;
         }
+        let temp_parent = if batch_settings
+            .temp_files_location
+            .eq_ignore_ascii_case("custom")
+        {
+            std::path::PathBuf::from(&batch_settings.custom_temp_directory)
+        } else {
+            std::path::PathBuf::from(&batch_settings.output_folder)
+        };
+        if temp_parent.is_dir() {
+            let _ = crate::temp_workspace::cleanup_abandoned(&temp_parent);
+        }
 
         // Reset batch state and set running
         {
@@ -908,6 +921,11 @@ pub fn run() {
         ])
         .setup(move |app| {
             let sink = tauri_sink::TauriSink::new(app.handle().clone());
+            match crate::temp_workspace::cleanup_registered_abandoned() {
+                Ok(count) if count>0 => sink.log(&format!("Cleaned {count} abandoned metadata workspace(s); active and unmanaged directories were retained.")),
+                Err(error) => sink.log(&format!("Could not clean abandoned metadata workspaces: {error}")),
+                _=>{}
+            }
 
             // Resolve ffmpeg/ffprobe binary paths (sidecar or PATH)
             let resource_dir = app.path().resource_dir().ok();

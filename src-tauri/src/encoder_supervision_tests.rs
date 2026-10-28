@@ -8,6 +8,7 @@ async fn ffmpeg_error_tail_is_reported_without_file_logging() {
     let control = CancellableBatchControl::new();
     let ctx = FfmpegRunContext {
         low_priority: false,
+        temp_dir: None,
         stderr_log: None,
         stderr_label: "test",
         sink: &sink,
@@ -50,6 +51,7 @@ async fn paused_ffmpeg_cancels_and_is_reaped() {
         tokio::spawn(async move {
             let ctx = FfmpegRunContext {
                 low_priority: false,
+                temp_dir: None,
                 stderr_log: None,
                 stderr_label: "test",
                 sink: &sink,

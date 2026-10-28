@@ -139,97 +139,26 @@ pub fn partition_free_space(path: &Path) -> Option<(u64, u64)> {
     }
 }
 
-// Linux x86_64: all statvfs fields are `unsigned long` (u64).
-#[cfg(target_os = "linux")]
+// Use the platform's real ABI rather than hand-maintained statvfs layouts.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
 fn partition_free_space_unix(path: &Path) -> Option<(u64, u64)> {
-    use std::ffi::CString;
-    use std::mem::MaybeUninit;
     use std::os::unix::ffi::OsStrExt;
-
-    extern "C" {
-        fn statvfs(path: *const std::ffi::c_char, buf: *mut Statvfs) -> std::ffi::c_int;
-    }
-
-    #[repr(C)]
-    struct Statvfs {
-        f_bsize: u64,  // unsigned long
-        f_frsize: u64, // unsigned long
-        f_blocks: u64, // fsblkcnt_t = unsigned long on Linux x86_64
-        f_bfree: u64,  // fsblkcnt_t
-        f_bavail: u64, // fsblkcnt_t
-        _rest: [u8; 256],
-    }
-
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut buf = MaybeUninit::<Statvfs>::zeroed();
-
-    // Safety: `statvfs` is a well-defined POSIX syscall. We pass a valid
-    // NUL-terminated path and a properly-aligned buffer.
-    let ret = unsafe { statvfs(c_path.as_ptr(), buf.as_mut_ptr()) };
-    if ret != 0 {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
         return None;
     }
-
-    let stat = unsafe { buf.assume_init() };
-    let block_size = if stat.f_frsize > 0 {
+    let stat = unsafe { stat.assume_init() };
+    let block = if stat.f_frsize > 0 {
         stat.f_frsize
     } else {
         stat.f_bsize
-    };
-    let total = stat.f_blocks * block_size;
-    let avail = stat.f_bavail * block_size;
-
-    Some((total, avail))
-}
-
-// macOS: f_bsize/f_frsize are c_ulong (u64 on 64-bit), but
-// f_blocks/f_bfree/f_bavail are fsblkcnt_t = c_uint (u32).
-#[cfg(target_os = "macos")]
-fn partition_free_space_unix(path: &Path) -> Option<(u64, u64)> {
-    use std::ffi::CString;
-    use std::mem::MaybeUninit;
-    use std::os::unix::ffi::OsStrExt;
-
-    extern "C" {
-        fn statvfs(path: *const std::ffi::c_char, buf: *mut Statvfs) -> std::ffi::c_int;
-    }
-
-    // macOS statvfs layout (from <sys/statvfs.h>):
-    //   unsigned long  f_bsize
-    //   unsigned long  f_frsize
-    //   fsblkcnt_t     f_blocks   (unsigned int on macOS)
-    //   fsblkcnt_t     f_bfree    (unsigned int)
-    //   fsblkcnt_t     f_bavail   (unsigned int)
-    #[repr(C)]
-    struct Statvfs {
-        f_bsize: std::ffi::c_ulong, // 64-bit on 64-bit macOS
-        f_frsize: std::ffi::c_ulong,
-        f_blocks: u32, // fsblkcnt_t = unsigned int
-        f_bfree: u32,
-        f_bavail: u32,
-        _rest: [u8; 256],
-    }
-
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut buf = MaybeUninit::<Statvfs>::zeroed();
-
-    // Safety: `statvfs` is a well-defined POSIX syscall. We pass a valid
-    // NUL-terminated path and a properly-aligned buffer.
-    let ret = unsafe { statvfs(c_path.as_ptr(), buf.as_mut_ptr()) };
-    if ret != 0 {
-        return None;
-    }
-
-    let stat = unsafe { buf.assume_init() };
-    let block_size = if stat.f_frsize > 0 {
-        stat.f_frsize as u64
-    } else {
-        stat.f_bsize as u64
-    };
-    let total = stat.f_blocks as u64 * block_size;
-    let avail = stat.f_bavail as u64 * block_size;
-
-    Some((total, avail))
+    } as u64;
+    Some((
+        (stat.f_blocks as u64).checked_mul(block)?,
+        (stat.f_bavail as u64).checked_mul(block)?,
+    ))
 }
 
 #[cfg(windows)]

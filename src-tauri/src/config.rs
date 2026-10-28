@@ -46,6 +46,8 @@ pub struct AppConfig {
     pub preserve_av1: bool,
     #[serde(default)]
     pub force_local: bool,
+    pub temp_files_location: String,
+    pub custom_temp_directory: String,
 }
 
 impl Default for AppConfig {
@@ -83,6 +85,8 @@ impl Default for AppConfig {
             compatibility_mode: false,
             preserve_av1: false,
             force_local: false,
+            temp_files_location: "automatic".to_string(),
+            custom_temp_directory: String::new(),
         }
     }
 }
@@ -123,7 +127,10 @@ fn migrate_legacy_app_data_config(path: &std::path::Path) {
         let legacy = parent.join("com.histv.encoder").join("config.json");
         if legacy.is_file() && legacy != path {
             if let Err(error) = fs::copy(&legacy, path) {
-                eprintln!("Could not migrate legacy settings from {}: {error}", legacy.display());
+                eprintln!(
+                    "Could not migrate legacy settings from {}: {error}",
+                    legacy.display()
+                );
             }
         }
     }
@@ -193,11 +200,17 @@ mod tests {
         let new_path = new_dir.join("config.json");
         fs::write(&old_path, r#"{"target_bitrate":8}"#).unwrap();
         migrate_legacy_app_data_config(&new_path);
-        assert_eq!(fs::read_to_string(&new_path).unwrap(), fs::read_to_string(&old_path).unwrap());
+        assert_eq!(
+            fs::read_to_string(&new_path).unwrap(),
+            fs::read_to_string(&old_path).unwrap()
+        );
         fs::write(&new_path, "keep-new-settings").unwrap();
         migrate_legacy_app_data_config(&new_path);
         assert_eq!(fs::read_to_string(&new_path).unwrap(), "keep-new-settings");
-        assert_eq!(fs::read_to_string(&old_path).unwrap(), r#"{"target_bitrate":8}"#);
+        assert_eq!(
+            fs::read_to_string(&old_path).unwrap(),
+            r#"{"target_bitrate":8}"#
+        );
     }
 
     #[test]

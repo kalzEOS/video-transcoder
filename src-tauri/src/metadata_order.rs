@@ -39,9 +39,10 @@ pub fn rank_timestamps(pts: &[f64]) -> Result<Vec<usize>, String> {
 pub async fn packet_order(
     path: &Path,
     count: usize,
+    temp_parent: &Path,
     sink: &dyn EventSink,
 ) -> Result<Vec<usize>, String> {
-    Ok(packet_timeline(path, count, sink).await?.rank)
+    Ok(packet_timeline(path, count, temp_parent, sink).await?.rank)
 }
 
 pub struct PacketTimeline {
@@ -52,11 +53,15 @@ pub struct PacketTimeline {
 pub async fn packet_timeline(
     path: &Path,
     count: usize,
+    temp_parent: &Path,
     sink: &dyn EventSink,
 ) -> Result<PacketTimeline, String> {
     pipeline_progress::check(sink).map_err(|e| e.to_string())?;
-    let file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    let file = tempfile::NamedTempFile::new_in(temp_parent).map_err(|e| e.to_string())?;
     let child = crate::ffmpeg::ffprobe_command()
+        .env("TMPDIR", temp_parent)
+        .env("TMP", temp_parent)
+        .env("TEMP", temp_parent)
         .kill_on_drop(true)
         .args([
             "-v",
@@ -174,6 +179,22 @@ pub fn frame_nalus<F: Fn(&NalUnit) -> bool>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn timestamp_scratch_requires_the_selected_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let blocked = root.path().join("unavailable workspace");
+        std::fs::write(&blocked, b"unrelated file").unwrap();
+        assert!(super::packet_timeline(
+            &root.path().join("input.mkv"),
+            1,
+            &blocked,
+            &crate::test_helpers::NoopSink
+        )
+        .await
+        .is_err());
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"unrelated file");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
     use super::*;
     #[test]
     fn reordered_b_frames_keep_metadata_with_presentation_picture() {

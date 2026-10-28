@@ -46,6 +46,42 @@ fn synthetic_source(root: &Path) -> PathBuf {
     source
 }
 
+#[tokio::test]
+async fn non_metadata_encoding_ignores_unavailable_custom_metadata_storage() {
+    let root = tempfile::tempdir().unwrap();
+    let source = synthetic_source(root.path());
+    let original = std::fs::read(&source).unwrap();
+    let folder = root.path().join("encoded");
+    std::fs::create_dir(&folder).unwrap();
+    let blocked = root.path().join("custom path is a file");
+    std::fs::write(&blocked, b"unrelated").unwrap();
+    let mut config = settings(&folder);
+    config.threshold = 0.1;
+    config.hdr_mode = Some(HdrMode::Auto);
+    config.temp_files_location = "custom".into();
+    config.custom_temp_directory = blocked.to_string_lossy().into_owned();
+    let mut queue = vec![queue_item(&source).await];
+    let sink = crate::test_helpers::RecordingSink::new();
+    assert_eq!(
+        run_encode_loop(
+            &sink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut queue,
+            &config,
+            &[],
+            None,
+            None
+        )
+        .await,
+        (1, 0, 0, false),
+        "{:?}",
+        sink.take_logs()
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    assert_eq!(std::fs::read(&blocked).unwrap(), b"unrelated");
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1);
+}
+
 async fn queue_item(source: &Path) -> QueueItem {
     let probe = crate::probe::probe_file(source.to_str().unwrap(), &NoopSink)
         .await
@@ -629,6 +665,12 @@ async fn hdr10plus_mode_keeps_hdr10_after_clean_scan_but_rejects_missing_adverti
     copy_settings.codec_family = "hevc".into();
     copy_settings.video_encoder = "libx265".into();
     copy_settings.hdr_mode = Some(HdrMode::Auto);
+    // Integration regression: a copy must not even resolve the custom
+    // metadata path. This path is deliberately a file, not a directory.
+    let blocked_temp = root.path().join("unavailable custom storage");
+    std::fs::write(&blocked_temp, b"unrelated file").unwrap();
+    copy_settings.temp_files_location = "custom".into();
+    copy_settings.custom_temp_directory = blocked_temp.to_string_lossy().into_owned();
     let copy_sink = crate::test_helpers::RecordingSink::new();
     let mut copy_queue = vec![item.clone()];
     assert_eq!(
@@ -770,6 +812,113 @@ async fn hdr10plus_mode_keeps_hdr10_after_clean_scan_but_rejects_missing_adverti
         b"previous successful output"
     );
     assert_eq!(std::fs::read(invalid).unwrap(), b"invalid disposable video");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires FFmpeg with libx265, MP4Box and /dev/shm; no GPU required"]
+async fn custom_hdr10plus_workspace_preserves_transaction_tracks_and_source() {
+    use crate::hdr10plus_pipeline as hdr;
+    use hdr10plus::{hevc::encode_hdr10plus_nal, metadata::Hdr10PlusMetadata};
+    let root = tempfile::tempdir().unwrap();
+    let custom = tempfile::tempdir_in("/dev/shm").unwrap();
+    let source = root.path().join("HDR10+ source ü.mkv");
+    let generated = std::process::Command::new("ffmpeg").args([
+        "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=384x216:rate=24:duration=1",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+        "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+        "-x265-params", "pools=1:frame-threads=1:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1):max-cll=1000,400:log-level=error",
+        "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+        "-c:a", "eac3", "-b:a", "384k",
+    ]).arg(&source).output().unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let metadata = hdr::ExtractedHdr10Plus {
+        frames: (0..24)
+            .map(|frame| {
+                vec![encode_hdr10plus_nal(
+                    &Hdr10PlusMetadata {
+                        itu_t_t35_country_code: 0xb5,
+                        itu_t_t35_terminal_provider_code: 0x003c,
+                        itu_t_t35_terminal_provider_oriented_code: 1,
+                        application_identifier: 4,
+                        application_version: 1,
+                        num_windows: 1,
+                        targeted_system_display_maximum_luminance: 500,
+                        average_maxrgb: 100 + frame,
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap()]
+            })
+            .collect(),
+    };
+    let seed_workspace = crate::temp_workspace::create_job_workspace(custom.path(), 0).unwrap();
+    hdr::inject_pending(&source, &metadata, seed_workspace.path(), &NoopSink)
+        .await
+        .unwrap();
+    drop(seed_workspace);
+    let original = std::fs::read(&source).unwrap();
+    let folder = root.path().join("destination");
+    std::fs::create_dir(&folder).unwrap();
+    let mut config = settings(&folder);
+    config.codec_family = "hevc".into();
+    config.video_encoder = "libx265".into();
+    config.hdr_mode = Some(HdrMode::Hdr10Plus);
+    config.threshold = 0.1;
+    config.temp_files_location = "custom".into();
+    config.custom_temp_directory = custom.path().to_string_lossy().into_owned();
+    let mut queue = vec![queue_item(&source).await];
+    let sink = crate::test_helpers::RecordingSink::new();
+    assert_eq!(
+        run_encode_loop(
+            &sink,
+            &crate::test_helpers::NoopBatchControl,
+            &mut queue,
+            &config,
+            &[],
+            None,
+            None
+        )
+        .await,
+        (1, 0, 0, false),
+        "{:?}",
+        sink.take_logs()
+    );
+    let output = folder.join(source.file_name().unwrap());
+    let verify_workspace = crate::temp_workspace::create_job_workspace(custom.path(), 0).unwrap();
+    hdr::verify_output(&output, &metadata, verify_workspace.path(), &NoopSink)
+        .await
+        .unwrap();
+    drop(verify_workspace);
+    let hash = |path: &Path| {
+        let result = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args([
+                "-map",
+                "0:a",
+                "-c",
+                "copy",
+                "-f",
+                "streamhash",
+                "-hash",
+                "sha256",
+                "-",
+            ])
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        result.stdout
+    };
+    assert_eq!(hash(&source), hash(&output));
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    assert_eq!(std::fs::read_dir(custom.path()).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(folder).unwrap().count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

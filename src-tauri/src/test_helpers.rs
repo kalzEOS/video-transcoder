@@ -246,6 +246,8 @@ pub fn default_settings() -> BatchSettings {
         compatibility_mode: false,
         preserve_av1: false,
         force_local: false,
+        temp_files_location: "automatic".into(),
+        custom_temp_directory: String::new(),
         video_encoder: "auto".to_string(),
         codec_family: "auto".to_string(),
         audio_encoder: "auto".to_string(),
