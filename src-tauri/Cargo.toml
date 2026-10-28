@@ -12,6 +12,11 @@ name = "histv_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [[bin]]
+name = "histv"
+path = "src/main.rs"
+required-features = ["custom-protocol"]
+
+[[bin]]
 name = "histv-cli"
 path = "src/cli_main.rs"
 required-features = ["cli"]

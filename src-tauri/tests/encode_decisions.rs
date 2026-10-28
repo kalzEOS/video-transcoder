@@ -34,6 +34,8 @@ fn base_settings() -> BatchSettings {
         hdr_mode: None,
         output_folder: String::new(),
         output_mode: String::new(),
+        temp_files_location: "automatic".to_string(),
+        custom_temp_directory: String::new(),
         threshold: 4.0,
         qp_i: 20,
         qp_p: 22,

@@ -132,12 +132,10 @@ async fn sparse_subtitles_keep_hdr10plus_mkv_audio_interleaved() {
             .collect(),
     };
     let output = root.path().join("preserved.mkv");
-    assert!(
-        hdr::inject_hdr10plus(&source, &output, &metadata, workspace.path(), &Sink)
-            .await
-            .unwrap()
-            .success
-    );
+    std::fs::copy(&source, &output).unwrap();
+    hdr::inject_pending(&output, &metadata, workspace.path(), &Sink)
+        .await
+        .unwrap();
     hdr::verify_output(&output, &metadata, workspace.path(), &Sink)
         .await
         .unwrap();
