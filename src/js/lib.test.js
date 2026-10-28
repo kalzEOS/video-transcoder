@@ -176,9 +176,10 @@ describe('computeEstimatedSize', () => {
     assert.equal(est.approx, false);
   });
 
-  it('marks HDR-to-SDR output size approximate because it re-encodes', () => {
+  it('shows variable size for quality-based HDR-to-SDR re-encoding', () => {
     const item = { sourceBytes: 50000000, videoBitrateMbps: 2.0, videoCodec: 'hevc', durationSecs: 60, isHdr: true };
-    assert.equal(computeEstimatedSize(item, { ...baseSettings, toneMapHdr: true }).approx, true);
+    assert.equal(computeEstimatedSize(item, { ...baseSettings, toneMapHdr: true }).variable, true);
+    assert.equal(formatEstimatedSize(item, { ...baseSettings, toneMapHdr: true }), 'Variable (quality-based)');
     assert.equal(computeEstimatedSize(item, baseSettings).approx, false);
   });
 
@@ -235,9 +236,9 @@ describe('formatEstimatedSize', () => {
     assert.match(result, /MB/);
   });
 
-  it('formats approximate estimate with tilde', () => {
+  it('does not invent a size estimate for quality-based output', () => {
     const item = { sourceBytes: 50000000, videoBitrateMbps: 0, videoCodec: 'hevc', durationSecs: 60 };
     const result = formatEstimatedSize(item, baseSettings);
-    assert.ok(result.startsWith('~'));
+    assert.equal(result, 'Variable (quality-based)');
   });
 });

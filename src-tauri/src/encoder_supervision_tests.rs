@@ -23,8 +23,7 @@ async fn ffmpeg_error_tail_is_reported_without_file_logging() {
             "null",
             NULL_DEVICE,
         ]
-        .map(String::from)
-        .to_vec(),
+        .map(String::from),
         1.0,
         None,
         &ctx,
@@ -67,8 +66,7 @@ async fn paused_ffmpeg_cancels_and_is_reaped() {
                     "null",
                     NULL_DEVICE,
                 ]
-                .map(String::from)
-                .to_vec(),
+                .map(String::from),
                 30.0,
                 None,
                 &ctx,
