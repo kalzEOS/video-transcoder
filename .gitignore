@@ -50,6 +50,7 @@ ehthumbs.db
 _ffmpeg_download*
 
 # ── Logs & temp ──
+__pycache__/
 *.log
 encode_log_*.txt
 patchnotes.md

@@ -864,6 +864,11 @@ mod gui_commands {
 pub fn run() {
     use gui_commands::*;
     use tauri::{Emitter, Manager};
+    let context = tauri::generate_context!();
+    // GTK 3 derives Wayland app_id from the program name even when a
+    // GtkApplication ID is set. Match the packaged desktop entry before init.
+    #[cfg(target_os = "linux")]
+    glib::set_prgname(Some(context.config().identifier.as_str()));
 
     let app_state = Arc::new(AppState {
         queue: RwLock::new(Vec::new()),
@@ -985,7 +990,7 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 
