@@ -2216,10 +2216,11 @@ async fn encode_single_file(
     // ── Animated WebP: dedicated decode + encode pipeline ──
     if is_animated_webp {
         sink.log("  Animated WebP: using RIFF decode pipeline");
-        let webp_result = crate::webp_decode::transcode_animated_webp(
+        let webp_result = crate::webp_decode::transcode_animated_webp_with_device(
             &item_full_path,
             &output_str,
             &video_args,
+            encoder_render_device(detected_encoders, file_encoder),
             settings.threads,
             settings.low_priority,
             sink,
@@ -3864,6 +3865,58 @@ struct ColourMetadata<'a> {
 }
 
 /// Assemble the full ffmpeg argument list from its component parts.
+pub(crate) fn raw_rgba_encoder_args(
+    output: &str,
+    video_args: &[String],
+    width: u32,
+    height: u32,
+    fps: f64,
+    threads: u32,
+    device: Option<&str>,
+) -> Vec<String> {
+    let video: Vec<_> = video_args.iter().map(String::as_str).collect();
+    let name = video_args.get(1).map(String::as_str).unwrap_or("");
+    let codec = if name.contains("264") {
+        "h264"
+    } else if name.contains("av1") {
+        "av1"
+    } else {
+        "hevc"
+    };
+    let mut args = assemble_ffmpeg_args(&FfmpegAssemblyParts {
+        input_path: "pipe:0",
+        output_path: output,
+        video_args: &video,
+        render_device: device,
+        hardware_decode: false,
+        source_format: None,
+        pix_fmt: "yuv420p",
+        audio_map_args: &[],
+        audio_codec_args: &[],
+        is_image_source: true,
+        threads,
+        tonemap_filter: None,
+        codec_family: codec,
+        colour_metadata: None,
+        vaapi_hevc_bsf: None,
+    });
+    let input = args.iter().position(|arg| arg == "-i").unwrap();
+    args.splice(
+        input..input,
+        [
+            "-f".into(),
+            "rawvideo".into(),
+            "-pixel_format".into(),
+            "rgba".into(),
+            "-video_size".into(),
+            format!("{width}x{height}"),
+            "-framerate".into(),
+            fps.to_string(),
+        ],
+    );
+    args
+}
+
 /// Used by both the primary encode and the software-fallback path
 /// to avoid duplicating the invocation pattern.
 fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
@@ -3998,12 +4051,14 @@ fn assemble_ffmpeg_args(parts: &FfmpegAssemblyParts<'_>) -> Vec<String> {
         // force yuv420p (GIF decodes to rgb24/rgba).
         args.extend(vec!["-an".into(), "-sn".into()]);
         args.extend(parts.video_args.iter().map(|s| s.to_string()));
-        args.extend(vec![
-            "-vf".into(),
-            "pad=ceil(iw/2)*2:ceil(ih/2)*2".into(),
-            "-pix_fmt".into(),
-            "yuv420p".into(),
-        ]);
+        let pad = "pad=ceil(iw/2)*2:ceil(ih/2)*2";
+        let filter = hw_upload_filter
+            .as_ref()
+            .map_or_else(|| pad.to_string(), |hw| format!("{pad},{hw}"));
+        args.extend(["-vf".into(), filter]);
+        if hw_upload_filter.is_none() {
+            args.extend(["-pix_fmt".into(), "yuv420p".into()]);
+        }
     } else {
         // Normal video: per-stream audio maps + subtitle passthrough
         args.extend_from_slice(parts.audio_map_args);

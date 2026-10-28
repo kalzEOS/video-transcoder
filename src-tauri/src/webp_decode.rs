@@ -411,313 +411,340 @@ pub async fn transcode_animated_webp(
     sink: &dyn EventSink,
     batch_control: &dyn BatchControl,
 ) -> Result<TranscodeResult, String> {
-    let path = Path::new(input_path);
+    transcode_animated_webp_with_device(
+        input_path,
+        output_path,
+        video_args,
+        None,
+        threads,
+        low_priority,
+        sink,
+        batch_control,
+    )
+    .await
+}
 
-    // ── Extract frames from the container ──
+async fn interruptible<T>(
+    future: impl std::future::Future<Output = Result<T, String>>,
+    control: &dyn BatchControl,
+    pauses: &mut [crate::process_control::PauseGuard],
+) -> Result<T, String> {
+    tokio::pin!(future);
+    loop {
+        if control.should_cancel_current() || control.should_cancel_all() {
+            return Err("Cancelled".into());
+        }
+        let paused = control.is_paused();
+        for process in pauses.iter_mut() {
+            process.set(paused)?;
+        }
+        tokio::select! {
+            value=&mut future, if !paused => return value,
+            _=tokio::time::sleep(std::time::Duration::from_millis(100))=>{}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn transcode_animated_webp_with_device(
+    input_path: &str,
+    output_path: &str,
+    video_args: &[String],
+    device: Option<&str>,
+    threads: u32,
+    low_priority: bool,
+    sink: &dyn EventSink,
+    batch_control: &dyn BatchControl,
+) -> Result<TranscodeResult, String> {
     sink.log("  Animated WebP: parsing RIFF container...");
-    let (info, frames) = extract_frames(path)?;
-
+    let (info, frames) = extract_frames(Path::new(input_path))?;
     if frames.is_empty() {
         return Err("No animation frames found in WebP file".into());
     }
-
-    // Check if frame durations vary
-    let has_variable_timing = if frames.len() > 1 {
-        let first_dur = frames[0].duration_ms;
-        frames.iter().any(|f| f.duration_ms != first_dur)
-    } else {
-        false
-    };
-    let timing_label = if has_variable_timing {
-        "variable timing"
-    } else {
-        "constant timing"
-    };
-    sink.log(&format!(
-        "  Animated WebP: {}x{}, {} frames, {:.1}s ({})",
-        info.width,
-        info.height,
-        info.frame_count,
-        info.total_duration_ms as f64 / 1000.0,
-        timing_label,
-    ));
-
-    // Base framerate for the output. Individual frame durations are
-    // honoured by writing each frame multiple times proportional to its
-    // duration (frame duplication). 50fps = 20ms per tick, which is the
-    // minimum frame duration in the WebP spec. The encoder compresses
-    // duplicate frames to near-zero cost (identical P-frames).
-    let base_fps: f64 = 50.0;
-    let ms_per_tick: f64 = 1000.0 / base_fps;
-
-    let canvas_w = info.width;
-    let canvas_h = info.height;
-    // Pad to even dimensions (required by most encoders)
-    let padded_w = (canvas_w + 1) & !1;
-    let padded_h = (canvas_h + 1) & !1;
-    let frame_byte_size = (padded_w as usize)
-        .checked_mul(padded_h as usize)
-        .and_then(|v| v.checked_mul(4))
-        .ok_or_else(|| {
-            format!(
-                "Padded canvas dimensions too large: {}x{}",
-                padded_w, padded_h
-            )
-        })?;
-
-    // ── Spawn the output encoder ──
-    let mut enc_args: Vec<String> = vec![
-        "-y".into(),
-        "-f".into(),
-        "rawvideo".into(),
-        "-pix_fmt".into(),
-        "rgba".into(),
-        "-s".into(),
-        format!("{}x{}", padded_w, padded_h),
-        "-r".into(),
-        format!("{:.0}", base_fps),
-        "-i".into(),
-        "pipe:0".into(),
-        "-an".into(),
-        "-sn".into(),
-    ];
-    if threads > 0 {
-        enc_args.push("-threads".into());
-        enc_args.push(threads.to_string());
-    }
-    enc_args.extend(video_args.iter().cloned());
-    enc_args.push("-pix_fmt".into());
-    enc_args.push("yuv420p".into());
-    if output_path.ends_with(".mp4") {
-        enc_args.push("-movflags".into());
-        enc_args.push("+faststart".into());
-    }
-    enc_args.push(output_path.to_string());
-
-    let mut enc_cmd = crate::ffmpeg::ffmpeg_command();
-    enc_cmd
+    let padded_w = info.width.checked_add(1).ok_or("WebP width overflow")? & !1;
+    let padded_h = info.height.checked_add(1).ok_or("WebP height overflow")? & !1;
+    let mut canvas = Canvas::new(padded_w, padded_h)?;
+    canvas.clear();
+    let frame_byte_size = canvas.as_rgba().len();
+    let frames = std::sync::Arc::new(frames);
+    let enc_args = crate::encoder::raw_rgba_encoder_args(
+        output_path,
+        video_args,
+        padded_w,
+        padded_h,
+        50.0,
+        threads,
+        device,
+    );
+    sink.processing_stage("encoding", "Encoding animated WebP...", None);
+    sink.batch_command(&format!("ffmpeg {}", enc_args.join(" ")));
+    let mut command = crate::ffmpeg::ffmpeg_command();
+    command
+        .kill_on_drop(true)
         .args(&enc_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-
+    #[cfg(windows)]
     if low_priority {
-        #[cfg(target_os = "windows")]
-        {
-            const BELOW_NORMAL: u32 = 0x00004000;
-            const NO_WINDOW: u32 = 0x08000000;
-            enc_cmd.creation_flags(BELOW_NORMAL | NO_WINDOW);
-        }
+        command.creation_flags(0x00004000 | 0x08000000);
     }
-
-    let mut encoder = enc_cmd
+    let mut encoder = command
         .spawn()
-        .map_err(|e| format!("Failed to launch encoder ffmpeg: {e}"))?;
-
+        .map_err(|e| format!("Cannot start WebP encoder: {e}"))?;
+    let encoder_progress = crate::encoder::FfmpegProgress::new();
+    let encoder_reader = crate::encoder::spawn_stderr_reader(
+        encoder.stderr.take().unwrap(),
+        &encoder_progress,
+        None,
+        "WebP encoder",
+    );
     #[cfg(unix)]
     if low_priority {
-        if let Some(pid) = encoder.id() {
-            let _ = std::process::Command::new("renice")
-                .args(["-n", "10", "-p", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        let _ = std::process::Command::new("renice")
+            .args(["-n", "10", "-p", &encoder.id().unwrap().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
-
-    sink.log(&format!(
-        "  Encoder ffmpeg PID: {}",
-        encoder.id().unwrap_or(0)
-    ));
-
-    let mut enc_stdin = encoder
-        .stdin
-        .take()
-        .ok_or_else(|| "Could not open encoder stdin".to_string())?;
-
-    // ── Spawn a single decoder process for all frames ──
-    // Instead of spawning one ffmpeg process per frame, we use a single
-    // long-lived process with webp_pipe input. We write each frame's
-    // standalone WebP data to its stdin and read the decoded RGBA pixels
-    // from its stdout. A background task feeds stdin while the main loop
-    // reads stdout, avoiding pipe deadlocks.
-    let mut dec_cmd = crate::ffmpeg::ffmpeg_command();
-    dec_cmd
+    let mut decoder = match crate::ffmpeg::ffmpeg_command()
+        .kill_on_drop(true)
         .args([
+            "-v",
+            "error",
             "-f",
             "webp_pipe",
             "-i",
             "pipe:0",
+            "-vf",
+            &format!("format=rgba,pad={padded_w}:{padded_h}:0:0:color=black@0"),
+            "-fps_mode",
+            "passthrough",
             "-f",
             "rawvideo",
             "-pix_fmt",
             "rgba",
-            "-v",
-            "error",
             "pipe:1",
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut decoder = dec_cmd
+        .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to launch decoder ffmpeg: {e}"))?;
-
-    let dec_stdin = decoder
-        .stdin
-        .take()
-        .ok_or_else(|| "Could not open decoder stdin".to_string())?;
-    let mut dec_stdout = decoder
-        .stdout
-        .take()
-        .ok_or_else(|| "Could not open decoder stdout".to_string())?;
-
-    // Prepare the frame payloads for the writer task. Each entry is the
-    // standalone-wrapped WebP data to write to the decoder's stdin.
-    let frame_payloads: Vec<Vec<u8>> = frames
-        .iter()
-        .map(|f| wrap_as_standalone_webp(&f.data))
-        .collect();
-
-    // Spawn a background task that feeds all frames to the decoder's stdin.
-    // This runs concurrently with the stdout reader to avoid deadlock.
-    let writer_handle = tokio::spawn(async move {
-        let mut stdin = dec_stdin;
-        for payload in &frame_payloads {
-            if stdin.write_all(payload).await.is_err() {
-                break;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = encoder.kill().await;
+            let _ = encoder.wait().await;
+            let _ = encoder_reader.join();
+            return Err(format!("Cannot start WebP decoder: {error}"));
+        }
+    };
+    let decoder_progress = crate::encoder::FfmpegProgress::new();
+    let decoder_reader = crate::encoder::spawn_stderr_reader(
+        decoder.stderr.take().unwrap(),
+        &decoder_progress,
+        None,
+        "WebP decoder",
+    );
+    let mut pauses = [
+        crate::process_control::PauseGuard::new(encoder.id().unwrap()),
+        crate::process_control::PauseGuard::new(decoder.id().unwrap()),
+    ];
+    sink.log(&format!(
+        "  WebP encoder PID: {}; decoder PID: {}",
+        encoder.id().unwrap(),
+        decoder.id().unwrap()
+    ));
+    let mut enc_stdin = encoder.stdin.take();
+    let mut dec_stdout = decoder.stdout.take();
+    let mut dec_stdin = decoder.stdin.take().unwrap();
+    let payloads = frames.clone();
+    // Share compressed frame data; wrap one frame at a time rather than
+    // duplicating all compressed payloads in a second in-memory collection.
+    let mut writer = Some(tokio::spawn(async move {
+        for frame in payloads.iter() {
+            dec_stdin
+                .write_all(&wrap_as_standalone_webp(&frame.data))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok::<_, String>(())
+    }));
+    let mut extra_reader = None;
+    let result: Result<(i32, u64), String> = async {
+        let mut encoded_frames = 0u64;
+        for (index, frame) in frames.iter().enumerate() {
+            if frame.width > padded_w || frame.height > padded_h {
+                return Err("WebP frame exceeds canvas dimensions".into());
             }
-        }
-        // Dropping stdin sends EOF so the decoder knows we are done.
-        drop(stdin);
-    });
-
-    // ── Compositing loop ──
-    let mut canvas = Canvas::new(padded_w, padded_h)?;
-    canvas.clear(); // WebP spec: canvas starts as transparent black
-    let total_frames = frames.len();
-    let mut decoded_count: u32 = 0;
-    let mut was_cancelled = false;
-
-    for (i, frame) in frames.iter().enumerate() {
-        // Check for cancellation
-        if batch_control.should_cancel_current() || batch_control.should_cancel_all() {
-            was_cancelled = true;
-            break;
-        }
-
-        // Read decoded RGBA pixels for this frame from the single decoder
-        // process. Each frame produces exactly width * height * 4 bytes.
-        let expected_size = (frame.width as usize)
-            .checked_mul(frame.height as usize)
-            .and_then(|v| v.checked_mul(4))
-            .ok_or_else(|| {
-                format!(
-                    "Frame {} dimensions too large: {}x{}",
-                    i + 1,
-                    frame.width,
-                    frame.height
+            let mut rgba = vec![0u8; frame_byte_size];
+            interruptible(
+                async {
+                    dec_stdout
+                        .as_mut()
+                        .unwrap()
+                        .read_exact(&mut rgba)
+                        .await
+                        .map_err(|e| format!("Incomplete WebP frame {}: {e}", index + 1))
+                },
+                batch_control,
+                &mut pauses,
+            )
+            .await?;
+            // Decode every fragment into a fixed-size padded buffer, then
+            // take its actual rectangle for the existing WebP compositing.
+            let mut fragment = Vec::with_capacity(frame.width as usize * frame.height as usize * 4);
+            for row in 0..frame.height as usize {
+                let start = row * padded_w as usize * 4;
+                fragment.extend_from_slice(&rgba[start..start + frame.width as usize * 4]);
+            }
+            if !frame.blend {
+                canvas.clear_rect(frame.x_offset, frame.y_offset, frame.width, frame.height);
+            }
+            canvas.composite(
+                &fragment,
+                frame.x_offset,
+                frame.y_offset,
+                frame.width,
+                frame.height,
+                frame.blend,
+            );
+            let repeats = ((frame.duration_ms as f64 / 20.0).round() as u32).max(1);
+            for _ in 0..repeats {
+                interruptible(
+                    async {
+                        enc_stdin
+                            .as_mut()
+                            .unwrap()
+                            .write_all(canvas.as_rgba())
+                            .await
+                            .map_err(|e| format!("WebP encoder pipe failed: {e}"))
+                    },
+                    batch_control,
+                    &mut pauses,
                 )
-            })?;
-        let decoded_rgba = {
-            let mut buf = vec![0u8; expected_size];
-            let mut read_so_far = 0;
-            while read_so_far < expected_size {
-                match dec_stdout.read(&mut buf[read_so_far..]).await {
-                    Ok(0) => break, // EOF
-                    Ok(n) => read_so_far += n,
-                    Err(e) => {
-                        return Err(format!("Frame {} decode read failed: {e}", i + 1));
-                    }
+                .await?;
+                encoded_frames += 1;
+            }
+            if frame.dispose {
+                canvas.clear_rect(frame.x_offset, frame.y_offset, frame.width, frame.height);
+            }
+            let fraction = (index + 1) as f64 / frames.len() as f64;
+            let duration = info.total_duration_ms as f64 / 1000.0;
+            sink.file_progress(
+                (fraction * 100.0).min(99.9),
+                fraction * duration,
+                duration,
+                None,
+            );
+        }
+        drop(enc_stdin.take());
+        let mut remaining = dec_stdout.take().unwrap();
+        extra_reader = Some(tokio::spawn(async move {
+            let mut count = 0;
+            let mut bytes = [0u8; 8192];
+            loop {
+                let n = remaining
+                    .read(&mut bytes)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
                 }
+                count += n;
             }
-            if read_so_far < expected_size {
-                // Pad with zeros if the decoder produced fewer bytes than expected
-                buf.truncate(read_so_far);
-                buf.resize(expected_size, 0);
-            }
-            buf
-        };
-
-        // Composite onto canvas
-        if !frame.blend {
-            // Overwrite mode: clear the frame region first
-            canvas.clear_rect(frame.x_offset, frame.y_offset, frame.width, frame.height);
+            Ok::<_, String>(count)
+        }));
+        interruptible(
+            async { writer.as_mut().unwrap().await.map_err(|e| e.to_string())? },
+            batch_control,
+            &mut pauses,
+        )
+        .await?;
+        drop(writer.take());
+        let decoded = interruptible(
+            async { decoder.wait().await.map_err(|e| e.to_string()) },
+            batch_control,
+            &mut pauses,
+        )
+        .await?;
+        let encoded = interruptible(
+            async { encoder.wait().await.map_err(|e| e.to_string()) },
+            batch_control,
+            &mut pauses,
+        )
+        .await?;
+        let extra = extra_reader
+            .take()
+            .unwrap()
+            .await
+            .map_err(|e| e.to_string())??;
+        if !decoded.success() {
+            return Err("WebP decoder failed".into());
         }
-        canvas.composite(
-            &decoded_rgba,
-            frame.x_offset,
-            frame.y_offset,
-            frame.width,
-            frame.height,
-            frame.blend,
-        );
-
-        // Write the composited canvas to the encoder's stdin.
-        // Each frame is written multiple times to honour its duration at
-        // the base framerate. A 100ms frame at 50fps = 5 writes.
-        let repeat_count = ((frame.duration_ms as f64 / ms_per_tick).round() as u32).max(1);
-        let canvas_bytes = canvas.as_rgba();
-        let write_bytes: &[u8] = if canvas_bytes.len() == frame_byte_size {
-            canvas_bytes
-        } else {
-            // This shouldn't happen with correct padding, but handle it safely
-            &canvas_bytes[..canvas_bytes.len().min(frame_byte_size)]
-        };
-        let mut pipe_broken = false;
-        for _ in 0..repeat_count {
-            if let Err(e) = enc_stdin.write_all(write_bytes).await {
-                sink.log(&format!(
-                    "  WARNING: Encoder pipe closed at frame {}: {e}",
-                    i + 1
-                ));
-                pipe_broken = true;
-                break;
-            }
+        if extra != 0 {
+            return Err("WebP decoder produced unexpected extra frames".into());
         }
-        if pipe_broken {
-            break;
-        }
-
-        // Disposal for the *current* frame (applies to the next frame's rendering)
-        if frame.dispose {
-            canvas.clear_rect(frame.x_offset, frame.y_offset, frame.width, frame.height);
-        }
-
-        decoded_count += 1;
-
-        // Report progress
-        let pct = (decoded_count as f64 / total_frames as f64) * 100.0;
-        let elapsed_secs =
-            (info.total_duration_ms as f64 / 1000.0) * (decoded_count as f64 / total_frames as f64);
-        let total_secs = info.total_duration_ms as f64 / 1000.0;
-        sink.file_progress(pct, elapsed_secs, total_secs, None);
+        Ok((encoded.code().unwrap_or(-1), encoded_frames))
     }
-
-    // Close encoder stdin to signal EOF
+    .await;
+    // Never await a blocked feeder before closing/killing its subprocess.
+    for pause in &mut pauses {
+        let _ = pause.set(false);
+    }
+    if result.is_err() {
+        let _ = encoder.kill().await;
+        let _ = decoder.kill().await;
+    }
     drop(enc_stdin);
-
-    // Ensure the decoder writer task finishes (it may already have)
-    let _ = writer_handle.await;
-
-    // Clean up the decoder process
     drop(dec_stdout);
+    if let Some(task) = writer.take() {
+        task.abort();
+        if !task.is_finished() {
+            let _ = task.await;
+        }
+    }
+    if let Some(task) = extra_reader.take() {
+        task.abort();
+        if !task.is_finished() {
+            let _ = task.await;
+        }
+    }
     let _ = decoder.wait().await;
-
-    // Wait for encoder to finish
-    let enc_status = encoder
-        .wait()
-        .await
-        .map_err(|e| format!("Encoder wait failed: {e}"))?;
-
-    let exit_code = enc_status.code().unwrap_or(-1);
-
-    Ok(TranscodeResult {
-        exit_code,
-        was_cancelled,
-        frame_count: decoded_count as u64,
-    })
+    let _ = encoder.wait().await;
+    let _ = decoder_reader.join();
+    let _ = encoder_reader.join();
+    let cancelled = batch_control.should_cancel_current() || batch_control.should_cancel_all();
+    if cancelled {
+        return Ok(TranscodeResult {
+            exit_code: -1,
+            was_cancelled: true,
+            frame_count: 0,
+        });
+    }
+    match result {
+        Ok((exit_code, frame_count)) => {
+            if exit_code != 0 {
+                sink.log(&format!(
+                    "  WebP encoder failed: {}",
+                    encoder_progress.stderr_tail()
+                ));
+            } else {
+                let duration = info.total_duration_ms as f64 / 1000.0;
+                sink.file_progress(100.0, duration, duration, None);
+            }
+            Ok(TranscodeResult {
+                exit_code,
+                was_cancelled: false,
+                frame_count,
+            })
+        }
+        Err(error) => Err(format!(
+            "{error}\nDecoder: {}\nEncoder: {}",
+            decoder_progress.stderr_tail(),
+            encoder_progress.stderr_tail()
+        )),
+    }
 }
 
 /// Result from the animated WebP transcode pipeline.
@@ -730,6 +757,185 @@ pub struct TranscodeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn animation(path: &Path) {
+        let result = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=128x96:rate=5:duration=1",
+                "-c:v",
+                "libwebp_anim",
+                "-lossless",
+                "1",
+                "-loop",
+                "0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn animation_completes_and_encoder_failure_does_not_deadlock() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("animated.webp");
+        animation(&input);
+        for codec in ["libx264", "invalid_webp_test_encoder"] {
+            let output = root.path().join(format!("{codec}.mkv"));
+            let args = ["-c:v", codec, "-preset", "ultrafast"].map(String::from);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                transcode_animated_webp(
+                    input.to_str().unwrap(),
+                    output.to_str().unwrap(),
+                    &args,
+                    1,
+                    false,
+                    &crate::test_helpers::NoopSink,
+                    &crate::test_helpers::NoopBatchControl,
+                ),
+            )
+            .await
+            .expect("WebP pipeline deadlocked");
+            if codec == "libx264" {
+                let result = result.unwrap();
+                assert_eq!(result.exit_code, 0);
+                assert_eq!(result.frame_count, 50);
+                let scan = std::process::Command::new("ffprobe")
+                    .args([
+                        "-v",
+                        "error",
+                        "-count_frames",
+                        "-select_streams",
+                        "v:0",
+                        "-show_entries",
+                        "stream=nb_read_frames,width,height,pix_fmt",
+                        "-of",
+                        "json",
+                    ])
+                    .arg(&output)
+                    .output()
+                    .unwrap();
+                assert!(scan.status.success());
+                let json: serde_json::Value = serde_json::from_slice(&scan.stdout).unwrap();
+                assert_eq!(json["streams"][0]["nb_read_frames"], "50");
+                assert_eq!(json["streams"][0]["width"], 128);
+                assert_eq!(json["streams"][0]["pix_fmt"], "yuv420p");
+            } else {
+                assert!(result.is_err() || result.is_ok_and(|r| r.exit_code != 0));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_paused_animation_reaps_both_children() {
+        use std::sync::{atomic::Ordering, Arc};
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("animated.webp");
+        animation(&input);
+        let output = root.path().join("cancelled.mkv");
+        let sink = Arc::new(crate::test_helpers::RecordingSink::new());
+        let control = Arc::new(crate::test_helpers::CancellableBatchControl::new());
+        control.paused.store(true, Ordering::SeqCst);
+        let task = {
+            let sink = sink.clone();
+            let control = control.clone();
+            tokio::spawn(async move {
+                transcode_animated_webp(
+                    input.to_str().unwrap(),
+                    output.to_str().unwrap(),
+                    &["-c:v".into(), "libx264".into()],
+                    1,
+                    false,
+                    &sink,
+                    &*control,
+                )
+                .await
+            })
+        };
+        let pids = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(line) = sink
+                    .take_logs()
+                    .into_iter()
+                    .find(|line| line.contains("WebP encoder PID:"))
+                {
+                    break line
+                        .split(|c: char| !c.is_ascii_digit())
+                        .filter_map(|v| v.parse::<u32>().ok())
+                        .collect::<Vec<_>>();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        control.cancel_current.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.was_cancelled);
+        assert_eq!(pids.len(), 2);
+        for pid in pids {
+            assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        }
+    }
+    #[test]
+    fn raw_rgba_vaapi_uses_verified_device_and_nv12_upload() {
+        let args = crate::encoder::raw_rgba_encoder_args(
+            "out.mkv",
+            &["-c:v".into(), "hevc_vaapi".into()],
+            128,
+            96,
+            50.0,
+            1,
+            Some("/test/dri/renderD177"),
+        );
+        let device = args.iter().position(|v| v == "-vaapi_device").unwrap();
+        assert_eq!(args[device + 1], "/test/dri/renderD177");
+        assert!(device < args.iter().position(|v| v == "-i").unwrap());
+        let filter = &args[args.iter().position(|v| v == "-vf").unwrap() + 1];
+        assert!(filter.contains("format=nv12,hwupload"));
+        assert!(args.windows(2).any(|p| p == ["-pixel_format", "rgba"]));
+        assert!(!args.windows(2).any(|p| p == ["-pix_fmt", "yuv420p"]));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn corrupt_frame_fails_instead_of_padding_successful_black_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("corrupt.webp");
+        animation(&input);
+        let mut bytes = std::fs::read(&input).unwrap();
+        let payload = bytes.windows(4).position(|v| v == b"VP8L").unwrap() + 8;
+        bytes[payload..payload + 5].fill(0);
+        std::fs::write(&input, &bytes).unwrap();
+        let output = root.path().join("out.mkv");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            transcode_animated_webp(
+                input.to_str().unwrap(),
+                output.to_str().unwrap(),
+                &["-c:v".into(), "libx264".into()],
+                1,
+                false,
+                &crate::test_helpers::NoopSink,
+                &crate::test_helpers::NoopBatchControl,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(input).unwrap(), bytes);
+    }
 
     #[test]
     fn test_canvas_new_overflow_returns_err() {
