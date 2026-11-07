@@ -431,6 +431,86 @@ fn metadata_failure_recovery_survives_pending_guard_cleanup() {
     );
 }
 
+#[tokio::test]
+async fn final_validation_failure_keeps_completed_encode_after_transaction_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let source = synthetic_source(root.path());
+    let original = std::fs::read(&source).unwrap();
+    let destination = root.path().join("existing output.mkv");
+    std::fs::write(&destination, b"existing output sentinel").unwrap();
+    let unrelated = root.path().join(".Mad-Max-2-pending.mkv");
+    std::fs::write(&unrelated, b"unrelated sentinel").unwrap();
+    let mut transaction =
+        crate::output_transaction::OutputTransaction::new(&source, &destination, false).unwrap();
+    std::fs::copy(&source, transaction.pending_path()).unwrap();
+    let pending = transaction.pending_path().to_path_buf();
+    let mut queue = vec![queue_item(&source).await];
+    // Inject a final integrity mismatch into the expected probe, without
+    // changing the real completed file or bypassing the production validator.
+    queue[0]
+        .probe
+        .tracks
+        .subtitles
+        .push(crate::tracks::SubtitleInfo::default());
+    let duration = queue[0].probe.duration_secs;
+    let sink = crate::test_helpers::RecordingSink::new();
+    let result = handle_post_encode(
+        0,
+        &mut queue,
+        &EncodeDecision::Copy,
+        &pending,
+        &mut transaction,
+        pending.to_str().unwrap(),
+        destination.to_str().unwrap(),
+        "mkv",
+        source.to_str().unwrap(),
+        false,
+        false,
+        false,
+        duration,
+        None,
+        &None,
+        root.path(),
+        &settings(root.path()),
+        &AudioStrategy::CopyAll,
+        &mut None,
+        &|_, _| {},
+        &sink,
+    )
+    .await;
+    assert!(!result);
+    assert_eq!(queue[0].status, QueueItemStatus::Failed);
+    drop(transaction);
+    assert!(!pending.exists());
+    let recovered = std::fs::read_dir(root.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("failed-validation-")
+        })
+        .unwrap()
+        .path();
+    assert_eq!(
+        std::fs::read(recovered.join("completed-output.mkv")).unwrap(),
+        original
+    );
+    let report = std::fs::read_to_string(recovered.join("validation-report.json")).unwrap();
+    assert!(report.contains("Subtitle or attachment streams changed unexpectedly"));
+    assert!(sink
+        .take_logs()
+        .iter()
+        .any(|line| line.contains("RECOVERY: Completed output preserved")));
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    assert_eq!(
+        std::fs::read(destination).unwrap(),
+        b"existing output sentinel"
+    );
+    assert_eq!(std::fs::read(unrelated).unwrap(), b"unrelated sentinel");
+}
+
 struct FallbackControl {
     offered: std::sync::atomic::AtomicBool,
     accept: bool,
@@ -823,9 +903,14 @@ async fn custom_hdr10plus_workspace_preserves_transaction_tracks_and_source() {
     let root = tempfile::tempdir().unwrap();
     let custom = tempfile::tempdir_in("/dev/shm").unwrap();
     let source = root.path().join("HDR10+ source ü.mkv");
+    let cue = root.path().join("subtitle.srt");
+    std::fs::write(&cue, "1\n00:00:00,000 --> 00:00:00,800\nHello\n").unwrap();
     let generated = std::process::Command::new("ffmpeg").args([
         "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=384x216:rate=24:duration=1",
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+        "-i", cue.to_str().unwrap(),
+        "-map", "0:v", "-map", "1:a", "-map", "2:s", "-map", "2:s", "-map", "2:s",
+        "-c:s", "srt", "-disposition:s:0", "default", "-disposition:s:1", "default+hearing_impaired", "-disposition:s:2", "0",
         "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
         "-x265-params", "pools=1:frame-threads=1:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1):max-cll=1000,400:log-level=error",
         "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
@@ -919,6 +1004,58 @@ async fn custom_hdr10plus_workspace_preserves_transaction_tracks_and_source() {
     assert_eq!(std::fs::read(&source).unwrap(), original);
     assert_eq!(std::fs::read_dir(custom.path()).unwrap().count(), 0);
     assert_eq!(std::fs::read_dir(folder).unwrap().count(), 1);
+
+    // Same metadata-bearing HEVC, now through GPAC plus final MP4 remux.
+    // The input has the exact Matroska roles seen in the reported movie.
+    let expected = crate::probe::probe_file_for_validation(source.to_str().unwrap(), &NoopSink)
+        .await
+        .unwrap();
+    let intermediate = root.path().join("encoded.mp4");
+    let converted = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(&output)
+        .args([
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-c:s",
+            "mov_text",
+            "-strict",
+            "unofficial",
+        ])
+        .args(expected.tracks.output_args("mp4", 0).unwrap())
+        .arg(&intermediate)
+        .output()
+        .unwrap();
+    assert!(
+        converted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let mp4 = root.path().join("HDR10+ converted subtitles.mp4");
+    let result = hdr::inject_hdr10plus(&intermediate, &mp4, &metadata, root.path(), &NoopSink)
+        .await
+        .unwrap();
+    assert!(result.success, "{}", result.message);
+    hdr::verify_output(&mp4, &metadata, root.path(), &NoopSink)
+        .await
+        .unwrap();
+    validate_encoded_output(&expected, mp4.to_str().unwrap(), false, &NoopSink)
+        .await
+        .unwrap();
+    crate::output_integrity::validate(
+        source.to_str().unwrap(),
+        mp4.to_str().unwrap(),
+        &[(expected.audio_streams[0].index as usize, true)],
+        3,
+        false,
+        24.0,
+        &NoopSink,
+    )
+    .await
+    .unwrap();
+    assert_eq!(hash(&source), hash(&mp4));
 }
 
 #[tokio::test(flavor = "multi_thread")]

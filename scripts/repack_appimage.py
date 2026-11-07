@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 from appimage_layout import prepare
@@ -16,6 +17,18 @@ def digest(path):
         while block := stream.read(1024 * 1024):
             result.update(block)
     return result.hexdigest()
+
+
+def prepare_permissions(appdir):
+    # AppImage extraction/mkdir obey the build host's umask. The distributed
+    # bundle must remain accessible to other users. Operate only on this
+    # packaging job's copy; never follow links to external host files.
+    for path in [appdir, *appdir.rglob('*')]:
+        if path.is_symlink():
+            continue
+        mode = stat.S_IMODE(path.stat().st_mode)
+        access = 0o555 if path.is_dir() or mode & 0o111 else 0o444
+        path.chmod(mode | access)
 
 
 def main():
@@ -50,6 +63,7 @@ def main():
         if args.binary:
             shutil.copy2(args.binary, appdir / 'usr/bin/video-transcoder')
         prepare(appdir)
+        prepare_permissions(appdir)
         offset = int(subprocess.check_output([str(runtime_source), '--appimage-offset']))
         if not 0 < offset < min(runtime_source.stat().st_size, 4 * 1024 * 1024):
             raise ValueError('Invalid source AppImage runtime offset')

@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 import unittest
 from appimage_layout import PROJECT, prepare, verify, png_size, desktop_values
+from repack_appimage import prepare_permissions
 
 APP_ID = 'com.kalzi.videotranscoder'
 
@@ -36,6 +37,22 @@ class AppImageLayoutTests(unittest.TestCase):
         for size in [32, 128, 256, 512]:
             self.assertEqual(png_size(self.root / f'usr/share/icons/hicolor/{size}x{size}/apps/{APP_ID}.png'), (size, size))
         self.assertFalse((self.root / 'usr/share/icons/hicolor/index.theme').exists())
+
+    def test_restrictive_build_permissions_do_not_make_bundle_private(self):
+        self.root.chmod(0o700)
+        binary = self.root / 'usr/bin/video-transcoder'
+        binary.chmod(0o700)
+        data = self.root / 'Video Transcoder.png'
+        data.chmod(0o600)
+        external = Path(self.temp.name) / 'external-file'
+        external.write_bytes(b'not bundled')
+        external.chmod(0o600)
+        (self.root / 'external-link').symlink_to(external)
+        prepare_permissions(self.root)
+        self.assertEqual(self.root.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(data.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(external.stat().st_mode & 0o777, 0o600)
 
     def test_idempotent_and_relocatable(self):
         prepare(self.root)
