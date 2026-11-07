@@ -1844,13 +1844,87 @@
     //  BOTTOM PANEL TOGGLE & RESIZE (§11)
     // ═══════════════════════════════════════════════════════════════
     function setupBottomPanel() {
-      // Toggle open/close on click
+      const handle = $('#log-resize-handle');
+      const panel = $('#bottom-panel');
+      const app = $('#app');
+      let preferredHeight = 210;
+      try {
+        const saved = Number(localStorage.getItem('video-transcoder.logHeight'));
+        if (Number.isFinite(saved) && saved >= 80) preferredHeight = saved;
+      } catch (_) { /* Layout preferences are optional. */ }
+      let drag = null;
+      function bounds() {
+        const height = app.getBoundingClientRect().height;
+        const chrome = panel.getBoundingClientRect().height - bottomPanelBody.getBoundingClientRect().height;
+        // Reserve controls plus useful queue space, even on a small window.
+        const controls = ['#left-panel .panel-header', '#destination-bar', '#toolbar']
+          .reduce((sum, selector) => sum + ($(selector)?.getBoundingClientRect().height || 0), 0);
+        const max = Math.max(0, Math.floor(Math.min(height * 0.45, height - chrome - Math.max(260, controls + 100))));
+        return { min: Math.min(80, max), max };
+      }
+      function refresh() {
+        const open = bottomPanelBody.classList.contains('open');
+        handle.hidden = !open;
+        bottomPanelArrow.textContent = open ? '\u25BC' : '\u25B2';
+        bottomPanelToggle.setAttribute('aria-expanded', String(open));
+        if (!open) return;
+        const { min, max } = bounds();
+        const height = Math.round(Math.max(min, Math.min(max, preferredHeight)));
+        bottomPanelBody.style.height = `${height}px`;
+        handle.setAttribute('aria-valuemin', String(min));
+        handle.setAttribute('aria-valuemax', String(max));
+        handle.setAttribute('aria-valuenow', String(height));
+      }
+      function setHeight(height) {
+        const { min, max } = bounds();
+        preferredHeight = Math.max(min, Math.min(max, height));
+        refresh();
+      }
+      function saveHeight() {
+        try { localStorage.setItem('video-transcoder.logHeight', String(preferredHeight)); } catch (_) { /* Optional. */ }
+      }
+      function stopDrag() {
+        if (!drag) return;
+        const id = drag.id;
+        drag = null;
+        if (handle.hasPointerCapture(id)) handle.releasePointerCapture(id);
+        document.body.classList.remove('resizing-log');
+        saveHeight();
+      }
+      handle.addEventListener('pointerdown', e => {
+        if (e.button !== 0 || drag) return;
+        e.preventDefault();
+        drag = { id: e.pointerId, y: e.clientY, height: bottomPanelBody.getBoundingClientRect().height };
+        handle.setPointerCapture(e.pointerId);
+        document.body.classList.add('resizing-log');
+      });
+      handle.addEventListener('pointermove', e => {
+        if (drag && e.pointerId === drag.id) setHeight(drag.height + drag.y - e.clientY);
+      });
+      for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) handle.addEventListener(event, stopDrag);
+      handle.addEventListener('keydown', e => {
+        const current = bottomPanelBody.getBoundingClientRect().height;
+        const { min, max } = bounds();
+        const values = { ArrowUp: current + 20, ArrowDown: current - 20, Home: min, End: max };
+        if (!(e.key in values)) return;
+        e.preventDefault();
+        setHeight(values[e.key]);
+        saveHeight();
+      });
       bottomPanelToggle.addEventListener('click', () => {
-        const isOpen = bottomPanelBody.classList.toggle('open');
-        bottomPanelArrow.textContent = isOpen ? '\u25BC' : '\u25B2';
-        bottomPanelToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+        stopDrag();
+        bottomPanelBody.classList.toggle('open');
+        refresh();
         scheduleConfigSave();
       });
+      window.addEventListener('blur', stopDrag);
+      window.addEventListener('resize', () => { stopDrag(); refresh(); });
+      // Account for wrapped controls and layout/theme changes without changing the user's preferred size.
+      const observer = new ResizeObserver(refresh);
+      for (const element of [app, $('#status-strip'), $('#toolbar'), $('#destination-bar')]) {
+        if (element) observer.observe(element);
+      }
+      refresh();
     }
 
     let lastLogMessage = '';

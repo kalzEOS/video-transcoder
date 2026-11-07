@@ -334,6 +334,7 @@ input[type="radio"]:checked::after { content: ""; position: absolute; inset: 4px
 #queue-table th:nth-child(7), #queue-table td:nth-child(7),
 #queue-table th:nth-child(8), #queue-table td:nth-child(8) { text-align: right; }
 .col-resize-handle { position: absolute; top: 0; right: 0; bottom: 0; width: 8px; cursor: col-resize; user-select: none; }
+.col-resize-handle::after { content: ''; position: absolute; top: 20%; bottom: 20%; left: 3px; width: 2px; background: var(--text-muted); border-radius: 2px; opacity: 0.65; }
 .col-resize-handle:hover, .col-resize-handle.active { background: var(--accent); opacity: 0.6; }
 
 #queue-table td {
@@ -451,7 +452,13 @@ tr.status-encoding .status-badge::before { background: var(--accent); animation:
 #bottom-panel-toggle:hover { color: var(--text); border-color: var(--text-muted); background: var(--glass-hover); }
 #bottom-panel-arrow { display: inline-block; font-size: 9px; }
 
-#bottom-panel-body { display: none; height: 210px; overflow: hidden; }
+#log-resize-handle { flex: 0 0 12px; display: flex; align-items: center; justify-content: center; cursor: row-resize; touch-action: none; background: var(--surface-dim); border-bottom: 1px solid var(--glass-border); }
+#log-resize-handle span { width: 60px; height: 4px; border-radius: 4px; background: var(--text-muted); }
+#log-resize-handle:hover span, #log-resize-handle:focus-visible span { background: var(--accent); }
+#log-resize-handle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+body.resizing-log, body.resizing-log * { cursor: row-resize !important; user-select: none !important; }
+#bottom-panel-body { display: none; height: 210px; overflow: hidden; min-height: 0; flex-shrink: 0; }
+#log-panel, #log-content { min-height: 0; }
 #bottom-panel-body.open { display: flex; }
 #log-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
 #log-panel-header { display: flex; align-items: center; gap: var(--s2); flex-shrink: 0; padding: 5px var(--s5); background: var(--surface-dim); border-top: 1px solid var(--glass-border); border-bottom: 1px solid var(--glass-border); }
