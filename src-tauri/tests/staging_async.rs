@@ -28,7 +28,9 @@ async fn stage_file_copies_and_cleans_up() {
 
     let staging_dir = tmp.path().join("staging");
 
-    let ctx = video_transcoder_lib::staging::StagingContext::stage_file(&source, &staging_dir, 0, &sink).await;
+    let ctx =
+        video_transcoder_lib::staging::StagingContext::stage_file(&source, &staging_dir, 0, &sink)
+            .await;
 
     assert!(ctx.is_some(), "stage_file should succeed");
     let mut ctx = ctx.unwrap();
@@ -91,7 +93,9 @@ async fn stage_file_creates_staging_dir() {
     let staging_dir = tmp.path().join("nested").join("staging");
     assert!(!staging_dir.exists());
 
-    let ctx = video_transcoder_lib::staging::StagingContext::stage_file(&source, &staging_dir, 5, &sink).await;
+    let ctx =
+        video_transcoder_lib::staging::StagingContext::stage_file(&source, &staging_dir, 5, &sink)
+            .await;
 
     assert!(ctx.is_some());
     assert!(staging_dir.exists(), "Staging dir should be created");
@@ -111,9 +115,14 @@ async fn stage_file_drop_cleans_up() {
 
     let staged_path;
     {
-        let ctx = video_transcoder_lib::staging::StagingContext::stage_file(&source, &staging_dir, 0, &sink)
-            .await
-            .unwrap();
+        let ctx = video_transcoder_lib::staging::StagingContext::stage_file(
+            &source,
+            &staging_dir,
+            0,
+            &sink,
+        )
+        .await
+        .unwrap();
         staged_path = ctx.local_path().to_path_buf();
         assert!(staged_path.exists());
         // ctx dropped here

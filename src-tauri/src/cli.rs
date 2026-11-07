@@ -674,7 +674,8 @@ mod tests {
     #[test]
     fn hdr10plus_flag_is_opt_in_and_exports_to_job() {
         assert!(!CliArgs::parse_from(["video-transcoder-cli", "source.mkv"]).preserve_hdr10plus);
-        let args = CliArgs::parse_from(["video-transcoder-cli", "--preserve-hdr10plus", "source.mkv"]);
+        let args =
+            CliArgs::parse_from(["video-transcoder-cli", "--preserve-hdr10plus", "source.mkv"]);
         assert!(args.preserve_hdr10plus);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("job.json");
