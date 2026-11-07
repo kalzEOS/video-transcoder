@@ -1564,11 +1564,19 @@ async fn handle_post_encode(
                 }
             };
             if let Err(reason) = validation {
+                if sink.cancellation_requested() {
+                    return false;
+                }
                 sink.log(&format!(
                     "  ERROR: Output rejected: {reason}. Source retained."
                 ));
                 write_log(log_writer, &reason);
-                let _ = std::fs::remove_file(temp_output_file);
+                let recovery = match output_transaction.retain_failed_validation(&reason, metadata.is_some()) {
+                    Ok(path) => format!("  RECOVERY: Completed output preserved at {}. See validation-report.json in the same folder; validation failed, so this output is not approved for source replacement.", path.display()),
+                    Err(error) => format!("  RECOVERY: {error}"),
+                };
+                sink.log(&recovery);
+                write_log(log_writer, &recovery);
                 queue[idx].status = QueueItemStatus::Failed;
                 sink.queue_item_updated(idx, "Failed");
                 return false;

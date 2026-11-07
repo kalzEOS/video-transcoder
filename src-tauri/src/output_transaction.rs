@@ -199,8 +199,87 @@ impl OutputTransaction {
     pub fn retain_pending(&mut self) -> Result<Option<PathBuf>, String> {
         self.pending
             .take()
-            .map(|path| path.keep().map_err(|e| e.to_string()))
+            .map(|mut path| {
+                // keep() can fail on some platforms. Even then its error
+                // owns a TempPath, so disable deletion before calling it.
+                path.disable_cleanup(true);
+                path.keep().map_err(|e| e.to_string())
+            })
             .transpose()
+    }
+
+    /// A completed but rejected encode is evidence, not disposable staging.
+    /// Disarm automatic deletion FIRST, including when recovery storage fails.
+    pub fn retain_failed_validation(
+        &mut self,
+        reason: &str,
+        hdr10plus_verified: bool,
+    ) -> Result<PathBuf, String> {
+        let retained = self
+            .retain_pending()?
+            .ok_or("No pending output to recover")?;
+        let recover = || -> Result<PathBuf, String> {
+            let parent = self
+                .destination
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let stem: String = self
+                .destination
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .chars()
+                .take(32)
+                .collect();
+            let directory = tempfile::Builder::new()
+                .prefix(&format!("failed-validation-{stem}-"))
+                .tempdir_in(parent)
+                .map_err(|e| e.to_string())?
+                .keep();
+            let extension = self.destination.extension().unwrap_or_default();
+            let mut output = directory.join("completed-output");
+            output.set_extension(extension);
+            let report = serde_json::json!({
+                "validation_error": reason,
+                "source": self.source,
+                "intended_destination": self.destination,
+                "recovered_output": output,
+                "original_pending_path": retained,
+                "hdr10plus_verification_passed": hdr10plus_verified,
+                "application_version": env!("CARGO_PKG_VERSION"),
+                "status": "failed-validation; not approved for source replacement"
+            });
+            // Unique, job-owned directory; never reuse or overwrite a report.
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join("validation-report.json"))
+                .map_err(|e| e.to_string())?;
+            file.write_all(
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| e.to_string())?
+                    .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            // persist_noclobber also protects against an unexpectedly occupied
+            // recovery name. Restore ownership without deletion on every error.
+            let mut pending =
+                tempfile::TempPath::try_from_path(retained.clone()).map_err(|e| e.to_string())?;
+            pending.disable_cleanup(true);
+            pending
+                .persist_noclobber(&output)
+                .map_err(|error| error.error.to_string())?;
+            Ok(output)
+        };
+        recover().map_err(|e| {
+            format!(
+                "Could not organize recovery files: {e}. Completed output retained at {}",
+                retained.display()
+            )
+        })
     }
 }
 
@@ -214,6 +293,63 @@ mod tests {
         let output = root.path().join("output.mkv");
         fs::write(&source, b"original source").unwrap();
         (root, source, output)
+    }
+
+    #[test]
+    fn failed_validation_retains_completed_output_and_diagnostics_without_clobbering() {
+        let (root, source, output) = paths();
+        fs::write(&output, b"existing output").unwrap();
+        let unrelated = root.path().join(".vt-Mad-Max-2-pending.mkv");
+        fs::write(&unrelated, b"unrelated pending job").unwrap();
+        let mut recovered = Vec::new();
+        for _ in 0..2 {
+            let mut tx = OutputTransaction::new(&source, &output, false).unwrap();
+            fs::write(tx.pending_path(), b"completed encode").unwrap();
+            let path = tx
+                .retain_failed_validation("Subtitle dispositions changed unexpectedly", true)
+                .unwrap();
+            assert!(tx.remove_source().is_err());
+            drop(tx);
+            assert_eq!(fs::read(&path).unwrap(), b"completed encode");
+            let report: serde_json::Value = serde_json::from_slice(
+                &fs::read(path.parent().unwrap().join("validation-report.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report["hdr10plus_verification_passed"], true);
+            assert!(report["validation_error"]
+                .as_str()
+                .unwrap()
+                .contains("Subtitle"));
+            assert!(!path
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with('.'));
+            recovered.push(path);
+        }
+        assert_ne!(recovered[0], recovered[1]);
+        assert_eq!(fs::read(source).unwrap(), b"original source");
+        assert_eq!(fs::read(output).unwrap(), b"existing output");
+        assert_eq!(fs::read(unrelated).unwrap(), b"unrelated pending job");
+    }
+
+    #[test]
+    fn recovery_directory_failure_still_disarms_pending_file_deletion() {
+        let (root, source, output) = paths();
+        let mut tx = OutputTransaction::new(&source, &output, false).unwrap();
+        fs::write(tx.pending_path(), b"completed encode").unwrap();
+        let pending = tx.pending_path().to_path_buf();
+        // Inject an unavailable recovery parent without affecting the owned file.
+        tx.destination = root.path().join("missing/output.mkv");
+        let error = tx
+            .retain_failed_validation("validation failure", false)
+            .unwrap_err();
+        assert!(error.contains(&pending.display().to_string()));
+        drop(tx);
+        assert_eq!(fs::read(pending).unwrap(), b"completed encode");
+        assert_eq!(fs::read(source).unwrap(), b"original source");
     }
 
     #[test]
