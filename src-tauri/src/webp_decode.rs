@@ -518,8 +518,9 @@ pub async fn transcode_animated_webp_with_device(
             "pipe:0",
             "-vf",
             &format!("format=rgba,pad={padded_w}:{padded_h}:0:0:color=black@0"),
-            "-fps_mode",
-            "passthrough",
+            // FFmpeg 4.4 (Ubuntu 22.04 CI) lacks -fps_mode; -vsync 0 is equivalent.
+            "-vsync",
+            "0",
             "-f",
             "rawvideo",
             "-pix_fmt",
